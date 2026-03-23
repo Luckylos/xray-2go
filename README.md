@@ -41,7 +41,7 @@ UUID=自定义UUID CFIP=www.visa.com.tw CFPORT=8443 bash <(curl -Ls https://raw.
 2. 卸载 Xray-2go
 3. Argo 隧道管理（启动/停止/固定隧道/临时隧道切换）
 4. 查看节点信息
-5. 修改节点配置（UUID / Argo 端口 / 免流 Path）
+5. 修改节点配置（UUID / Argo 端口 / 免流 Path[WS]）
 ```
 
 ## 说明
