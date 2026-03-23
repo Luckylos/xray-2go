@@ -87,19 +87,26 @@ check_argo() {
 # 通用包安装，支持 apt / dnf / yum / apk
 # ============================================================
 manage_packages() {
-    [ $# -lt 2 ] && red "未指定包名或操作" && return 1
+    [ "$#" -lt 2 ] && red "未指定包名或操作" && return 1
     local action=$1; shift
     [ "$action" != "install" ] && red "未知操作: $action" && return 1
+    local pm
+    if   command -v apt > /dev/null 2>&1; then pm="apt"
+    elif command -v dnf > /dev/null 2>&1; then pm="dnf"
+    elif command -v yum > /dev/null 2>&1; then pm="yum"
+    elif command -v apk > /dev/null 2>&1; then pm="apk"
+    else red "未知系统！"; return 1; fi
     for package in "$@"; do
         if command -v "$package" > /dev/null 2>&1; then
             green "${package} already installed"; continue
         fi
         yellow "正在安装 ${package}..."
-        if   command -v apt > /dev/null 2>&1; then DEBIAN_FRONTEND=noninteractive apt install -y "$package"
-        elif command -v dnf > /dev/null 2>&1; then dnf install -y "$package"
-        elif command -v yum > /dev/null 2>&1; then yum install -y "$package"
-        elif command -v apk > /dev/null 2>&1; then apk update && apk add "$package"
-        else red "未知系统！"; return 1; fi
+        case "$pm" in
+            apt) DEBIAN_FRONTEND=noninteractive apt install -y "$package" ;;
+            dnf) dnf install -y "$package" ;;
+            yum) yum install -y "$package" ;;
+            apk) apk update && apk add "$package" ;;
+        esac
     done
 }
 
@@ -134,16 +141,6 @@ get_current_uuid() {
 }
 
 # ============================================================
-# save_freeflow_mode
-# 持久化 FREEFLOW_MODE 到文件
-# work_dir 可能尚不存在（安装前调用），先 mkdir
-# ============================================================
-save_freeflow_mode() {
-    mkdir -p "${work_dir}"
-    echo "${FREEFLOW_MODE}" > "${freeflow_conf}"
-}
-
-# ============================================================
 # ask_freeflow_mode
 # 交互选择免流方式，写入 FREEFLOW_MODE 并持久化
 # ============================================================
@@ -162,7 +159,8 @@ ask_freeflow_mode() {
         2) FREEFLOW_MODE="tcp"  ;;
         *) FREEFLOW_MODE="none" ;;
     esac
-    save_freeflow_mode
+    mkdir -p "${work_dir}"
+    echo "${FREEFLOW_MODE}" > "${freeflow_conf}"
 
     case "${FREEFLOW_MODE}" in
         ws)   green  "已选择：VLESS+WS 免流"  ;;
@@ -175,7 +173,7 @@ ask_freeflow_mode() {
 # ============================================================
 # get_freeflow_inbound_json <uuid>
 # 根据 FREEFLOW_MODE 输出免流 inbound JSON 字符串
-# VLESS+WS：port 80，path=/luckyss
+# VLESS+WS：port 80，path 默认为 /
 # VLESS+TCP：port 80，TCP 裸连
 # none：不输出
 # ============================================================
@@ -187,7 +185,7 @@ get_freeflow_inbound_json() {
 {
   "port": 80, "listen": "::", "protocol": "vless",
   "settings": { "clients": [{ "id": "${uuid}" }], "decryption": "none" },
-  "streamSettings": { "network": "ws", "security": "none", "wsSettings": { "path": "/luckyss" } },
+  "streamSettings": { "network": "ws", "security": "none" },
   "sniffing": { "enabled": true, "destOverride": ["http","tls","quic"], "metadataOnly": false }
 }
 EOF
@@ -237,9 +235,6 @@ apply_freeflow_config() {
 # install_xray
 # 下载 xray + cloudflared，写入基础 config.json（仅 Argo inbound）
 # 再调用 apply_freeflow_config 追加免流 inbound（复用 jq 逻辑）
-#
-# FIX：s390x 分支补充 ARCH_ARG='s390x'，原来只赋值了 ARCH
-#   导致 cloudflared 下载 URL 拼接出空字符串
 # ============================================================
 install_xray() {
     clear
@@ -397,9 +392,9 @@ change_hosts() {
 
 # ============================================================
 # reset_tunnel_to_temp
-# 只重写 ExecStart/command_args 一行切换回临时隧道
+# 只重写 ExecStart（systemd）或 command_args（OpenRC）一行切换回临时隧道
 # 格式与 manage_argo 选项5的 grep -Fq 匹配字符串保持一致
-# 注意：只替换 ExecStart 行，StandardOutput/StandardError 行不变
+# systemd：StandardOutput/StandardError 行保持不变
 # ============================================================
 reset_tunnel_to_temp() {
     if [ -f /etc/alpine-release ]; then
@@ -472,12 +467,11 @@ build_freeflow_link() {
     uuid=$(get_current_uuid)
     case "${FREEFLOW_MODE}" in
         ws)
-            echo "vless://${uuid}@${ip}:80?encryption=none&security=none&type=ws&host=${ip}&path=%2Fluckyss#FreeFlow-WS"
+            echo "vless://${uuid}@${ip}:80?encryption=none&security=none&type=ws&host=${ip}#FreeFlow-WS"
             ;;
         tcp)
             echo "vless://${uuid}@${ip}:80?encryption=none&security=none&type=tcp#FreeFlow-TCP"
             ;;
-        # none：不输出
     esac
 }
 
@@ -488,9 +482,6 @@ build_freeflow_link() {
 # url.txt 结构：
 #   第1行：Argo 节点（必选，get_quick_tunnel 的 sed 锚定此行）
 #   第2行：免流节点（FREEFLOW_MODE != none 时存在）
-#
-# FIX：Argo 节点链接的 UUID 统一从 config.json 读取（get_current_uuid），
-#   与 build_freeflow_link 保持同一来源，避免全局变量与文件不同步
 # ============================================================
 get_info() {
     clear
@@ -508,11 +499,14 @@ get_info() {
     else
         green "ArgoDomain：${argodomain}"
     fi
+    if [ -z "$IP" ]; then
+        yellow "警告：无法获取服务器 IP，免流节点链接将缺失"
+    fi
     echo ""
 
     {
         echo "vless://${cur_uuid}@${CFIP}:${CFPORT}?encryption=none&security=tls&sni=${argodomain}&fp=chrome&type=ws&host=${argodomain}&path=%2Fvless-argo%3Fed%3D2560#Argo"
-        build_freeflow_link "${IP}"
+        [ -n "$IP" ] && build_freeflow_link "${IP}"
     } > "${client_dir}"
 
     print_nodes
@@ -548,8 +542,8 @@ get_quick_tunnel() {
 # manage_argo - Argo 隧道管理
 # ============================================================
 manage_argo() {
-    local argo_status cx
-    argo_status=$(check_argo); cx=$?
+    local cx
+    check_argo > /dev/null 2>&1; cx=$?
     if [ "$cx" -eq 2 ]; then
         yellow "Argo 尚未安装！"; sleep 1; menu; return
     fi
@@ -581,6 +575,9 @@ manage_argo() {
                 red "Argo 域名不能为空"; return
             fi
             reading "请输入 Argo 密钥（token 或 json）: " argo_auth
+            if [ -z "$argo_auth" ]; then
+                red "Argo 密钥不能为空"; return
+            fi
 
             if echo "$argo_auth" | grep -q "TunnelSecret"; then
                 local tunnel_id
@@ -653,7 +650,7 @@ EOF
 }
 
 # ============================================================
-# change_config - 修改 UUID / Argo 端口 / WS Path / 免流方式
+# change_config - 修改 UUID / Argo 端口 / 免流方式
 # ============================================================
 change_config() {
     local ff_label
@@ -669,9 +666,7 @@ change_config() {
     skyblue "------------"
     green  "2. 修改 Argo 回源端口（当前：${ARGO_PORT}）"
     skyblue "-------------------------------------------"
-    green  "3. 修改免流 WS Path（仅 WS 模式有效）"
-    skyblue "--------------------------------------"
-    green  "4. 变更免流方式（${ff_label}）"
+    green  "3. 变更免流方式（${ff_label}）"
     skyblue "--------------------------------"
     purple "0. 返回主菜单"
     skyblue "------------"
@@ -686,7 +681,6 @@ change_config() {
             fi
             sed -i "s/[a-fA-F0-9]\{8\}-[a-fA-F0-9]\{4\}-[a-fA-F0-9]\{4\}-[a-fA-F0-9]\{4\}-[a-fA-F0-9]\{12\}/$new_uuid/g" \
                 "$config_dir" "$client_dir"
-            # 同步全局变量，保持与文件一致（install_xray 用 $UUID 写入基础 config）
             export UUID=$new_uuid
             restart_xray
             green "UUID 已修改为：${new_uuid}"
@@ -715,24 +709,6 @@ change_config() {
             green "Argo 回源端口已修改为：${new_port}"
             ;;
         3)
-            if [ "${FREEFLOW_MODE}" != "ws" ]; then
-                yellow "当前免流模式为「${FREEFLOW_MODE}」，WS Path 仅在 WS 模式下有效"; return
-            fi
-            reading "请输入新的 WS Path（仅限字母数字下划线连字符，回车默认 luckyss）: " new_path
-            if [ -z "$new_path" ]; then
-                new_path="luckyss"
-            elif ! echo "$new_path" | grep -qE '^[A-Za-z0-9_-]+$'; then
-                red "Path 仅允许字母、数字、下划线和连字符"; return
-            fi
-            jq --arg p "/${new_path}" \
-                '.inbounds[1].streamSettings.wsSettings.path = $p' "$config_dir" \
-                > "${config_dir}.tmp" && mv "${config_dir}.tmp" "${config_dir}"
-            sed -i "2s|path=%2F[A-Za-z0-9_-]*|path=%2F${new_path}|" "$client_dir"
-            restart_xray
-            green "免流 WS Path 已修改为：/${new_path}"
-            print_nodes
-            ;;
-        4)
             if [ ! -f "${client_dir}" ]; then
                 yellow "节点文件不存在，请先完成安装后再变更免流方式"; return
             fi
@@ -747,7 +723,7 @@ change_config() {
             ip_now=$(get_realip)
             {
                 echo "${argo_line}"
-                build_freeflow_link "${ip_now}"
+                [ -n "$ip_now" ] && build_freeflow_link "${ip_now}"
             } > "${client_dir}"
             restart_xray
             green "免流方式已变更"
