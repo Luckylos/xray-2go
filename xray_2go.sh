@@ -4,7 +4,7 @@
 # 精简版 Xray-Argo 一键脚本
 # 协议：
 #   必选：VLESS+WS+TLS（Cloudflare Argo 隧道）
-#   可选：VLESS+WS 免流（port 80）| VLESS+TCP 免流（port 80）| 不安装
+#   可选：VLESS+WS 免流（port 80）| VLESS+HTTPUpgrade 免流（port 80）| 不安装
 # ============================================================
 
 # 颜色输出：printf 替代 echo -e，避免依赖 echo 的 -e 扩展行为
@@ -32,10 +32,10 @@ export CFPORT=${CFPORT:-'443'}
 [ "$EUID" -ne 0 ] && red "请在 root 用户下运行脚本" && exit 1
 
 # ── 读取持久化免流模式，校验合法值，非法值回退 none ──────────
-# FREEFLOW_MODE: none | ws | tcp
+# FREEFLOW_MODE: none | ws | httpupgrade
 _raw_mode=$(cat "${freeflow_conf}" 2>/dev/null)
 case "${_raw_mode}" in
-    ws|tcp) FREEFLOW_MODE="${_raw_mode}" ;;
+    ws|httpupgrade) FREEFLOW_MODE="${_raw_mode}" ;;
     *)      FREEFLOW_MODE="none"         ;;
 esac
 unset _raw_mode
@@ -149,14 +149,14 @@ ask_freeflow_mode() {
     green  "请选择免流方式："
     skyblue "-----------------------------"
     green  "1. VLESS + WS  （明文 WebSocket，port 80）"
-    green  "2. VLESS + TCP （明文 TCP，port 80）"
+    green  "2. VLESS + HTTPUpgrade （HTTP 升级，port 80）"
     green  "3. 不安装免流节点（默认）"
     skyblue "-----------------------------"
     reading "请输入选择(1-3，回车默认3): " ff_choice
 
     case "${ff_choice}" in
         1) FREEFLOW_MODE="ws"   ;;
-        2) FREEFLOW_MODE="tcp"  ;;
+        2) FREEFLOW_MODE="httpupgrade" ;;
         *) FREEFLOW_MODE="none" ;;
     esac
     mkdir -p "${work_dir}"
@@ -164,7 +164,7 @@ ask_freeflow_mode() {
 
     case "${FREEFLOW_MODE}" in
         ws)   green  "已选择：VLESS+WS 免流"  ;;
-        tcp)  green  "已选择：VLESS+TCP 免流" ;;
+        httpupgrade) green  "已选择：VLESS+HTTPUpgrade 免流" ;;
         none) yellow "不安装免流节点"          ;;
     esac
     echo ""
@@ -174,7 +174,7 @@ ask_freeflow_mode() {
 # get_freeflow_inbound_json <uuid>
 # 根据 FREEFLOW_MODE 输出免流 inbound JSON 字符串
 # VLESS+WS：port 80，path 默认为 /
-# VLESS+TCP：port 80，TCP 裸连
+# VLESS+HTTPUpgrade：port 80，HTTP Upgrade 握手
 # none：不输出
 # ============================================================
 get_freeflow_inbound_json() {
@@ -190,12 +190,12 @@ get_freeflow_inbound_json() {
 }
 EOF
             ;;
-        tcp)
+        httpupgrade)
             cat << EOF
 {
   "port": 80, "listen": "::", "protocol": "vless",
   "settings": { "clients": [{ "id": "${uuid}" }], "decryption": "none" },
-  "streamSettings": { "network": "tcp", "security": "none" },
+  "streamSettings": { "network": "httpupgrade", "security": "none" },
   "sniffing": { "enabled": true, "destOverride": ["http","tls","quic"], "metadataOnly": false }
 }
 EOF
@@ -213,7 +213,7 @@ apply_freeflow_config() {
     cur_uuid=$(get_current_uuid)
 
     case "${FREEFLOW_MODE}" in
-        ws|tcp)
+        ws|httpupgrade)
             ff_json=$(get_freeflow_inbound_json "${cur_uuid}")
             jq --argjson ib "${ff_json}" '
                 if (.inbounds | length) == 1
@@ -469,8 +469,8 @@ build_freeflow_link() {
         ws)
             echo "vless://${uuid}@${ip}:80?encryption=none&security=none&type=ws&host=${ip}#FreeFlow-WS"
             ;;
-        tcp)
-            echo "vless://${uuid}@${ip}:80?encryption=none&security=none&type=tcp#FreeFlow-TCP"
+        httpupgrade)
+            echo "vless://${uuid}@${ip}:80?encryption=none&security=none&type=httpupgrade&host=${ip}#FreeFlow-HTTPUpgrade"
             ;;
     esac
 }
@@ -656,7 +656,7 @@ change_config() {
     local ff_label
     case "${FREEFLOW_MODE}" in
         ws)   ff_label="VLESS+WS（当前）"  ;;
-        tcp)  ff_label="VLESS+TCP（当前）" ;;
+        httpupgrade) ff_label="VLESS+HTTPUpgrade（当前）" ;;
         none) ff_label="未安装（当前）"    ;;
         *)    ff_label="未知"              ;;
     esac
@@ -789,7 +789,7 @@ menu() {
         argo_status=$(check_argo)
         case "${FREEFLOW_MODE}" in
             ws)   ff_display="WS"   ;;
-            tcp)  ff_display="TCP"  ;;
+            httpupgrade) ff_display="HTTPUpgrade" ;;
             none) ff_display="无"   ;;
             *)    ff_display="未知" ;;
         esac
