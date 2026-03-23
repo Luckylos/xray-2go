@@ -29,7 +29,6 @@ export ARGO_PORT=${ARGO_PORT:-'8080'}
 export CFIP=${CFIP:-'cdns.doon.eu.org'}
 export CFPORT=${CFPORT:-'443'}
 
-# root 检查：用 [ ] 替代 [[ ]]
 [ "$EUID" -ne 0 ] && red "请在 root 用户下运行脚本" && exit 1
 
 # ── 读取持久化免流模式，校验合法值，非法值回退 none ──────────
@@ -128,7 +127,7 @@ get_realip() {
 # ============================================================
 # get_current_uuid
 # 从 config.json 读取当前实际 UUID，作为统一入口
-# 避免全局变量 $UUID 与文件不同步
+# 所有生成链接的函数均通过此函数读取，避免全局变量与文件不同步
 # ============================================================
 get_current_uuid() {
     jq -r '.inbounds[0].settings.clients[0].id' "${config_dir}"
@@ -238,6 +237,9 @@ apply_freeflow_config() {
 # install_xray
 # 下载 xray + cloudflared，写入基础 config.json（仅 Argo inbound）
 # 再调用 apply_freeflow_config 追加免流 inbound（复用 jq 逻辑）
+#
+# FIX：s390x 分支补充 ARCH_ARG='s390x'，原来只赋值了 ARCH
+#   导致 cloudflared 下载 URL 拼接出空字符串
 # ============================================================
 install_xray() {
     clear
@@ -397,6 +399,7 @@ change_hosts() {
 # reset_tunnel_to_temp
 # 只重写 ExecStart/command_args 一行切换回临时隧道
 # 格式与 manage_argo 选项5的 grep -Fq 匹配字符串保持一致
+# 注意：只替换 ExecStart 行，StandardOutput/StandardError 行不变
 # ============================================================
 reset_tunnel_to_temp() {
     if [ -f /etc/alpine-release ]; then
@@ -410,7 +413,8 @@ reset_tunnel_to_temp() {
 
 # ============================================================
 # restart_xray / restart_argo
-# restart_argo 删除旧 argo.log，避免解析到过期临时域名
+# restart_argo：先删旧 argo.log 再重启，避免解析到过期域名
+# restart_xray：daemon-reload 确保 systemd 读取最新服务文件
 # ============================================================
 restart_xray() {
     if [ -f /etc/alpine-release ]; then rc-service xray restart
@@ -427,7 +431,6 @@ restart_argo() {
 # get_argodomain
 # 从 argo.log 提取 trycloudflare.com 子域
 # 先 sleep 3 等待 cloudflared 写入，再最多轮询 5 次（每次 sleep 2）
-# 用 while 计数替代 bash-specific {1..5} brace expansion
 # ============================================================
 get_argodomain() {
     sleep 3
@@ -446,7 +449,6 @@ get_argodomain() {
 # ============================================================
 # print_nodes
 # 将 url.txt 内容以紫色逐行输出，跳过空行
-# printf 替代 echo -e，避免依赖 echo 扩展行为
 # ============================================================
 print_nodes() {
     echo ""
@@ -486,11 +488,15 @@ build_freeflow_link() {
 # url.txt 结构：
 #   第1行：Argo 节点（必选，get_quick_tunnel 的 sed 锚定此行）
 #   第2行：免流节点（FREEFLOW_MODE != none 时存在）
+#
+# FIX：Argo 节点链接的 UUID 统一从 config.json 读取（get_current_uuid），
+#   与 build_freeflow_link 保持同一来源，避免全局变量与文件不同步
 # ============================================================
 get_info() {
     clear
-    local IP argodomain
+    local IP argodomain cur_uuid
     IP=$(get_realip)
+    cur_uuid=$(get_current_uuid)
 
     purple "正在获取 ArgoDomain，请稍等..."
     restart_argo
@@ -505,7 +511,7 @@ get_info() {
     echo ""
 
     {
-        echo "vless://${UUID}@${CFIP}:${CFPORT}?encryption=none&security=tls&sni=${argodomain}&fp=chrome&type=ws&host=${argodomain}&path=%2Fvless-argo%3Fed%3D2560#Argo"
+        echo "vless://${cur_uuid}@${CFIP}:${CFPORT}?encryption=none&security=tls&sni=${argodomain}&fp=chrome&type=ws&host=${argodomain}&path=%2Fvless-argo%3Fed%3D2560#Argo"
         build_freeflow_link "${IP}"
     } > "${client_dir}"
 
@@ -515,6 +521,7 @@ get_info() {
 # ============================================================
 # get_quick_tunnel
 # 重启 Argo，提取新临时域名，更新 url.txt 第1行的 sni/host
+# 第1行结构固定为 Argo 节点，sed 行号锚定安全
 # ============================================================
 get_quick_tunnel() {
     if [ ! -f "${client_dir}" ]; then
@@ -575,9 +582,7 @@ manage_argo() {
             fi
             reading "请输入 Argo 密钥（token 或 json）: " argo_auth
 
-            # 用 grep 替代 [[ =~ ]] 检测 TunnelSecret
             if echo "$argo_auth" | grep -q "TunnelSecret"; then
-                # 用 echo | cut 替代 <<< here-string
                 local tunnel_id
                 tunnel_id=$(echo "$argo_auth" | cut -d'"' -f12)
                 echo "$argo_auth" > "${work_dir}/tunnel.json"
@@ -600,7 +605,6 @@ EOF
                     sed -i "/^ExecStart=/c\\ExecStart=/bin/sh -c '/etc/xray/argo tunnel --edge-ip-version auto --config /etc/xray/tunnel.yml run >> /etc/xray/argo.log 2>&1'" \
                         /etc/systemd/system/tunnel.service
                 fi
-            # 用 grep -E 替代 [[ =~ regex ]] 检测 token 格式
             elif echo "$argo_auth" | grep -qE '^[A-Z0-9a-z=]{120,250}$'; then
                 if [ -f /etc/alpine-release ]; then
                     sed -i "/^command_args=/c\command_args=\"-c '/etc/xray/argo tunnel --edge-ip-version auto --no-autoupdate --protocol http2 run --token ${argo_auth} >> /etc/xray/argo.log 2>&1'\"" \
@@ -682,6 +686,7 @@ change_config() {
             fi
             sed -i "s/[a-fA-F0-9]\{8\}-[a-fA-F0-9]\{4\}-[a-fA-F0-9]\{4\}-[a-fA-F0-9]\{4\}-[a-fA-F0-9]\{12\}/$new_uuid/g" \
                 "$config_dir" "$client_dir"
+            # 同步全局变量，保持与文件一致（install_xray 用 $UUID 写入基础 config）
             export UUID=$new_uuid
             restart_xray
             green "UUID 已修改为：${new_uuid}"
@@ -692,7 +697,6 @@ change_config() {
             if [ -z "$new_port" ]; then
                 new_port=$(shuf -i 2000-65000 -n 1)
             fi
-            # 用 grep -E 替代 [[ =~ ]] 做数字格式校验
             if ! echo "$new_port" | grep -qE '^[0-9]+$' || \
                [ "$new_port" -lt 1 ] || [ "$new_port" -gt 65535 ]; then
                 red "端口无效，请输入 1-65535 的整数"; return
@@ -717,7 +721,6 @@ change_config() {
             reading "请输入新的 WS Path（仅限字母数字下划线连字符，回车默认 luckyss）: " new_path
             if [ -z "$new_path" ]; then
                 new_path="luckyss"
-            # 用 grep -E 替代 [[ =~ ]] 做字符集校验
             elif ! echo "$new_path" | grep -qE '^[A-Za-z0-9_-]+$'; then
                 red "Path 仅允许字母、数字、下划线和连字符"; return
             fi
@@ -862,8 +865,6 @@ menu() {
             0) exit 0 ;;
             *) red "无效的选项，请输入 0 到 5" ;;
         esac
-        # 等待任意键：printf 输出提示，read -r 读一行（回车即可）
-        # 替代 bash-specific: read -n 1 -s -r -p $'...'
         printf '\033[1;91m按回车键继续...\033[0m'
         read -r _dummy
     done
