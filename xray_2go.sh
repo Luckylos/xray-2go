@@ -194,10 +194,15 @@ get_realip() {
 
 # ============================================================
 # get_current_uuid
-# 从 config.json 读取当前实际 UUID，作为统一入口
+# 从 config.json 搜索第一个 VLESS inbound 的 UUID；
+# 找不到时（如 SS-only 场景）回退到全局 UUID 变量
 # ============================================================
 get_current_uuid() {
-    jq -r '.inbounds[0].settings.clients[0].id' "${config_dir}"
+    local id
+    id=$(jq -r '
+        (first(.inbounds[] | select(.protocol=="vless") | .settings.clients[0].id) // empty)
+    ' "${config_dir}" 2>/dev/null)
+    echo "${id:-${UUID}}"
 }
 
 # ============================================================
@@ -1309,10 +1314,6 @@ change_config() {
                 [ "${FREEFLOW_MODE}" != "none" ] && [ -n "$ip_now" ] && build_freeflow_link "${ip_now}"
                 [ "${SS_MODE}"      = "yes"  ] && grep '^ss://'           "${client_dir}" 2>/dev/null
             } > "${client_dir}.new" && mv "${client_dir}.new" "${client_dir}"
-            # 若之前有免流但现在选了 none，从 config 中删除免流 inbound
-            if [ "${old_mode}" != "none" ] && [ "${FREEFLOW_MODE}" = "none" ]; then
-                _jq_del_inbound "$(calc_freeflow_index)" "${old_mode}"
-            fi
             restart_xray
             green "免流方式已变更"
             print_nodes
@@ -1489,6 +1490,6 @@ menu() {
 }
 
 # ── 安装快捷方式（若未存在） ─────────────────────────────────
-[ ! -f "${shortcut_path}" ] && install_shortcut 2>/dev/null
+[ ! -f "${shortcut_path}" ] && install_shortcut 2>/dev/null || true
 
 menu
