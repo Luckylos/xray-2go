@@ -2,13 +2,6 @@
 
 精简高效的 Xray-Argo 一键安装脚本，无交互全自动部署。
 
-## 协议
-
-| 协议 | 说明 |
-|---|---|
-| VLESS + WS + TLS | 通过 Cloudflare Argo 隧道，客户端 TLS 由 CF 边缘终结 |
-| VLESS + WS/TCP | 端口 80 明文直连，适用于运营商免流场景 |
-
 ## 支持系统
 
 Debian / Ubuntu / CentOS / Alpine / Fedora / AlmaLinux / Rocky Linux / Amazon Linux
@@ -43,12 +36,6 @@ UUID=自定义UUID CFIP=www.visa.com.tw CFPORT=8443 bash <(curl -Ls https://raw.
 4. 查看节点信息
 5. 修改节点配置（UUID / Argo 端口 / 免流 Path[WS]）
 ```
-
-## 说明
-
-- Argo 节点 TLS 由 Cloudflare 边缘提供，xray 本地无需配置证书
-- 免流节点依赖运营商免流规则，请自行确认 IP 和端口是否在免流名单内
-- NAT 机器使用免流节点前请确认端口 80 在可用端口范围内
 
 ## 免责声明
 
