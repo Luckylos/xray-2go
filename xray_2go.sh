@@ -207,30 +207,33 @@ get_current_uuid() {
 
 # ============================================================
 # install_shortcut
-# 将脚本本体复制到 /usr/local/bin/xray2go（固定路径），
+# 将脚本本体下载到 /usr/local/bin/xray2go（固定路径），
 # 再创建 /usr/local/bin/s 指向它。
-# 兼容 bash <(curl ...) / pipe 执行场景：此时 $0 为临时 fd 路径，
-# 通过 /proc/self/fd/255 读取当前 bash 进程加载的脚本内容。
 # ============================================================
 install_shortcut() {
-    local script_main="/usr/local/bin/xray2go"
+    local script_wrapper="${work_dir}/s.sh"
+    local shortcut_path="/usr/local/bin/s"
+    local shortcut_path_upper="/usr/local/bin/S"
 
-    # 优先：$0 是真实文件（直接执行 bash argo.sh）
-    if [ -f "$0" ]; then
-        cp -f "$0" "${script_main}"
-    # 次选：bash <(curl ...) 场景，fd/255 指向脚本内容
-    elif [ -r /proc/self/fd/255 ]; then
-        cat /proc/self/fd/255 > "${script_main}"
+    cat > "$script_wrapper" << 'EOF'
+#!/usr/bin/env bash
+bash <(curl -Ls https://raw.githubusercontent.com/Luckylos/xray-2go/refs/heads/main/xray_2go.sh) "$@"
+EOF
+
+    chmod +x "$script_wrapper"
+
+    # 创建小写 s
+    ln -sf "$script_wrapper" "$shortcut_path"
+
+    # 创建大写 S（实现不区分大小写）
+    ln -sf "$script_wrapper" "$shortcut_path_upper"
+
+    # 检测
+    if [ -s "$shortcut_path" ] && [ -s "$shortcut_path_upper" ]; then
+        green "\n快捷指令 s / S 创建成功\n"
     else
-        yellow "无法确定脚本路径，快捷方式安装跳过"; return 1
+        red "\n快捷指令创建失败\n"
     fi
-
-    chmod +x "${script_main}"
-
-    # s → xray2go
-    printf '#!/bin/bash\nexec /usr/local/bin/xray2go "$@"\n' > "${shortcut_path}"
-    chmod +x "${shortcut_path}"
-    green "快捷方式已安装：输入 s 可直接启动本脚本"
 }
 
 # ============================================================
