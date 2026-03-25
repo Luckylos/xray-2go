@@ -230,9 +230,9 @@ EOF
 
     # 检测
     if [ -s "$shortcut_path" ] && [ -s "$shortcut_path_upper" ]; then
-        green "\n快捷指令 s / S 创建成功\n"
+        green "快捷指令 s / S 创建成功"
     else
-        red "\n快捷指令创建失败\n"
+        red "快捷指令创建失败"
     fi
 }
 
