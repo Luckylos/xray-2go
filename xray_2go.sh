@@ -20,6 +20,7 @@ config_dir="${work_dir}/config.json"
 client_dir="${work_dir}/url.txt"
 freeflow_conf="${work_dir}/freeflow.conf"
 argo_mode_conf="${work_dir}/argo_mode.conf"
+restart_conf="${work_dir}/restart.conf"
 
 export UUID=${UUID:-$(cat /proc/sys/kernel/random/uuid)}
 export ARGO_PORT=${ARGO_PORT:-'8080'}
@@ -55,6 +56,12 @@ if [ -f "${freeflow_conf}" ]; then
     unset _l1 _l2
 else
     FREEFLOW_MODE="none"
+fi
+
+RESTART_INTERVAL=0
+if [ -f "${restart_conf}" ]; then
+    _ri=$(cat "${restart_conf}" 2>/dev/null)
+    echo "${_ri}" | grep -qE '^[0-9]+$' && RESTART_INTERVAL="${_ri}"
 fi
 
 check_xray() {
@@ -569,6 +576,46 @@ _update_freeflow_url() {
     fi
 }
 
+install_cron_if_needed() {
+    if command -v crontab > /dev/null 2>&1; then return 0; fi
+    yellow "正在安装 cron 服务..."
+    if command -v apt > /dev/null 2>&1; then
+        manage_packages install cron
+        systemctl enable --now cron 2>/dev/null || true
+    elif command -v dnf > /dev/null 2>&1 || command -v yum > /dev/null 2>&1; then
+        manage_packages install cronie
+        systemctl enable --now crond 2>/dev/null || true
+    elif command -v apk > /dev/null 2>&1; then
+        manage_packages install dcron
+        rc-service dcron start 2>/dev/null || true
+        rc-update add dcron default 2>/dev/null || true
+    else
+        yellow "无法自动安装 cron，请手动安装"
+        return 1
+    fi
+    return 0
+}
+
+setup_auto_restart() {
+    install_cron_if_needed || return
+    local restart_cmd
+    if [ -f /etc/alpine-release ]; then
+        restart_cmd="rc-service xray restart"
+    else
+        restart_cmd="systemctl restart xray"
+    fi
+    crontab -l 2>/dev/null | sed '/xray-restart/d' > /tmp/crontab.tmp 2>/dev/null || true
+    echo "*/${RESTART_INTERVAL} * * * * ${restart_cmd} >/dev/null 2>&1 #xray-restart" >> /tmp/crontab.tmp
+    crontab /tmp/crontab.tmp
+    rm -f /tmp/crontab.tmp
+}
+
+remove_auto_restart() {
+    crontab -l 2>/dev/null | sed '/xray-restart/d' > /tmp/crontab.tmp 2>/dev/null || true
+    crontab /tmp/crontab.tmp 2>/dev/null
+    rm -f /tmp/crontab.tmp
+}
+
 manage_argo() {
     if [ "${ARGO_MODE}" != "yes" ]; then
         yellow "未安装 Argo，Argo 管理不可用"; sleep 1; menu; return
@@ -747,11 +794,43 @@ manage_freeflow() {
     esac
 }
 
+manage_restart() {
+    clear; echo ""
+    green  "Xray 自动重启间隔：当前 ${RESTART_INTERVAL} 分钟 (0=关闭)"
+    echo   "=========================="
+    green  "1. 设置重启间隔（分钟，0=关闭）"
+    purple "2. 返回主菜单"
+    skyblue "------------"
+    reading "请输入选择: " choice
+
+    case "${choice}" in
+        1)
+            reading "请输入间隔分钟（0关闭，推荐60）: " new_int
+            if ! echo "${new_int}" | grep -qE '^[0-9]+$' || [ "${new_int}" -lt 0 ]; then
+                red "无效输入"; return
+            fi
+            RESTART_INTERVAL="${new_int}"
+            mkdir -p "${work_dir}"
+            echo "${RESTART_INTERVAL}" > "${restart_conf}"
+            if [ "${RESTART_INTERVAL}" -eq 0 ]; then
+                remove_auto_restart
+                green "自动重启已关闭"
+            else
+                setup_auto_restart
+                green "已设置每 ${RESTART_INTERVAL} 分钟重启 Xray"
+            fi
+            ;;
+        2) menu ;;
+        *) red "无效的选项！" ;;
+    esac
+}
+
 uninstall_xray() {
     reading "确定要卸载 xray-2go 吗？(y/n): " choice
     case "${choice}" in
         y|Y)
             yellow "正在卸载..."
+            remove_auto_restart
             if [ -f /etc/alpine-release ]; then
                 rc-service xray stop 2>/dev/null
                 rc-update del xray default 2>/dev/null
@@ -803,6 +882,7 @@ menu() {
         purple " Xray 状态:   ${xray_status}"
         purple " Argo 状态:   ${argo_display}"
         purple " FreeFlow:    ${ff_display}"
+        purple " 重启间隔:    ${RESTART_INTERVAL} 分钟"
         echo   "========================"
         green  "1. 安装 Xray-2go"
         red    "2. 卸载 Xray-2go"
@@ -812,10 +892,11 @@ menu() {
         echo   "================="
         green  "5. 查看节点信息"
         green  "6. 修改 UUID"
+        green  "7. Xray 自动重启管理"
         echo   "================="
         red    "0. 退出脚本"
         echo   "==========="
-        reading "请输入选择(0-6): " choice
+        reading "请输入选择(0-7): " choice
         echo ""
 
         case "${choice}" in
@@ -857,8 +938,9 @@ menu() {
                 green "UUID 已修改为：${new_uuid}"
                 print_nodes
                 ;;
+            7) manage_restart ;;
             0) exit 0 ;;
-            *) red "无效的选项，请输入 0 到 6" ;;
+            *) red "无效的选项，请输入 0 到 7" ;;
         esac
         printf '\033[1;91m按回车键继续...\033[0m'
         read -r _dummy
