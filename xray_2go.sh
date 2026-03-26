@@ -576,28 +576,42 @@ _update_freeflow_url() {
     fi
 }
 
-install_cron_if_needed() {
-    if command -v crontab > /dev/null 2>&1; then return 0; fi
-    yellow "正在安装 cron 服务..."
-    if command -v apt > /dev/null 2>&1; then
-        manage_packages install cron
-        systemctl enable --now cron 2>/dev/null || true
-    elif command -v dnf > /dev/null 2>&1 || command -v yum > /dev/null 2>&1; then
-        manage_packages install cronie
-        systemctl enable --now crond 2>/dev/null || true
-    elif command -v apk > /dev/null 2>&1; then
-        manage_packages install dcron
-        rc-service dcron start 2>/dev/null || true
-        rc-update add dcron default 2>/dev/null || true
-    else
-        yellow "无法自动安装 cron，请手动安装"
-        return 1
+check_and_install_cron() {
+    if command -v crontab >/dev/null 2>&1 && command -v cron >/dev/null 2>&1; then
+        return 0
     fi
-    return 0
+
+    yellow "检测到 cron 服务未安装"
+    reading "是否安装 cron？(y/n，回车默认 y): " choice
+    case "${choice}" in
+        n|N) 
+            red "未安装 cron，自动重启功能无法使用"
+            return 1 
+            ;;
+        *) 
+            yellow "正在安装 cron..."
+            if command -v apt >/dev/null 2>&1; then
+                DEBIAN_FRONTEND=noninteractive apt install -y cron
+                systemctl enable --now cron 2>/dev/null || true
+            elif command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1; then
+                yum install -y cronie || dnf install -y cronie
+                systemctl enable --now crond 2>/dev/null || true
+            elif command -v apk >/dev/null 2>&1; then
+                apk add dcron
+                rc-service dcron start 2>/dev/null || true
+                rc-update add dcron default 2>/dev/null || true
+            else
+                red "无法自动安装 cron，请手动安装后重试"
+                return 1
+            fi
+            green "cron 已安装"
+            return 0
+            ;;
+    esac
 }
 
 setup_auto_restart() {
-    install_cron_if_needed || return
+    check_and_install_cron || return 1
     local restart_cmd
     if [ -f /etc/alpine-release ]; then
         restart_cmd="rc-service xray restart"
@@ -608,6 +622,7 @@ setup_auto_restart() {
     echo "*/${RESTART_INTERVAL} * * * * ${restart_cmd} >/dev/null 2>&1 #xray-restart" >> /tmp/crontab.tmp
     crontab /tmp/crontab.tmp
     rm -f /tmp/crontab.tmp
+    green "已设置每 ${RESTART_INTERVAL} 分钟自动重启 Xray"
 }
 
 remove_auto_restart() {
@@ -758,7 +773,6 @@ manage_freeflow() {
 
     case "${choice}" in
         1)
-            local old_mode="${FREEFLOW_MODE}"
             ask_freeflow_mode
             apply_freeflow_config
             local ip_now; ip_now=$(get_realip)
@@ -805,19 +819,19 @@ manage_restart() {
 
     case "${choice}" in
         1)
-            reading "请输入间隔分钟（0关闭，推荐60）: " new_int
+            reading "请输入间隔分钟（0关闭，推荐 60）: " new_int
             if ! echo "${new_int}" | grep -qE '^[0-9]+$' || [ "${new_int}" -lt 0 ]; then
-                red "无效输入"; return
+                red "输入无效"; return
             fi
             RESTART_INTERVAL="${new_int}"
             mkdir -p "${work_dir}"
             echo "${RESTART_INTERVAL}" > "${restart_conf}"
+
             if [ "${RESTART_INTERVAL}" -eq 0 ]; then
                 remove_auto_restart
                 green "自动重启已关闭"
             else
                 setup_auto_restart
-                green "已设置每 ${RESTART_INTERVAL} 分钟重启 Xray"
             fi
             ;;
         2) menu ;;
