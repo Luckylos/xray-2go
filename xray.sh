@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ============================================================
-# 精简版 Xray-2go 一键脚本 (极简优化版)
+# 精简版 Xray-2go 一键脚本
 # 协议：
 #   Argo 固定隧道：VLESS+WS+TLS 或 VLESS+XHTTP+TLS (port 8080)
 #   FreeFlow（可选）：VLESS+WS / HTTPUpgrade / XHTTP 明文 (port 80)
