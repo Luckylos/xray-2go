@@ -415,7 +415,7 @@ get_info() {
                 _apply_fixed_tunnel "xhttp" || return 1
             fi
             d=$(cat "${work_dir}/domain_xhttp.txt")
-            echo "vless://${cur_uuid}@${CFIP}:${CFPORT}?encryption=none&security=tls&sni=${d}&fp=chrome&type=xhttp&host=${d}&path=%2Fargo#Argo-XHTTP-Fixed" >> "${client_dir}"
+            echo "vless://${cur_uuid}@${CFIP}:${CFPORT}?encryption=none&security=tls&sni=${d}&fp=firefox&type=xhttp&host=${d}&path=%2Fargo#Argo-XHTTP-Fixed" >> "${client_dir}"
         else
             echo ""; green "请选择 Argo 隧道类型："; skyblue "-------------------------------"
             green "1. 临时隧道（自动生成域名，默认）"; green "2. 固定隧道（使用自有 token/json）"; skyblue "-------------------------------"
@@ -427,11 +427,11 @@ get_info() {
                 purple "正在获取临时 ArgoDomain，请稍等..."
                 restart_argo; argodomain=$(get_argodomain)
                 if [ -z "$argodomain" ]; then yellow "未能获取临时域名"
-                else green "ArgoDomain：${argodomain}"; echo "vless://${cur_uuid}@${CFIP}:${CFPORT}?encryption=none&security=tls&sni=${argodomain}&fp=chrome&type=ws&host=${argodomain}&path=%2Fargo%3Fed%3D2560#Argo-WS" >> "${client_dir}"; fi
+                else green "ArgoDomain：${argodomain}"; echo "vless://${cur_uuid}@${CFIP}:${CFPORT}?encryption=none&security=tls&sni=${argodomain}&fp=firefox&type=ws&host=${argodomain}&path=%2Fargo%3Fed%3D2560#Argo-WS" >> "${client_dir}"; fi
             fi
             if [ -f "${work_dir}/domain_ws.txt" ]; then
                 d=$(cat "${work_dir}/domain_ws.txt")
-                echo "vless://${cur_uuid}@${CFIP}:${CFPORT}?encryption=none&security=tls&sni=${d}&fp=chrome&type=ws&host=${d}&path=%2Fargo%3Fed%3D2560#Argo-WS-Fixed" >> "${client_dir}"
+                echo "vless://${cur_uuid}@${CFIP}:${CFPORT}?encryption=none&security=tls&sni=${d}&fp=firefox&type=ws&host=${d}&path=%2Fargo%3Fed%3D2560#Argo-WS-Fixed" >> "${client_dir}"
             fi
         fi
     fi
