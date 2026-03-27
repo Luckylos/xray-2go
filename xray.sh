@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ============================================================
-# 精简版 Xray-2go 一键脚本 (终极优化版)
+# 精简版 Xray-2go 一键脚本
 # 协议：
 #   Argo 固定隧道：VLESS+WS+TLS 或 VLESS+XHTTP+TLS (port 8080)
 #   FreeFlow（可选）：VLESS+WS / HTTPUpgrade / XHTTP 明文 (port 80)
@@ -132,7 +132,7 @@ manage_packages() {
     done
 }
 
-# ── 获取服务器真实 IP (极速版) ───────────────────────────────
+# ── 获取服务器真实IP ───────────────────────────────
 get_realip() {
     local ip
     ip=$(curl -s --max-time 2 https://cloudflare.com/cdn-cgi/trace | awk -F= '/^ip=/{print $2}')
@@ -232,7 +232,7 @@ ask_freeflow_mode() {
     if [ "${FREEFLOW_MODE}" != "none" ]; then
         reading "请输入 FreeFlow path（回车默认 /）: " ff_path_input
         [ -z "${ff_path_input}" ] && FF_PATH="/" || FF_PATH="${ff_path_input#/}"
-        FF_PATH="/${FF_PATH#/}" # 强制开头为 /
+        FF_PATH="/${FF_PATH#/}"
     else
         FF_PATH="/"
     fi
@@ -369,10 +369,10 @@ install_xray() {
             green "cloudflared 二进制已存在，跳过下载"
         fi
 
-        local net_type="ws" net_settings='"wsSettings": { "path": "/vless-argo" }'
+        local net_type="ws" net_settings='"wsSettings": { "path": "/argo" }'
         if [ "${ARGO_PROTO}" = "xhttp" ]; then
             net_type="xhttp"
-            net_settings='"xhttpSettings": { "host": "", "path": "/vless-xhttp", "mode": "auto" }'
+            net_settings='"xhttpSettings": { "host": "", "path": "/argo", "mode": "auto" }'
         fi
         
         cat > "${config_dir}" << EOF
@@ -386,7 +386,7 @@ install_xray() {
     "streamSettings": { "network": "${net_type}", "security": "none", ${net_settings} },
     "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"], "metadataOnly": false }
   }],
-  "dns": { "servers": ["https+local://8.8.8.8/dns-query"] },
+  "dns": { "servers": ["https+local://1.1.1.1/dns-query"] },
   "outbounds": [
     { "protocol": "freedom", "tag": "direct" },
     { "protocol": "blackhole", "tag": "block" }
@@ -398,7 +398,7 @@ EOF
 {
   "log": { "access": "/dev/null", "error": "/dev/null", "loglevel": "none" },
   "inbounds": [],
-  "dns": { "servers": ["https+local://8.8.8.8/dns-query"] },
+  "dns": { "servers": ["https+local://1.1.1.1/dns-query"] },
   "outbounds": [
     { "protocol": "freedom", "tag": "direct" },
     { "protocol": "blackhole", "tag": "block" }
@@ -521,18 +521,13 @@ get_argodomain() {
 }
 
 # ── 节点链接 ──────────────────────────────────────────────────
-_urlencode_path() {
-    printf '%s' "$1" | sed 's/%/%25/g; s/ /%20/g; s/!/%21/g; s/"/%22/g; s/#/%23/g; s/\$/%24/g; s/&/%26/g; s/'\''/%27/g; s/(/%28/g; s/)/%29/g; s/\*/%2A/g; s/+/%2B/g; s/,/%2C/g; s/:/%3A/g; s/;/%3B/g; s/=/%3D/g; s/?/%3F/g; s/@/%40/g; s/\[/%5B/g; s/\]/%5D/g'
-}
-
 build_freeflow_link() {
-    local ip="$1" uuid path_enc
+    local ip="$1" uuid
     uuid=$(get_current_uuid)
-    path_enc=$(_urlencode_path "${FF_PATH}")
     case "${FREEFLOW_MODE}" in
-        ws)          echo "vless://${uuid}@${ip}:80?encryption=none&security=none&type=ws&host=${ip}&path=${path_enc}#FreeFlow-WS" ;;
-        httpupgrade) echo "vless://${uuid}@${ip}:80?encryption=none&security=none&type=httpupgrade&host=${ip}&path=${path_enc}#FreeFlow-HTTPUpgrade" ;;
-        xhttp)       echo "vless://${uuid}@${ip}:80?encryption=none&security=none&type=xhttp&host=${ip}&path=${path_enc}#FreeFlow-XHTTP" ;;
+        ws)          echo "vless://${uuid}@${ip}:80?encryption=none&security=none&type=ws&host=${ip}&path=/argo#FreeFlow-WS" ;;
+        httpupgrade) echo "vless://${uuid}@${ip}:80?encryption=none&security=none&type=httpupgrade&host=${ip}&path=/argo#FreeFlow-HTTPUpgrade" ;;
+        xhttp)       echo "vless://${uuid}@${ip}:80?encryption=none&security=none&type=xhttp&host=${ip}&path=/argo#FreeFlow-XHTTP" ;;
     esac
 }
 
@@ -549,7 +544,7 @@ get_info() {
                 yellow "当前 Argo 使用 XHTTP 协议，不支持临时隧道" >&2
                 if [ -f "${work_dir}/domain_xhttp.txt" ]; then
                     local d_xhttp=$(cat "${work_dir}/domain_xhttp.txt")
-                    echo "vless://${cur_uuid}@${CFIP}:${CFPORT}?encryption=none&security=tls&sni=${d_xhttp}&fp=chrome&type=xhttp&host=${d_xhttp}&path=%2Fvless-xhttp#Argo-XHTTP-Fixed" >&2
+                    echo "vless://${cur_uuid}@${CFIP}:${CFPORT}?encryption=none&security=tls&sni=${d_xhttp}&fp=chrome&type=xhttp&host=${d_xhttp}&path=%2Fargo#Argo-XHTTP-Fixed" >&2
                 else
                     yellow "尚未配置固定 XHTTP 隧道，请先在 Argo 管理菜单中添加" >&2
                 fi
@@ -578,18 +573,18 @@ get_info() {
                     else
                         green "ArgoDomain：${argodomain}" >&2
                     fi
-                    echo "vless://${cur_uuid}@${CFIP}:${CFPORT}?encryption=none&security=tls&sni=${argodomain}&fp=chrome&type=ws&host=${argodomain}&path=%2Fvless-argo%3Fed%3D2560#Argo-WS" >&2
+                    echo "vless://${cur_uuid}@${CFIP}:${CFPORT}?encryption=none&security=tls&sni=${argodomain}&fp=chrome&type=ws&host=${argodomain}&path=%2Fargo%3Fed%3D2560#Argo-WS" >&2
                 fi
             fi
 
             if [ "${ARGO_PROTO}" = "ws" ] && [ -f "${work_dir}/domain_ws.txt" ]; then
                 local d_ws=$(cat "${work_dir}/domain_ws.txt")
-                echo "vless://${cur_uuid}@${CFIP}:${CFPORT}?encryption=none&security=tls&sni=${d_ws}&fp=chrome&type=ws&host=${d_ws}&path=%2Fvless-ws%3Fed%3D2560#Argo-WS-Fixed" >&2
+                echo "vless://${cur_uuid}@${CFIP}:${CFPORT}?encryption=none&security=tls&sni=${d_ws}&fp=chrome&type=ws&host=${d_ws}&path=%2Fargo%3Fed%3D2560#Argo-WS-Fixed" >&2
             fi
 
             if [ "${ARGO_PROTO}" = "xhttp" ] && [ -f "${work_dir}/domain_xhttp.txt" ]; then
                 local d_xhttp=$(cat "${work_dir}/domain_xhttp.txt")
-                echo "vless://${cur_uuid}@${CFIP}:${CFPORT}?encryption=none&security=tls&sni=${d_xhttp}&fp=chrome&type=xhttp&host=${d_xhttp}&path=%2Fvless-xhttp#Argo-XHTTP-Fixed" >&2
+                echo "vless://${cur_uuid}@${CFIP}:${CFPORT}?encryption=none&security=tls&sni=${d_xhttp}&fp=chrome&type=xhttp&host=${d_xhttp}&path=%2Fargo#Argo-XHTTP-Fixed" >&2
             fi
         fi
 
