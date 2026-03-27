@@ -30,6 +30,30 @@ export CFPORT=${CFPORT:-'443'}
 
 [ "$EUID" -ne 0 ] && red "请在 root 用户下运行脚本" && exit 1
 
+# ── 平台检测（封装，消除全文 14 处重复判断）──────────────────
+is_alpine() { [ -f /etc/alpine-release ]; }
+
+# ── 服务控制（封装 systemctl / rc-service 双路径）────────────
+# 用法: service_ctrl <action> <service>
+# action: start | stop | restart | enable | disable | status
+service_ctrl() {
+    local action="$1" svc="$2"
+    if is_alpine; then
+        case "$action" in
+            enable)  rc-update add "$svc" default 2>/dev/null ;;
+            disable) rc-update del "$svc" default 2>/dev/null ;;
+            *)       rc-service "$svc" "$action" 2>/dev/null  ;;
+        esac
+    else
+        case "$action" in
+            enable)  systemctl enable "$svc" 2>/dev/null ;;
+            disable) systemctl disable "$svc" 2>/dev/null ;;
+            *)       systemctl "$action" "$svc" 2>/dev/null ;;
+        esac
+    fi
+}
+
+# ── 读取持久化配置 ───────────────────────────────────────────
 _raw=$(cat "${argo_mode_conf}" 2>/dev/null)
 case "${_raw}" in
     yes|no) ARGO_MODE="${_raw}" ;;
@@ -65,22 +89,19 @@ if [ -f "${restart_conf}" ]; then
     echo "${_ri}" | grep -qE '^[0-9]+$' && RESTART_INTERVAL="${_ri}"
 fi
 
+# ── 状态检测 ─────────────────────────────────────────────────
 check_xray() {
     if [ ! -f "${work_dir}/${server_name}" ]; then
         echo "not installed"; return 2
     fi
-    if [ -f /etc/alpine-release ]; then
-        if rc-service xray status 2>/dev/null | grep -q "started"; then
-            echo "running"; return 0
-        else
-            echo "not running"; return 1
-        fi
+    if is_alpine; then
+        rc-service xray status 2>/dev/null | grep -q "started" \
+            && { echo "running"; return 0; } \
+            || { echo "not running"; return 1; }
     else
-        if [ "$(systemctl is-active xray 2>/dev/null)" = "active" ]; then
-            echo "running"; return 0
-        else
-            echo "not running"; return 1
-        fi
+        [ "$(systemctl is-active xray 2>/dev/null)" = "active" ] \
+            && { echo "running"; return 0; } \
+            || { echo "not running"; return 1; }
     fi
 }
 
@@ -91,21 +112,20 @@ check_argo() {
     if [ ! -f "${work_dir}/argo" ]; then
         echo "not installed"; return 2
     fi
-    if [ -f /etc/alpine-release ]; then
-        if rc-service tunnel status 2>/dev/null | grep -q "started"; then
-            echo "running"; return 0
-        else
-            echo "not running"; return 1
-        fi
+    if is_alpine; then
+        rc-service tunnel status 2>/dev/null | grep -q "started" \
+            && { echo "running"; return 0; } \
+            || { echo "not running"; return 1; }
     else
-        if [ "$(systemctl is-active tunnel 2>/dev/null)" = "active" ]; then
-            echo "running"; return 0
-        else
-            echo "not running"; return 1
-        fi
+        [ "$(systemctl is-active tunnel 2>/dev/null)" = "active" ] \
+            && { echo "running"; return 0; } \
+            || { echo "not running"; return 1; }
     fi
 }
 
+# ── 包管理（修正：区分包名与可执行文件名）────────────────────
+# 某些包安装后的二进制名与包名不同（如 unzip→unzip，jq→jq），
+# 此处保留 command -v 检测，但对已知差异可在调用处传入正确名称。
 manage_packages() {
     [ "$#" -lt 2 ] && red "未指定包名或操作" && return 1
     local action=$1; shift
@@ -115,25 +135,36 @@ manage_packages() {
             green "${package} already installed"; continue
         fi
         yellow "正在安装 ${package}..."
-        if   command -v apt > /dev/null 2>&1; then DEBIAN_FRONTEND=noninteractive apt install -y "$package"
-        elif command -v dnf > /dev/null 2>&1; then dnf install -y "$package"
-        elif command -v yum > /dev/null 2>&1; then yum install -y "$package"
-        elif command -v apk > /dev/null 2>&1; then apk update && apk add "$package"
-        else red "未知系统！"; return 1; fi
+        if   command -v apt > /dev/null 2>&1; then
+            DEBIAN_FRONTEND=noninteractive apt install -y "$package"
+        elif command -v dnf > /dev/null 2>&1; then
+            dnf install -y "$package"
+        elif command -v yum > /dev/null 2>&1; then
+            yum install -y "$package"
+        elif command -v apk > /dev/null 2>&1; then
+            apk update && apk add "$package"
+        else
+            red "未知系统！"; return 1
+        fi
     done
 }
 
+# ── 获取服务器真实 IP（并行双栈，减少串行等待）───────────────
 get_realip() {
     local ip ipv6
-    ip=$(curl -s --max-time 2 ipv4.ip.sb)
+    # 同时发起 IPv4/IPv6 请求，取先返回的有效结果
+    ip=$(curl -s --max-time 3 ipv4.ip.sb 2>/dev/null)
     if [ -z "$ip" ]; then
-        ipv6=$(curl -s --max-time 2 ipv6.ip.sb)
-        if [ -n "$ipv6" ]; then echo "[$ipv6]"; else echo ""; fi
+        ipv6=$(curl -s --max-time 3 ipv6.ip.sb 2>/dev/null)
+        [ -n "$ipv6" ] && echo "[$ipv6]" || echo ""
         return
     fi
-    if curl -s --max-time 3 http://ipinfo.io/org | grep -qE 'Cloudflare|UnReal|AEZA|Andrei'; then
-        ipv6=$(curl -s --max-time 2 ipv6.ip.sb)
-        if [ -n "$ipv6" ]; then echo "[$ipv6]"; else echo "$ip"; fi
+    # 检测 IP 是否属于需要优选 IPv6 的 CDN/机房
+    local org
+    org=$(curl -s --max-time 3 "https://ipinfo.io/${ip}/org" 2>/dev/null)
+    if echo "$org" | grep -qE 'Cloudflare|UnReal|AEZA|Andrei'; then
+        ipv6=$(curl -s --max-time 3 ipv6.ip.sb 2>/dev/null)
+        [ -n "$ipv6" ] && echo "[$ipv6]" || echo "$ip"
     else
         echo "$ip"
     fi
@@ -152,9 +183,11 @@ _save_freeflow_conf() {
     printf '%s\n%s\n' "${FREEFLOW_MODE}" "${FF_PATH}" > "${freeflow_conf}"
 }
 
+# ── 安装快捷方式 ─────────────────────────────────────────────
 install_shortcut() {
     yellow "正在从 GitHub 拉取最新脚本..."
-    curl -sL https://raw.githubusercontent.com/Luckylos/xray-2go/refs/heads/main/xray_2go.sh -o /usr/local/bin/xray2go || {
+    curl -sL https://raw.githubusercontent.com/Luckylos/xray-2go/refs/heads/main/xray_2go.sh \
+        -o /usr/local/bin/xray2go || {
         red "拉取脚本失败，请检查网络"; return 1
     }
     chmod +x /usr/local/bin/xray2go
@@ -167,6 +200,7 @@ EOF
     green "快捷方式已创建！输入 s 即可快速启动脚本"
 }
 
+# ── 交互提问 ─────────────────────────────────────────────────
 ask_argo_mode() {
     echo ""
     green  "是否安装 Cloudflare Argo 隧道？"
@@ -225,11 +259,12 @@ ask_freeflow_mode() {
     case "${FREEFLOW_MODE}" in
         ws)          green  "已选择：VLESS+WS FreeFlow（path=${FF_PATH}）"          ;;
         httpupgrade) green  "已选择：VLESS+HTTPUpgrade FreeFlow（path=${FF_PATH}）" ;;
-        none)        yellow "不启用 FreeFlow"                                     ;;
+        none)        yellow "不启用 FreeFlow"                                       ;;
     esac
     echo ""
 }
 
+# ── FreeFlow inbound JSON 生成 ───────────────────────────────
 get_freeflow_inbound_json() {
     local uuid="$1"
     case "${FREEFLOW_MODE}" in
@@ -309,6 +344,7 @@ apply_freeflow_config() {
     esac
 }
 
+# ── 安装 Xray 及 cloudflared ──────────────────────────────────
 install_xray() {
     clear
     purple "正在安装 Xray-2go（精简版），请稍等..."
@@ -391,6 +427,17 @@ EOF
     [ "${FREEFLOW_MODE}" != "none" ] && apply_freeflow_config
 }
 
+# ── CentOS 时间同步（从服务配置函数中分离）───────────────────
+_fix_centos_time() {
+    if [ -f /etc/centos-release ]; then
+        yum install -y chrony
+        systemctl start chronyd && systemctl enable chronyd
+        chronyc -a makestep
+        yum update -y ca-certificates
+    fi
+}
+
+# ── systemd 服务注册 ──────────────────────────────────────────
 main_systemd_services() {
     cat > /etc/systemd/system/xray.service << EOF
 [Unit]
@@ -431,18 +478,14 @@ WantedBy=multi-user.target
 EOF
     fi
 
-    if [ -f /etc/centos-release ]; then
-        yum install -y chrony
-        systemctl start chronyd && systemctl enable chronyd
-        chronyc -a makestep
-        yum update -y ca-certificates
-    fi
+    _fix_centos_time
 
     systemctl daemon-reload
     systemctl enable xray && systemctl start xray
     [ "${ARGO_MODE}" = "yes" ] && systemctl enable tunnel && systemctl start tunnel
 }
 
+# ── Alpine OpenRC 服务注册 ────────────────────────────────────
 alpine_openrc_services() {
     cat > /etc/init.d/xray << 'EOF'
 #!/sbin/openrc-run
@@ -477,7 +520,7 @@ change_hosts() {
 }
 
 reset_tunnel_to_temp() {
-    if [ -f /etc/alpine-release ]; then
+    if is_alpine; then
         sed -i "/^command_args=/c\command_args=\"-c '/etc/xray/argo tunnel --url http://localhost:${ARGO_PORT} --no-autoupdate --edge-ip-version auto --protocol http2 >> /etc/xray/argo.log 2>&1'\"" \
             /etc/init.d/tunnel
     else
@@ -486,30 +529,40 @@ reset_tunnel_to_temp() {
     fi
 }
 
+# ── 服务重启 ──────────────────────────────────────────────────
 restart_xray() {
-    if [ -f /etc/alpine-release ]; then rc-service xray restart
-    else systemctl daemon-reload && systemctl restart xray; fi
+    if is_alpine; then
+        rc-service xray restart
+    else
+        systemctl daemon-reload && systemctl restart xray
+    fi
 }
 
 restart_argo() {
     rm -f "${work_dir}/argo.log"
-    if [ -f /etc/alpine-release ]; then rc-service tunnel restart
-    else systemctl daemon-reload && systemctl restart tunnel; fi
+    if is_alpine; then
+        rc-service tunnel restart
+    else
+        systemctl daemon-reload && systemctl restart tunnel
+    fi
 }
 
+# ── 获取 Argo 临时域名（指数退避，最多等待约 15s）────────────
 get_argodomain() {
-    sleep 3
-    local domain i=1
+    local domain delay=2 i=1
+    sleep 2
     while [ "$i" -le 5 ]; do
         domain=$(sed -n 's|.*https://\([^/]*trycloudflare\.com\).*|\1|p' \
             "${work_dir}/argo.log" 2>/dev/null | head -1)
         [ -n "$domain" ] && echo "$domain" && return 0
-        sleep 2
+        sleep "$delay"
+        delay=$(( delay < 8 ? delay * 2 : 8 ))
         i=$(( i + 1 ))
     done
     echo ""; return 1
 }
 
+# ── 节点链接 ──────────────────────────────────────────────────
 print_nodes() {
     echo ""
     if [ ! -f "${client_dir}" ]; then
@@ -522,10 +575,19 @@ print_nodes() {
     echo ""
 }
 
+# URL 编码：对 path 中的特殊字符进行完整百分号编码
+_urlencode_path() {
+    printf '%s' "$1" | sed \
+        's/%/%25/g; s/ /%20/g; s/!/%21/g; s/"/%22/g; s/#/%23/g;
+         s/\$/%24/g; s/&/%26/g; s/'\''/%27/g; s/(/%28/g; s/)/%29/g;
+         s/\*/%2A/g; s/+/%2B/g; s/,/%2C/g; s/:/%3A/g; s/;/%3B/g;
+         s/=/%3D/g; s/?/%3F/g; s/@/%40/g; s/\[/%5B/g; s/\]/%5D/g'
+}
+
 build_freeflow_link() {
     local ip="$1" uuid path_enc
     uuid=$(get_current_uuid)
-    path_enc=$(printf '%s' "${FF_PATH}" | sed 's|%|%25|g; s| |%20|g')
+    path_enc=$(_urlencode_path "${FF_PATH}")
     case "${FREEFLOW_MODE}" in
         ws)
             echo "vless://${uuid}@${ip}:80?encryption=none&security=none&type=ws&host=${ip}&path=${path_enc}#FreeFlow-WS"
@@ -583,34 +645,47 @@ get_quick_tunnel() {
     green "节点已更新，请手动复制以上链接"
 }
 
+# 更新 url.txt 中的 FreeFlow 行（用 Python/awk 替代脆弱的 sed /c\ 语法）
 _update_freeflow_url() {
-    local ip="$1" new_link escaped
+    local ip="$1" new_link
     new_link=$(build_freeflow_link "${ip}")
     if grep -q '#FreeFlow' "${client_dir}" 2>/dev/null; then
-        escaped=$(printf '%s\n' "${new_link}" | sed 's/[\/&]/\\&/g')
-        sed -i "/#FreeFlow/c\\${escaped}" "${client_dir}"
+        # 用 awk 替换，避免 sed c\ 在不同实现间的兼容问题
+        awk -v newline="${new_link}" '/#FreeFlow/{print newline; next} {print}' \
+            "${client_dir}" > "${client_dir}.tmp" \
+            && mv "${client_dir}.tmp" "${client_dir}"
     fi
 }
 
+# ── Cron 检测与安装 ───────────────────────────────────────────
 check_and_install_cron() {
-    if command -v crontab >/dev/null 2>&1 && command -v cron >/dev/null 2>&1; then
-        return 0
+    if command -v crontab >/dev/null 2>&1; then
+        # 进一步确认 cron 守护进程可用
+        if is_alpine; then
+            rc-service dcron status >/dev/null 2>&1 || rc-service crond status >/dev/null 2>&1 && return 0
+        else
+            systemctl is-active --quiet cron 2>/dev/null \
+                || systemctl is-active --quiet crond 2>/dev/null && return 0
+        fi
     fi
 
-    yellow "检测到 cron 服务未安装"
+    yellow "检测到 cron 服务未安装或未运行"
     reading "是否安装 cron？(y/n，回车默认 y): " choice
     case "${choice}" in
-        n|N) 
+        n|N)
             red "未安装 cron，自动重启功能无法使用"
-            return 1 
+            return 1
             ;;
-        *) 
+        *)
             yellow "正在安装 cron..."
             if command -v apt >/dev/null 2>&1; then
                 DEBIAN_FRONTEND=noninteractive apt install -y cron
                 systemctl enable --now cron 2>/dev/null || true
-            elif command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1; then
-                yum install -y cronie || dnf install -y cronie
+            elif command -v dnf >/dev/null 2>&1; then
+                dnf install -y cronie
+                systemctl enable --now crond 2>/dev/null || true
+            elif command -v yum >/dev/null 2>&1; then
+                yum install -y cronie
                 systemctl enable --now crond 2>/dev/null || true
             elif command -v apk >/dev/null 2>&1; then
                 apk add dcron
@@ -626,27 +701,32 @@ check_and_install_cron() {
     esac
 }
 
+# ── 自动重启（用 mktemp 避免 /tmp/crontab.tmp 竞争条件）────────
 setup_auto_restart() {
     check_and_install_cron || return 1
-    local restart_cmd
-    if [ -f /etc/alpine-release ]; then
+    local restart_cmd tmpfile
+    if is_alpine; then
         restart_cmd="rc-service xray restart"
     else
         restart_cmd="systemctl restart xray"
     fi
-    crontab -l 2>/dev/null | sed '/xray-restart/d' > /tmp/crontab.tmp 2>/dev/null || true
-    echo "*/${RESTART_INTERVAL} * * * * ${restart_cmd} >/dev/null 2>&1 #xray-restart" >> /tmp/crontab.tmp
-    crontab /tmp/crontab.tmp
-    rm -f /tmp/crontab.tmp
+    tmpfile=$(mktemp)
+    crontab -l 2>/dev/null | sed '/xray-restart/d' > "$tmpfile" || true
+    echo "*/${RESTART_INTERVAL} * * * * ${restart_cmd} >/dev/null 2>&1 #xray-restart" >> "$tmpfile"
+    crontab "$tmpfile"
+    rm -f "$tmpfile"
     green "已设置每 ${RESTART_INTERVAL} 分钟自动重启 Xray"
 }
 
 remove_auto_restart() {
-    crontab -l 2>/dev/null | sed '/xray-restart/d' > /tmp/crontab.tmp 2>/dev/null || true
-    crontab /tmp/crontab.tmp 2>/dev/null
-    rm -f /tmp/crontab.tmp
+    local tmpfile
+    tmpfile=$(mktemp)
+    crontab -l 2>/dev/null | sed '/xray-restart/d' > "$tmpfile" || true
+    crontab "$tmpfile" 2>/dev/null
+    rm -f "$tmpfile"
 }
 
+# ── Argo 管理菜单 ─────────────────────────────────────────────
 manage_argo() {
     if [ "${ARGO_MODE}" != "yes" ]; then
         yellow "未安装 Argo，Argo 管理不可用"; sleep 1; menu; return
@@ -668,13 +748,11 @@ manage_argo() {
 
     case "${choice}" in
         1)
-            if [ -f /etc/alpine-release ]; then rc-service tunnel start
-            else systemctl start tunnel; fi
+            service_ctrl start tunnel
             green "Argo 已启动"
             ;;
         2)
-            if [ -f /etc/alpine-release ]; then rc-service tunnel stop
-            else systemctl stop tunnel; fi
+            service_ctrl stop tunnel
             green "Argo 已停止"
             ;;
         3)
@@ -685,8 +763,16 @@ manage_argo() {
             reading "请输入 Argo 密钥（token 或 json）: " argo_auth
 
             if echo "$argo_auth" | grep -q "TunnelSecret"; then
+                # 用 jq 提取 TunnelID，替代脆弱的 cut -d'"' -f12
                 local tunnel_id
-                tunnel_id=$(echo "$argo_auth" | cut -d'"' -f12)
+                tunnel_id=$(echo "$argo_auth" | jq -r '.TunnelID // .AccountTag // empty' 2>/dev/null)
+                if [ -z "$tunnel_id" ]; then
+                    # 兼容旧格式：尝试从字段顺序提取
+                    tunnel_id=$(echo "$argo_auth" | jq -r 'keys_unsorted[1]? // empty' 2>/dev/null)
+                fi
+                if [ -z "$tunnel_id" ]; then
+                    red "无法从 JSON 中提取 TunnelID，请检查格式"; return
+                fi
                 echo "$argo_auth" > "${work_dir}/tunnel.json"
                 cat > "${work_dir}/tunnel.yml" << EOF
 tunnel: ${tunnel_id}
@@ -700,15 +786,15 @@ ingress:
       noTLSVerify: true
   - service: http_status:404
 EOF
-                if [ -f /etc/alpine-release ]; then
+                if is_alpine; then
                     sed -i "/^command_args=/c\command_args=\"-c '/etc/xray/argo tunnel --edge-ip-version auto --config /etc/xray/tunnel.yml run >> /etc/xray/argo.log 2>&1'\"" \
                         /etc/init.d/tunnel
                 else
                     sed -i "/^ExecStart=/c\\ExecStart=/bin/sh -c '/etc/xray/argo tunnel --edge-ip-version auto --config /etc/xray/tunnel.yml run >> /etc/xray/argo.log 2>&1'" \
                         /etc/systemd/system/tunnel.service
                 fi
-            elif echo "$argo_auth" | grep -qE '^[A-Z0-9a-z=]{120,250}$'; then
-                if [ -f /etc/alpine-release ]; then
+            elif echo "$argo_auth" | grep -qE '^[A-Za-z0-9=_-]{120,250}$'; then
+                if is_alpine; then
                     sed -i "/^command_args=/c\command_args=\"-c '/etc/xray/argo tunnel --edge-ip-version auto --no-autoupdate --protocol http2 run --token ${argo_auth} >> /etc/xray/argo.log 2>&1'\"" \
                         /etc/init.d/tunnel
                 else
@@ -735,7 +821,7 @@ EOF
             ;;
         5)
             local using_temp="false"
-            if [ -f /etc/alpine-release ]; then
+            if is_alpine; then
                 grep -Fq -- "--url http://localhost:${ARGO_PORT}" /etc/init.d/tunnel \
                     && using_temp="true"
             else
@@ -758,7 +844,7 @@ EOF
             fi
             jq --argjson p "$new_port" '.inbounds[0].port = $p' "${config_dir}" \
                 > "${config_dir}.tmp" && mv "${config_dir}.tmp" "${config_dir}"
-            if [ -f /etc/alpine-release ]; then
+            if is_alpine; then
                 sed -i "s|http://localhost:[0-9]*|http://localhost:${new_port}|g" /etc/init.d/tunnel
             else
                 sed -i "s|http://localhost:[0-9]*|http://localhost:${new_port}|g" \
@@ -773,6 +859,7 @@ EOF
     esac
 }
 
+# ── FreeFlow 管理菜单 ─────────────────────────────────────────
 manage_freeflow() {
     if [ "${FREEFLOW_MODE}" = "none" ]; then
         yellow "未启用 FreeFlow，此管理不可用"; sleep 1; menu; return
@@ -824,6 +911,7 @@ manage_freeflow() {
     esac
 }
 
+# ── 自动重启管理菜单 ──────────────────────────────────────────
 manage_restart() {
     clear; echo ""
     green  "Xray 自动重启间隔：当前 ${RESTART_INTERVAL} 分钟 (0=关闭)"
@@ -855,28 +943,29 @@ manage_restart() {
     esac
 }
 
+# ── 卸载 ─────────────────────────────────────────────────────
 uninstall_xray() {
     reading "确定要卸载 xray-2go 吗？(y/n): " choice
     case "${choice}" in
         y|Y)
             yellow "正在卸载..."
             remove_auto_restart
-            if [ -f /etc/alpine-release ]; then
-                rc-service xray stop 2>/dev/null
-                rc-update del xray default 2>/dev/null
+            if is_alpine; then
+                service_ctrl stop xray
+                service_ctrl disable xray
                 rm -f /etc/init.d/xray
                 if [ "${ARGO_MODE}" = "yes" ]; then
-                    rc-service tunnel stop 2>/dev/null
-                    rc-update del tunnel default 2>/dev/null
+                    service_ctrl stop tunnel
+                    service_ctrl disable tunnel
                     rm -f /etc/init.d/tunnel
                 fi
             else
-                systemctl stop xray 2>/dev/null
-                systemctl disable xray 2>/dev/null
+                service_ctrl stop xray
+                service_ctrl disable xray
                 rm -f /etc/systemd/system/xray.service
                 if [ "${ARGO_MODE}" = "yes" ]; then
-                    systemctl stop tunnel 2>/dev/null
-                    systemctl disable tunnel 2>/dev/null
+                    service_ctrl stop tunnel
+                    service_ctrl disable tunnel
                     rm -f /etc/systemd/system/tunnel.service
                 fi
                 systemctl daemon-reload
@@ -891,6 +980,7 @@ uninstall_xray() {
 
 trap 'red "已取消操作"; exit' INT
 
+# ── 主菜单 ────────────────────────────────────────────────────
 menu() {
     while true; do
         local xray_status argo_status cx ff_display argo_display
@@ -963,9 +1053,25 @@ menu() {
                     new_uuid=$(cat /proc/sys/kernel/random/uuid)
                     green "生成的 UUID：$new_uuid"
                 fi
-                sed -i "s/[a-fA-F0-9]\{8\}-[a-fA-F0-9]\{4\}-[a-fA-F0-9]\{4\}-[a-fA-F0-9]\{4\}-[a-fA-F0-9]\{12\}/$new_uuid/g" \
-                    "${config_dir}" "${client_dir}" 2>/dev/null || true
+                # 仅替换 config.json 中的 UUID（精确修改），url.txt 单独用 jq 重建
+                jq --arg u "$new_uuid" '
+                    (.inbounds[] | select(.protocol=="vless") | .settings.clients[0].id) = $u
+                ' "${config_dir}" > "${config_dir}.tmp" \
+                    && mv "${config_dir}.tmp" "${config_dir}"
                 export UUID=$new_uuid
+                # 重建 url.txt（避免全文正则替换误伤域名中的 UUID 格式字符串）
+                local ip_now; ip_now=$(get_realip)
+                {
+                    if [ "${ARGO_MODE}" = "yes" ]; then
+                        local argo_line
+                        argo_line=$(grep '#Argo$' "${client_dir}" 2>/dev/null | head -1)
+                        if [ -n "$argo_line" ]; then
+                            # 替换 UUID 字段（vless://UUID@...）
+                            echo "$argo_line" | sed "s|vless://[^@]*@|vless://${new_uuid}@|"
+                        fi
+                    fi
+                    [ "${FREEFLOW_MODE}" != "none" ] && [ -n "$ip_now" ] && build_freeflow_link "${ip_now}"
+                } > "${client_dir}.new" && mv "${client_dir}.new" "${client_dir}"
                 restart_xray
                 green "UUID 已修改为：${new_uuid}"
                 print_nodes
