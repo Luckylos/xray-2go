@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ============================================================
-# 精简版 Xray-2go 一键脚本 (终极优化版)
+# 精简版 Xray-2go 一键脚本
 # 协议：
 #   Argo（可选）：VLESS+WS+TLS（Cloudflare Argo 隧道）
 #   FreeFlow（可选）：VLESS+WS 明文（port 80）| VLESS+HTTPUpgrade（port 80）
@@ -21,11 +21,12 @@ client_dir="${work_dir}/url.txt"
 freeflow_conf="${work_dir}/freeflow.conf"
 argo_mode_conf="${work_dir}/argo_mode.conf"
 restart_conf="${work_dir}/restart.conf"
+shortcut_path="/usr/local/bin/s"
 
-UUID=${UUID:-$(cat /proc/sys/kernel/random/uuid)}
-ARGO_PORT=${ARGO_PORT:-'8080'}
-CFIP=${CFIP:-'cdns.doon.eu.org'}
-CFPORT=${CFPORT:-'443'}
+export UUID=${UUID:-$(cat /proc/sys/kernel/random/uuid)}
+export ARGO_PORT=${ARGO_PORT:-'8080'}
+export CFIP=${CFIP:-'cdns.doon.eu.org'}
+export CFPORT=${CFPORT:-'443'}
 
 [ "$EUID" -ne 0 ] && red "请在 root 用户下运行脚本" && exit 1
 
@@ -39,7 +40,7 @@ unset _raw
 if [ "${ARGO_MODE}" = "yes" ] && [ -f "${config_dir}" ]; then
     _port=$(jq -r '.inbounds[0].port' "${config_dir}" 2>/dev/null)
     if echo "$_port" | grep -qE '^[0-9]+$'; then
-        ARGO_PORT=$_port
+        export ARGO_PORT=$_port
     fi
     unset _port
 fi
@@ -124,7 +125,7 @@ manage_packages() {
 
 get_realip() {
     local ip ipv6
-    ip=$(curl -s --max-time 2 https://cloudflare.com/cdn-cgi/trace | awk -F= '/^ip=/{print $2}')
+    ip=$(curl -s --max-time 2 ipv4.ip.sb)
     if [ -z "$ip" ]; then
         ipv6=$(curl -s --max-time 2 ipv6.ip.sb)
         if [ -n "$ipv6" ]; then echo "[$ipv6]"; else echo ""; fi
@@ -149,6 +150,21 @@ get_current_uuid() {
 _save_freeflow_conf() {
     mkdir -p "${work_dir}"
     printf '%s\n%s\n' "${FREEFLOW_MODE}" "${FF_PATH}" > "${freeflow_conf}"
+}
+
+install_shortcut() {
+    yellow "正在从 GitHub 拉取最新脚本..."
+    curl -sL https://raw.githubusercontent.com/Luckylos/xray-2go/refs/heads/main/xray_2go.sh -o /usr/local/bin/xray2go || {
+        red "拉取脚本失败，请检查网络"; return 1
+    }
+    chmod +x /usr/local/bin/xray2go
+
+    cat > "${shortcut_path}" << 'EOF'
+#!/bin/bash
+exec /usr/local/bin/xray2go "$@"
+EOF
+    chmod +x "${shortcut_path}"
+    green "快捷方式已创建！输入 s 即可快速启动脚本"
 }
 
 ask_argo_mode() {
@@ -415,6 +431,13 @@ WantedBy=multi-user.target
 EOF
     fi
 
+    if [ -f /etc/centos-release ]; then
+        yum install -y chrony
+        systemctl start chronyd && systemctl enable chronyd
+        chronyc -a makestep
+        yum update -y ca-certificates
+    fi
+
     systemctl daemon-reload
     systemctl enable xray && systemctl start xray
     [ "${ARGO_MODE}" = "yes" ] && systemctl enable tunnel && systemctl start tunnel
@@ -445,6 +468,12 @@ EOF
 
     chmod +x /etc/init.d/xray
     rc-update add xray default
+}
+
+change_hosts() {
+    echo "0 0" > /proc/sys/net/ipv4/ping_group_range
+    sed -i '1s/.*/127.0.0.1   localhost/' /etc/hosts
+    sed -i '2s/.*/::1         localhost/' /etc/hosts
 }
 
 reset_tunnel_to_temp() {
@@ -605,7 +634,7 @@ setup_auto_restart() {
     else
         restart_cmd="systemctl restart xray"
     fi
-    (crontab -l 2>/dev/null || true) | sed '/xray-restart/d' > /tmp/crontab.tmp
+    crontab -l 2>/dev/null | sed '/xray-restart/d' > /tmp/crontab.tmp 2>/dev/null || true
     echo "*/${RESTART_INTERVAL} * * * * ${restart_cmd} >/dev/null 2>&1 #xray-restart" >> /tmp/crontab.tmp
     crontab /tmp/crontab.tmp
     rm -f /tmp/crontab.tmp
@@ -613,7 +642,7 @@ setup_auto_restart() {
 }
 
 remove_auto_restart() {
-    (crontab -l 2>/dev/null || true) | sed '/xray-restart/d' > /tmp/crontab.tmp
+    crontab -l 2>/dev/null | sed '/xray-restart/d' > /tmp/crontab.tmp 2>/dev/null || true
     crontab /tmp/crontab.tmp 2>/dev/null
     rm -f /tmp/crontab.tmp
 }
@@ -735,7 +764,7 @@ EOF
                 sed -i "s|http://localhost:[0-9]*|http://localhost:${new_port}|g" \
                     /etc/systemd/system/tunnel.service
             fi
-            ARGO_PORT=$new_port
+            export ARGO_PORT=$new_port
             restart_xray && restart_argo
             green "Argo 回源端口已修改为：${new_port}"
             ;;
@@ -853,6 +882,7 @@ uninstall_xray() {
                 systemctl daemon-reload
             fi
             rm -rf "${work_dir}"
+            rm -f "${shortcut_path}" /usr/local/bin/xray2go
             green "Xray-2go 卸载完成"
             ;;
         *) purple "已取消卸载" ;;
@@ -894,10 +924,11 @@ menu() {
         green  "5. 查看节点信息"
         green  "6. 修改 UUID"
         green  "7. Xray 自动重启管理"
+        green  "8. 创建快捷方式 (s)"
         echo   "================="
         red    "0. 退出脚本"
         echo   "==========="
-        reading "请输入选择(0-7): " choice
+        reading "请输入选择(0-8): " choice
         echo ""
 
         case "${choice}" in
@@ -913,6 +944,7 @@ menu() {
                         main_systemd_services
                     elif command -v rc-update > /dev/null 2>&1; then
                         alpine_openrc_services
+                        change_hosts
                         rc-service xray restart
                         [ "${ARGO_MODE}" = "yes" ] && rc-service tunnel restart
                     else
@@ -931,21 +963,17 @@ menu() {
                     new_uuid=$(cat /proc/sys/kernel/random/uuid)
                     green "生成的 UUID：$new_uuid"
                 fi
-                
-                jq --arg uuid "$new_uuid" '
-                    (.inbounds[]? | select(.protocol=="vless") | .settings.clients[0].id) |= $uuid
-                ' "${config_dir}" > "${config_dir}.tmp" && mv "${config_dir}.tmp" "${config_dir}"
-                
-                sed -i -E "s/[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}/$new_uuid/g" "${client_dir}" 2>/dev/null || true
-                
-                UUID=$new_uuid
+                sed -i "s/[a-fA-F0-9]\{8\}-[a-fA-F0-9]\{4\}-[a-fA-F0-9]\{4\}-[a-fA-F0-9]\{4\}-[a-fA-F0-9]\{12\}/$new_uuid/g" \
+                    "${config_dir}" "${client_dir}" 2>/dev/null || true
+                export UUID=$new_uuid
                 restart_xray
                 green "UUID 已修改为：${new_uuid}"
                 print_nodes
                 ;;
             7) manage_restart ;;
+            8) install_shortcut ;;
             0) exit 0 ;;
-            *) red "无效的选项，请输入 0 到 7" ;;
+            *) red "无效的选项，请输入 0 到 8" ;;
         esac
         printf '\033[1;91m按回车键继续...\033[0m'
         read -r _dummy
