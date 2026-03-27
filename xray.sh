@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ============================================================
-# 精简版 Xray-2go 一键脚本
+# 精简版 Xray-2go 一键脚本 (终极优化版)
 # 协议：
 #   Argo 固定隧道：VLESS+WS+TLS 或 VLESS+XHTTP+TLS (port 8080)
 #   FreeFlow（可选）：VLESS+WS / HTTPUpgrade / XHTTP 明文 (port 80)
@@ -386,7 +386,7 @@ install_xray() {
     "streamSettings": { "network": "${net_type}", "security": "none", ${net_settings} },
     "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"], "metadataOnly": false }
   }],
-  "dns": { "servers": ["https+local://1.1.1.1/dns-query"] },
+  "dns": { "servers": ["https+local://8.8.8.8/dns-query"] },
   "outbounds": [
     { "protocol": "freedom", "tag": "direct" },
     { "protocol": "blackhole", "tag": "block" }
@@ -398,7 +398,7 @@ EOF
 {
   "log": { "access": "/dev/null", "error": "/dev/null", "loglevel": "none" },
   "inbounds": [],
-  "dns": { "servers": ["https+local://1.1.1.1/dns-query"] },
+  "dns": { "servers": ["https+local://8.8.8.8/dns-query"] },
   "outbounds": [
     { "protocol": "freedom", "tag": "direct" },
     { "protocol": "blackhole", "tag": "block" }
