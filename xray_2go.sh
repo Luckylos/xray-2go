@@ -5,7 +5,7 @@
 # 协议：
 #   Argo 临时隧道：VLESS+WS+TLS（Cloudflare 随机域名）
 #   Argo 固定隧道 WS：VLESS+WS+TLS（port 8080，自有域名）
-#   Argo 固定隧道 XHTTP：VLESS+XHTTP+TLS（port 8081，自有域名）
+#   Argo 固定隧道 XHTTP：VLESS+XHTTP+TLS（port 8080，自有域名）
 #   FreeFlow（可选）：VLESS+WS 明文（port 80）| VLESS+HTTPUpgrade（port 80）
 # ============================================================
 
