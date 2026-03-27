@@ -288,7 +288,7 @@ EOF
   "settings": { "clients": [{ "id": "${uuid}" }], "decryption": "none" },
   "streamSettings": {
     "network": "xhttp", "security": "none",
-    "xhttpSettings": { "host": "", "path": "${FF_PATH}", "mode": "stream-one" }
+    "xhttpSettings": { "host": "", "path": "${FF_PATH}", "mode": "auto" }
   },
   "sniffing": { "enabled": true, "destOverride": ["http","tls","quic"], "metadataOnly": false }
 }
@@ -377,7 +377,7 @@ install_xray() {
         local net_type="ws" net_settings='"wsSettings": { "path": "/argo" }'
         if [ "${ARGO_PROTO}" = "xhttp" ]; then
             net_type="xhttp"
-            net_settings='"xhttpSettings": { "host": "", "path": "/argo", "mode": "stream-one" }'
+            net_settings='"xhttpSettings": { "host": "", "path": "/argo", "mode": "auto" }'
         fi
 
         cat > "${config_dir}" << EOF
