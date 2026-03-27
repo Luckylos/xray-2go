@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ============================================================
-# 精简版 Xray-2go 一键脚本 (极简优化版)
+# 精简版 Xray-2go 一键脚本
 # 协议：
 #   Argo 固定隧道：VLESS+WS+TLS 或 VLESS+XHTTP+TLS (port 8080)
 #   FreeFlow（可选）：VLESS+WS / HTTPUpgrade / XHTTP 明文 (port 80)
@@ -123,7 +123,6 @@ manage_packages() {
     done
 }
 
-# ── 获取服务器真实IP ───────────────────────────────
 get_realip() {
     local ip ipv6
     ip=$(curl -s --max-time 2 https://cloudflare.com/cdn-cgi/trace | awk -F= '/^ip=/{print $2}')
@@ -137,47 +136,29 @@ get_realip() {
 }
 
 get_current_uuid() {
-    local id
-    id=$(jq -r '(first(.inbounds[] | select(.protocol=="vless") | .settings.clients[0].id) // empty)' "${config_dir}" 2>/dev/null)
+    local id=$(jq -r '(first(.inbounds[] | select(.protocol=="vless") | .settings.clients[0].id) // empty)' "${config_dir}" 2>/dev/null)
     echo "${id:-${UUID}}"
 }
 
-_save_freeflow_conf() {
-    mkdir -p "${work_dir}"
-    printf '%s\n%s\n' "${FREEFLOW_MODE}" "${FF_PATH}" > "${freeflow_conf}"
-}
+_save_freeflow_conf() { mkdir -p "${work_dir}"; printf '%s\n%s\n' "${FREEFLOW_MODE}" "${FF_PATH}" > "${freeflow_conf}"; }
+_save_argo_proto() { mkdir -p "${work_dir}"; echo "${ARGO_PROTO}" > "${work_dir}/argo_proto.conf"; }
 
-_save_argo_proto() {
-    mkdir -p "${work_dir}"
-    echo "${ARGO_PROTO}" > "${work_dir}/argo_proto.conf"
-}
-
-# ── 节点信息展示 ─────────────────────────────────────────────
 print_nodes() {
     echo ""
-    if [ ! -f "${client_dir}" ]; then
-        yellow "节点文件不存在，请先安装或重新获取节点信息"
-        return 1
-    fi
-    while IFS= read -r line; do
-        [ -n "$line" ] && printf '\033[1;35m%s\033[0m\n' "$line"
-    done < "${client_dir}"
+    [ ! -f "${client_dir}" ] && { yellow "节点文件不存在，请先安装或重新获取节点信息"; return 1; }
+    while IFS= read -r line; do [ -n "$line" ] && printf '\033[1;35m%s\033[0m\n' "$line"; done < "${client_dir}"
     echo ""
 }
 
-# ── 安装快捷方式 ─────────────────────────────────────────────
 install_shortcut() {
     yellow "正在从 GitHub 拉取最新脚本..."
-    curl -sL https://raw.githubusercontent.com/Luckylos/xray-2go/refs/heads/main/xray_2go.sh \
-        -o /usr/local/bin/xray2go || { red "拉取脚本失败"; return 1; }
+    curl -sL https://raw.githubusercontent.com/Luckylos/xray-2go/refs/heads/main/xray_2go.sh -o /usr/local/bin/xray2go || { red "拉取失败"; return 1; }
     chmod +x /usr/local/bin/xray2go
-
     cat > "${shortcut_path}" << 'EOF'
 #!/bin/bash
 exec /usr/local/bin/xray2go "$@"
 EOF
-    chmod +x "${shortcut_path}"
-    green "快捷方式已创建！输入 s 即可快速启动脚本"
+    chmod +x "${shortcut_path}"; green "快捷方式 s 已创建"
 }
 
 # ── 交互提问 ─────────────────────────────────────────────────
@@ -192,7 +173,7 @@ ask_argo_mode() {
 
 ask_freeflow_mode() {
     echo ""; green "请选择 FreeFlow 方式："; skyblue "-----------------------------"
-    green "1. VLESS + WS"; green "2. VLESS + HTTPUpgrade"; green "3. VLESS + XHTTP"; green "4. 不启用 FreeFlow（默认）"
+    green "1. VLESS + WS"; green "2. VLESS + HTTPUpgrade"; green "3. VLESS + XHTTP"; green "4. 不启用（默认）"
     skyblue "-----------------------------"; reading "请输入选择(1-4，回车默认4): " ff_choice
     case "${ff_choice}" in
         1) FREEFLOW_MODE="ws" ;; 2) FREEFLOW_MODE="httpupgrade" ;; 3) FREEFLOW_MODE="xhttp" ;; *) FREEFLOW_MODE="none" ;;
@@ -204,20 +185,20 @@ ask_freeflow_mode() {
         FF_PATH="/"
     fi
     _save_freeflow_conf
-    [ "${FREEFLOW_MODE}" != "none" ] && green "已选择：VLESS+${FREEFLOW_MODE^^} FreeFlow（path=${FF_PATH}）" || yellow "不启用 FreeFlow"
+    [ "${FREEFLOW_MODE}" != "none" ] && green "已选择：VLESS+${FREEFLOW_MODE^^}（path=${FF_PATH}）" || yellow "不启用 FreeFlow"
 }
 
 ask_argo_proto() {
     [ "${ARGO_MODE}" = "no" ] && return
     echo ""; green "请选择 Argo 隧道协议（复用同一端口）："; skyblue "------------------------------------"
-    green "1. WS（WebSocket，支持临时隧道，默认）"; green "2. XHTTP（不支持临时隧道）"; skyblue "------------------------------------"
+    green "1. WS（支持临时隧道，默认）"; green "2. XHTTP（必须配合固定隧道使用）"; skyblue "------------------------------------"
     reading "请输入选择(1-2，回车默认1): " proto_choice
     [ "${proto_choice}" = "2" ] && ARGO_PROTO="xhttp" || ARGO_PROTO="ws"
     _save_argo_proto
     [ "${ARGO_PROTO}" = "xhttp" ] && yellow "警告：XHTTP 模式必须使用固定隧道" || green "已选择：Argo ${ARGO_PROTO^^} 协议"
 }
 
-# ── FreeFlow inbound JSON 生成 ───────────────────────────────
+# ── 配置生成与服务构建模块 ──────────────────────────────────
 get_freeflow_inbound_json() {
     local uuid="$1"
     case "${FREEFLOW_MODE}" in
@@ -252,7 +233,6 @@ _jq_del_inbound() {
 apply_freeflow_config() {
     local cur_uuid=$(get_current_uuid)
     [ -z "$cur_uuid" ] || [ "$cur_uuid" = "null" ] && cur_uuid="${UUID}"
-
     if [ "${FREEFLOW_MODE}" != "none" ]; then
         _jq_set_inbound "$(calc_freeflow_index)" "$(get_freeflow_inbound_json "${cur_uuid}")"
     else
@@ -260,9 +240,8 @@ apply_freeflow_config() {
     fi
 }
 
-# ── 安装 Xray 及 cloudflared ──────────────────────────────────
 install_xray() {
-    clear; purple "正在安装 Xray-2go（精简版），请稍等..."; enable_bbr
+    clear; purple "正在安装基础环境与 Xray..."; enable_bbr
     local ARCH_RAW=$(uname -m) ARCH ARCH_ARG
     case "${ARCH_RAW}" in
         'x86_64')            ARCH='amd64'; ARCH_ARG='64'        ;;
@@ -289,10 +268,8 @@ install_xray() {
 
         local net_type="ws" net_settings='"wsSettings": { "path": "/argo" }'
         if [ "${ARGO_PROTO}" = "xhttp" ]; then
-            net_type="xhttp"
-            net_settings='"xhttpSettings": { "host": "", "path": "/argo", "mode": "stream-one" }'
+            net_type="xhttp"; net_settings='"xhttpSettings": { "host": "", "path": "/argo", "mode": "stream-one" }'
         fi
-
         cat > "${config_dir}" << EOF
 { "log": { "access": "/dev/null", "error": "/dev/null", "loglevel": "none" }, "inbounds": [{ "port": ${ARGO_PORT}, "listen": "127.0.0.1", "protocol": "vless", "settings": { "clients": [{ "id": "${UUID}" }], "decryption": "none" }, "streamSettings": { "network": "${net_type}", "security": "none", ${net_settings} }, "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"], "metadataOnly": false } }], "dns": { "servers": ["https+local://1.1.1.1/dns-query"] }, "outbounds": [ { "protocol": "freedom", "tag": "direct" }, { "protocol": "blackhole", "tag": "block" } ] }
 EOF
@@ -301,13 +278,88 @@ EOF
 { "log": { "access": "/dev/null", "error": "/dev/null", "loglevel": "none" }, "inbounds": [], "dns": { "servers": ["https+local://1.1.1.1/dns-query"] }, "outbounds": [ { "protocol": "freedom", "tag": "direct" }, { "protocol": "blackhole", "tag": "block" } ] }
 EOF
     fi
-
     [ "${FREEFLOW_MODE}" != "none" ] && apply_freeflow_config
 }
 
-# ── 服务注册 ──────────────────────────────────────────
-main_systemd_services() {
-    cat > /etc/systemd/system/xray.service << EOF
+# ── 纯净的固定隧道参数交互 ──────────────────────────────────
+ask_fixed_tunnel_info() {
+    local mode="${1:-ws}" port="${ARGO_PORT}" tunnel_id
+    yellow "固定隧道回源端口为 ${port}，请在 CF 后台配置对应 ingress"
+    reading "请输入你的 Argo 域名: " argo_domain
+    [ -z "$argo_domain" ] && { red "Argo 域名不能为空"; return 1; }
+    reading "请输入 Argo 密钥（token 或 json）: " argo_auth
+
+    if echo "$argo_auth" | grep -q "TunnelSecret"; then
+        tunnel_id=$(echo "$argo_auth" | jq -r '.TunnelID // .AccountTag // empty' 2>/dev/null)
+        [ -z "$tunnel_id" ] && tunnel_id=$(echo "$argo_auth" | jq -r 'keys_unsorted[1]? // empty' 2>/dev/null)
+        [ -z "$tunnel_id" ] && { red "无法解析 JSON"; return 1; }
+        echo "$argo_auth" > "${work_dir}/tunnel.json"
+        cat > "${work_dir}/tunnel.yml" << EOF
+tunnel: ${tunnel_id}
+credentials-file: ${work_dir}/tunnel.json
+protocol: http2
+ingress:
+  - hostname: ${argo_domain}
+    service: http://localhost:${port}
+    originRequest:
+      noTLSVerify: true
+  - service: http_status:404
+EOF
+        ARGO_EXEC_CMD="${work_dir}/argo tunnel --edge-ip-version auto --config ${work_dir}/tunnel.yml run"
+    elif echo "$argo_auth" | grep -qE '^[A-Za-z0-9=_-]{120,250}$'; then
+        ARGO_EXEC_CMD="${work_dir}/argo tunnel --edge-ip-version auto --no-autoupdate --protocol http2 run --token ${argo_auth}"
+    else
+        yellow "输入格式有误"; return 1
+    fi
+
+    echo "$argo_domain" > "${work_dir}/domain_${mode}.txt"
+    return 0
+}
+
+write_tunnel_service() {
+    local exec_cmd="$1"
+    if is_alpine; then
+        cat > /etc/init.d/tunnel << EOF
+#!/sbin/openrc-run
+description="Cloudflare Tunnel"
+command="/bin/sh"
+command_args="-c '${exec_cmd} >> ${work_dir}/argo.log 2>&1'"
+command_background=true
+pidfile="/var/run/tunnel.pid"
+EOF
+        chmod +x /etc/init.d/tunnel
+    else
+        cat > /etc/systemd/system/tunnel.service << EOF
+[Unit]
+Description=Cloudflare Tunnel
+After=network.target
+[Service]
+Type=simple
+NoNewPrivileges=yes
+TimeoutStartSec=0
+ExecStart=/bin/sh -c '${exec_cmd} >> ${work_dir}/argo.log 2>&1'
+Restart=on-failure
+RestartSec=5s
+[Install]
+WantedBy=multi-user.target
+EOF
+        systemctl daemon-reload
+    fi
+}
+
+install_services_and_start() {
+    if is_alpine; then
+        cat > /etc/init.d/xray << 'EOF'
+#!/sbin/openrc-run
+description="Xray service"
+command="/etc/xray/xray"
+command_args="run -c /etc/xray/config.json"
+command_background=true
+pidfile="/var/run/xray.pid"
+EOF
+        chmod +x /etc/init.d/xray
+    else
+        cat > /etc/systemd/system/xray.service << EOF
 [Unit]
 Description=Xray Service
 After=network.target nss-lookup.target
@@ -321,70 +373,25 @@ RestartPreventExitStatus=23
 [Install]
 WantedBy=multi-user.target
 EOF
-
-    if [ "${ARGO_MODE}" = "yes" ]; then
-        cat > /etc/systemd/system/tunnel.service << EOF
-[Unit]
-Description=Cloudflare Tunnel
-After=network.target
-[Service]
-Type=simple
-NoNewPrivileges=yes
-TimeoutStartSec=0
-ExecStart=${work_dir}/argo tunnel --url http://localhost:${ARGO_PORT} --no-autoupdate --edge-ip-version auto --protocol http2
-StandardOutput=append:${work_dir}/argo.log
-StandardError=append:${work_dir}/argo.log
-Restart=on-failure
-RestartSec=5s
-[Install]
-WantedBy=multi-user.target
-EOF
+        systemctl daemon-reload
     fi
 
-    systemctl daemon-reload
+    [ "${ARGO_MODE}" = "yes" ] && write_tunnel_service "${ARGO_EXEC_CMD}"
+
     service_ctrl enable xray; service_ctrl start xray
     [ "${ARGO_MODE}" = "yes" ] && { service_ctrl enable tunnel; service_ctrl start tunnel; }
 }
 
-alpine_openrc_services() {
-    cat > /etc/init.d/xray << 'EOF'
-#!/sbin/openrc-run
-description="Xray service"
-command="/etc/xray/xray"
-command_args="run -c /etc/xray/config.json"
-command_background=true
-pidfile="/var/run/xray.pid"
-EOF
-
-    if [ "${ARGO_MODE}" = "yes" ]; then
-        cat > /etc/init.d/tunnel << EOF
-#!/sbin/openrc-run
-description="Cloudflare Tunnel"
-command="/bin/sh"
-command_args="-c '/etc/xray/argo tunnel --url http://localhost:${ARGO_PORT} --no-autoupdate --edge-ip-version auto --protocol http2 >> /etc/xray/argo.log 2>&1'"
-command_background=true
-pidfile="/var/run/tunnel.pid"
-EOF
-        chmod +x /etc/init.d/tunnel
-        service_ctrl enable tunnel
-    fi
-    chmod +x /etc/init.d/xray
-    service_ctrl enable xray
-}
-
 reset_tunnel_to_temp() {
-    if is_alpine; then
-        sed -i "/^command_args=/c\command_args=\"-c '/etc/xray/argo tunnel --url http://localhost:${ARGO_PORT} --no-autoupdate --edge-ip-version auto --protocol http2 >> /etc/xray/argo.log 2>&1'\"" /etc/init.d/tunnel
-    else
-        sed -i "/^ExecStart=/c\\ExecStart=${work_dir}/argo tunnel --url http://localhost:${ARGO_PORT} --no-autoupdate --edge-ip-version auto --protocol http2" /etc/systemd/system/tunnel.service
-    fi
+    rm -f "${work_dir}/domain_ws.txt" "${work_dir}/domain_xhttp.txt"
+    ARGO_EXEC_CMD="${work_dir}/argo tunnel --url http://localhost:${ARGO_PORT} --no-autoupdate --edge-ip-version auto --protocol http2"
+    write_tunnel_service "${ARGO_EXEC_CMD}"
 }
 
-# ── 服务重启 ──────────────────────────────────────────────────
+# ── 服务重启与运行监控 ─────────────────────────────────────────
 restart_xray() { is_alpine || systemctl daemon-reload 2>/dev/null; service_ctrl restart xray; }
 restart_argo() { rm -f "${work_dir}/argo.log"; is_alpine || systemctl daemon-reload 2>/dev/null; service_ctrl restart tunnel; }
 
-# ── 获取 Argo 临时域名 ────────────────────────────────────────
 get_argodomain() {
     local domain delay=2 i=1
     sleep 2
@@ -396,7 +403,7 @@ get_argodomain() {
     return 1
 }
 
-# ── 节点链接 ──────────────────────────────────────────────────
+# ── 纯净只读的链接抓取 ────────────────────────────────────────
 build_freeflow_link() {
     local ip="$1" uuid=$(get_current_uuid)
     echo "vless://${uuid}@${ip}:80?encryption=none&security=none&type=${FREEFLOW_MODE}&host=${ip}&path=${FF_PATH}#FreeFlow-${FREEFLOW_MODE^^}"
@@ -404,34 +411,27 @@ build_freeflow_link() {
 
 get_info() {
     clear
-    local IP=$(get_realip) cur_uuid=$(get_current_uuid) argodomain tunnel_choice d
+    local IP=$(get_realip) cur_uuid=$(get_current_uuid) argodomain d
     [ -z "$IP" ] && yellow "警告：无法获取服务器 IP，依赖 IP 的节点链接将缺失"
     > "${client_dir}"
 
     if [ "${ARGO_MODE}" = "yes" ]; then
         if [ "${ARGO_PROTO}" = "xhttp" ]; then
-            if [ ! -f "${work_dir}/domain_xhttp.txt" ]; then
-                yellow "XHTTP 协议必须配置固定隧道！"
-                _apply_fixed_tunnel "xhttp" || return 1
+            if [ -f "${work_dir}/domain_xhttp.txt" ]; then
+                d=$(cat "${work_dir}/domain_xhttp.txt")
+                echo "vless://${cur_uuid}@${CFIP}:${CFPORT}?encryption=none&security=tls&sni=${d}&fp=chrome&type=xhttp&host=${d}&path=%2Fargo#Argo-XHTTP-Fixed" >> "${client_dir}"
+            else
+                yellow "XHTTP 固定隧道配置文件缺失！"
             fi
-            d=$(cat "${work_dir}/domain_xhttp.txt")
-            echo "vless://${cur_uuid}@${CFIP}:${CFPORT}?encryption=none&security=tls&sni=${d}&fp=chrome&type=xhttp&host=${d}&path=%2Fargo#Argo-XHTTP-Fixed" >> "${client_dir}"
         else
-            echo ""; green "请选择 Argo 隧道类型："; skyblue "-------------------------------"
-            green "1. 临时隧道（自动生成域名，默认）"; green "2. 固定隧道（使用自有 token/json）"; skyblue "-------------------------------"
-            reading "请输入选择(1-2，回车默认1): " tunnel_choice
-
-            [ "${tunnel_choice}" = "2" ] && { _apply_fixed_tunnel "ws" || tunnel_choice="1"; }
-
-            if [ "${tunnel_choice}" != "2" ]; then
-                purple "正在获取临时 ArgoDomain，请稍等..."
-                restart_argo; argodomain=$(get_argodomain)
-                if [ -z "$argodomain" ]; then yellow "未能获取临时域名"
-                else green "ArgoDomain：${argodomain}"; echo "vless://${cur_uuid}@${CFIP}:${CFPORT}?encryption=none&security=tls&sni=${argodomain}&fp=chrome&type=ws&host=${argodomain}&path=%2Fargo%3Fed%3D2560#Argo-WS" >> "${client_dir}"; fi
-            fi
             if [ -f "${work_dir}/domain_ws.txt" ]; then
                 d=$(cat "${work_dir}/domain_ws.txt")
                 echo "vless://${cur_uuid}@${CFIP}:${CFPORT}?encryption=none&security=tls&sni=${d}&fp=chrome&type=ws&host=${d}&path=%2Fargo%3Fed%3D2560#Argo-WS-Fixed" >> "${client_dir}"
+            else
+                purple "正在获取临时 ArgoDomain，请稍等..."
+                argodomain=$(get_argodomain)
+                if [ -z "$argodomain" ]; then yellow "未能获取临时域名"
+                else green "ArgoDomain：${argodomain}"; echo "vless://${cur_uuid}@${CFIP}:${CFPORT}?encryption=none&security=tls&sni=${argodomain}&fp=chrome&type=ws&host=${argodomain}&path=%2Fargo%3Fed%3D2560#Argo-WS" >> "${client_dir}"; fi
             fi
         fi
     fi
@@ -451,12 +451,7 @@ get_quick_tunnel() {
     print_nodes
 }
 
-_update_freeflow_url() {
-    local ip="$1" new_link=$(build_freeflow_link "${ip}")
-    grep -q '#FreeFlow' "${client_dir}" 2>/dev/null && awk -v nl="${new_link}" '/#FreeFlow/{print nl; next}1' "${client_dir}" > "${client_dir}.tmp" && mv "${client_dir}.tmp" "${client_dir}"
-}
-
-# ── Cron 检测与安装 ───────────────────────────────────────────
+# ── 系统功能与菜单逻辑 ───────────────────────────────────────
 check_and_install_cron() {
     if command -v crontab >/dev/null 2>&1; then
         is_alpine && { service_ctrl status dcron || service_ctrl status crond; } && return 0
@@ -489,71 +484,6 @@ remove_auto_restart() {
     crontab "$tmpfile" 2>/dev/null; rm -f "$tmpfile"
 }
 
-# ── 固定隧道配置 ───────────────────────────────────────────────
-_apply_fixed_tunnel() {
-    local mode="${1:-ws}" port="${ARGO_PORT}" exec_cmd tunnel_id log_file="${work_dir}/argo.log"
-    yellow "固定隧道回源端口为 ${port}，请在 CF 后台配置对应 ingress"
-    reading "请输入你的 Argo 域名: " argo_domain
-    [ -z "$argo_domain" ] && { red "Argo 域名不能为空"; return 1; }
-    reading "请输入 Argo 密钥（token 或 json）: " argo_auth
-
-    if echo "$argo_auth" | grep -q "TunnelSecret"; then
-        tunnel_id=$(echo "$argo_auth" | jq -r '.TunnelID // .AccountTag // empty' 2>/dev/null)
-        [ -z "$tunnel_id" ] && tunnel_id=$(echo "$argo_auth" | jq -r 'keys_unsorted[1]? // empty' 2>/dev/null)
-        [ -z "$tunnel_id" ] && { red "无法解析 JSON"; return 1; }
-        echo "$argo_auth" > "${work_dir}/tunnel.json"
-        cat > "${work_dir}/tunnel.yml" << EOF
-tunnel: ${tunnel_id}
-credentials-file: ${work_dir}/tunnel.json
-protocol: http2
-ingress:
-  - hostname: ${argo_domain}
-    service: http://localhost:${port}
-    originRequest:
-      noTLSVerify: true
-  - service: http_status:404
-EOF
-        exec_cmd="${work_dir}/argo tunnel --edge-ip-version auto --config ${work_dir}/tunnel.yml run"
-    elif echo "$argo_auth" | grep -qE '^[A-Za-z0-9=_-]{120,250}$'; then
-        exec_cmd="${work_dir}/argo tunnel --edge-ip-version auto --no-autoupdate --protocol http2 run --token ${argo_auth}"
-    else
-        yellow "输入格式有误"; return 1
-    fi
-
-    if is_alpine; then
-        cat > /etc/init.d/tunnel << EOF
-#!/sbin/openrc-run
-description="Cloudflare Tunnel"
-command="/bin/sh"
-command_args="-c '${exec_cmd} >> ${log_file} 2>&1'"
-command_background=true
-pidfile="/var/run/tunnel.pid"
-EOF
-        chmod +x /etc/init.d/tunnel
-    else
-        cat > /etc/systemd/system/tunnel.service << EOF
-[Unit]
-Description=Cloudflare Tunnel
-After=network.target
-[Service]
-Type=simple
-NoNewPrivileges=yes
-TimeoutStartSec=0
-ExecStart=/bin/sh -c '${exec_cmd} >> ${log_file} 2>&1'
-Restart=on-failure
-RestartSec=5s
-[Install]
-WantedBy=multi-user.target
-EOF
-        systemctl daemon-reload
-    fi
-    service_ctrl enable tunnel
-    echo "$argo_domain" > "${work_dir}/domain_${mode}.txt"
-    restart_argo; green "固定隧道（${mode^^}）已配置，域名：${argo_domain}"
-    return 0
-}
-
-# ── 菜单逻辑 ──────────────────────────────────────────────────
 manage_argo() {
     [ "${ARGO_MODE}" != "yes" ] && { yellow "未启用 Argo"; sleep 1; return; }
     check_argo > /dev/null 2>&1; [ $? -eq 2 ] && { yellow "Argo 尚未安装"; sleep 1; return; }
@@ -566,8 +496,11 @@ manage_argo() {
     case "${choice}" in
         1) service_ctrl start tunnel; green "Argo 已启动" ;;
         2) service_ctrl stop tunnel; green "Argo 已停止" ;;
-        3) _apply_fixed_tunnel "${ARGO_PROTO}" || return; get_info ;;
-        4) [ "${ARGO_PROTO}" = "xhttp" ] && { yellow "XHTTP 不支持临时隧道"; sleep 1; return; }; reset_tunnel_to_temp; get_quick_tunnel ;;
+        3)
+            ask_fixed_tunnel_info "${ARGO_PROTO}" || return
+            write_tunnel_service "${ARGO_EXEC_CMD}"; restart_argo; get_info
+            ;;
+        4) [ "${ARGO_PROTO}" = "xhttp" ] && { yellow "XHTTP 不支持临时隧道"; sleep 1; return; }; reset_tunnel_to_temp; restart_argo; get_quick_tunnel ;;
         5) [ "${ARGO_PROTO}" = "xhttp" ] && { yellow "XHTTP 不支持临时隧道"; sleep 1; return; }; get_quick_tunnel ;;
         6)
             reading "请输入新回源端口（回车随机）: " new_port
@@ -638,10 +571,24 @@ menu() {
         case "${choice}" in
             1) if [ "$cx" -eq 0 ]; then yellow "已安装！"; else
                    ask_argo_mode; ask_freeflow_mode; [ "${ARGO_MODE}" = "yes" ] && ask_argo_proto
-                   manage_packages install jq unzip; install_xray
-                   if command -v systemctl > /dev/null 2>&1; then main_systemd_services
-                   elif command -v rc-update > /dev/null 2>&1; then alpine_openrc_services; service_ctrl restart xray; [ "${ARGO_MODE}" = "yes" ] && service_ctrl restart tunnel
-                   else red "不支持的 init 系统"; exit 1; fi
+                   manage_packages install jq unzip
+                   install_xray
+
+                   # 核心重构：参数先行收集，阻断一切抢占运行行为
+                   ARGO_EXEC_CMD="${work_dir}/argo tunnel --url http://localhost:${ARGO_PORT} --no-autoupdate --edge-ip-version auto --protocol http2"
+                   if [ "${ARGO_MODE}" = "yes" ]; then
+                       if [ "${ARGO_PROTO}" = "xhttp" ]; then
+                           yellow "XHTTP 协议必须配置固定隧道！"
+                           ask_fixed_tunnel_info "xhttp" || exit 1
+                       else
+                           echo ""; green "请选择 Argo 隧道类型："; skyblue "-------------------------------"
+                           green "1. 临时隧道（自动生成域名，默认）"; green "2. 固定隧道（使用自有 token/json）"; skyblue "-------------------------------"
+                           reading "请输入选择(1-2，回车默认1): " tunnel_choice
+                           [ "${tunnel_choice}" = "2" ] && { ask_fixed_tunnel_info "ws" || yellow "回退到临时隧道"; }
+                       fi
+                   fi
+
+                   install_services_and_start
                    get_info
                fi ;;
             2) uninstall_xray ;; 3) manage_argo ;; 4) manage_freeflow ;; 5) check_nodes ;;
