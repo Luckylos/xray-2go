@@ -386,7 +386,7 @@ install_xray() {
     "streamSettings": { "network": "${net_type}", "security": "none", ${net_settings} },
     "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"], "metadataOnly": false }
   }],
-  "dns": { "servers": ["https+local://8.8.8.8/dns-query"] },
+  "dns": { "servers": ["https+local://1.1.1.1/dns-query"] },
   "outbounds": [
     { "protocol": "freedom", "tag": "direct" },
     { "protocol": "blackhole", "tag": "block" }
@@ -398,7 +398,7 @@ EOF
 {
   "log": { "access": "/dev/null", "error": "/dev/null", "loglevel": "none" },
   "inbounds": [],
-  "dns": { "servers": ["https+local://8.8.8.8/dns-query"] },
+  "dns": { "servers": ["https+local://1.1.1.1/dns-query"] },
   "outbounds": [
     { "protocol": "freedom", "tag": "direct" },
     { "protocol": "blackhole", "tag": "block" }
