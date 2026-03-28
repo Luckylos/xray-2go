@@ -992,7 +992,7 @@ manage_freeflow() {
         skyblue "  方式: ${FREEFLOW_MODE}（path=${FF_PATH}）"
     fi
     echo   "=========================="
-    green  "1. 变更 FreeFlow 方式"
+    green  "1. 添加/变更 FreeFlow 方式"
     green  "2. 修改 FreeFlow path"
     red    "3. 卸载 FreeFlow"
     purple "0. 返回主菜单"
