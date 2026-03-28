@@ -588,7 +588,7 @@ build_freeflow_link() {
             echo "vless://${uuid}@${ip}:80?encryption=none&security=none&type=httpupgrade&host=${ip}&path=${path_enc}#FreeFlow-HTTPUpgrade"
             ;;
         xhttp)
-            echo "vless://${uuid}@${ip}:80?encryption=none&security=none&type=xhttp&host=${ip}&path=${path_enc}&mode=stream-one#FreeFlow-XHTTP"
+            echo "vless://${uuid}@${ip}:80?encryption=none&security=none&type=xhttp&host=${ip}&path=${path_enc}&mode=auto#FreeFlow-XHTTP"
             ;;
     esac
 }
@@ -748,7 +748,7 @@ get_info() {
 
             # 生成 Argo 节点链接（path 统一 /argo）
             if [ "${ARGO_PROTOCOL}" = "xhttp" ]; then
-                echo "vless://${cur_uuid}@${CFIP}:${CFPORT}?encryption=none&security=tls&sni=${argodomain}&fp=chrome&type=xhttp&host=${argodomain}&path=%2Fargo&mode=stream-one#Argo-XHTTP"
+                echo "vless://${cur_uuid}@${CFIP}:${CFPORT}?encryption=none&security=tls&sni=${argodomain}&fp=chrome&type=xhttp&host=${argodomain}&path=%2Fargo&mode=auto#Argo-XHTTP"
             else
                 echo "vless://${cur_uuid}@${CFIP}:${CFPORT}?encryption=none&security=tls&sni=${argodomain}&fp=chrome&type=ws&host=${argodomain}&path=%2Fargo%3Fed%3D2560#Argo-WS"
             fi
