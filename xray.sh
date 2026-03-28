@@ -63,7 +63,8 @@ esac
 unset _raw
 
 if [ "${ARGO_MODE}" = "yes" ] && [ -f "${config_dir}" ]; then
-    _port=$(jq -r '.inbounds[0].port' "${config_dir}" 2>/dev/null)
+    # Argo inbound 固定 listen 127.0.0.1，FreeFlow 是 ::，通过此特征精确读取
+    _port=$(jq -r 'first(.inbounds[] | select(.listen=="127.0.0.1") | .port) // empty' "${config_dir}" 2>/dev/null)
     echo "$_port" | grep -qE '^[0-9]+$' && export ARGO_PORT=$_port
     unset _port
 fi
@@ -509,12 +510,16 @@ reset_tunnel_to_temp() {
     fi
     echo "ws" > "${argo_protocol_conf}"
     ARGO_PROTOCOL="ws"
-    # 同步更新 xray inbound 为 ws 协议
+    # 原位替换 argo inbound，保持顺序
     local _ib; _ib=$(_argo_inbound_json)
-    jq --argjson p "${ARGO_PORT}" 'del(.inbounds[] | select(.port == $p))' \
-        "${config_dir}" > "${config_dir}.tmp" && mv "${config_dir}.tmp" "${config_dir}"
-    jq --argjson ib "${_ib}" '.inbounds += [$ib]' \
-        "${config_dir}" > "${config_dir}.tmp" && mv "${config_dir}.tmp" "${config_dir}"
+    jq --argjson ib "${_ib}" '
+        (.inbounds | map(select(.listen == "127.0.0.1")) | length) as $n |
+        if $n > 0 then
+            .inbounds = [.inbounds[] | if .listen == "127.0.0.1" then $ib else . end]
+        else
+            .inbounds = [$ib] + .inbounds
+        end
+    ' "${config_dir}" > "${config_dir}.tmp" && mv "${config_dir}.tmp" "${config_dir}"
 }
 
 # ── 服务重启 ─────────────────────────────────────────────────
@@ -583,7 +588,7 @@ build_freeflow_link() {
             echo "vless://${uuid}@${ip}:80?encryption=none&security=none&type=httpupgrade&host=${ip}&path=${path_enc}#FreeFlow-HTTPUpgrade"
             ;;
         xhttp)
-            echo "vless://${uuid}@${ip}:80?encryption=none&security=none&type=xhttp&host=${ip}&path=${path_enc}&mode=stream-one#FreeFlow-XHTTP"
+            echo "vless://${uuid}@${ip}:80?encryption=none&security=none&type=xhttp&host=${ip}&path=${path_enc}#FreeFlow-XHTTP"
             ;;
     esac
 }
@@ -656,12 +661,17 @@ EOF
         systemctl enable tunnel 2>/dev/null
     fi
 
-    # 更新 xray inbound：删旧注入新（幂等）
+    # 更新 xray inbound：原位替换 listen==127.0.0.1 的 argo inbound，保持顺序
+    # 避免先删后追加导致 argo inbound 移至末尾（下次启动 ARGO_PORT 会被 FreeFlow 的 port 80 覆盖）
     local _ib; _ib=$(_argo_inbound_json)
-    jq --argjson p "${ARGO_PORT}" 'del(.inbounds[] | select(.port == $p))' \
-        "${config_dir}" > "${config_dir}.tmp" && mv "${config_dir}.tmp" "${config_dir}"
-    jq --argjson ib "${_ib}" '.inbounds += [$ib]' \
-        "${config_dir}" > "${config_dir}.tmp" && mv "${config_dir}.tmp" "${config_dir}"
+    jq --argjson ib "${_ib}" '
+        (.inbounds | map(select(.listen == "127.0.0.1")) | length) as $n |
+        if $n > 0 then
+            .inbounds = [.inbounds[] | if .listen == "127.0.0.1" then $ib else . end]
+        else
+            .inbounds = [$ib] + .inbounds
+        end
+    ' "${config_dir}" > "${config_dir}.tmp" && mv "${config_dir}.tmp" "${config_dir}"
 
     # 持久化域名和协议
     echo "$argo_domain"    > "${work_dir}/domain_fixed.txt"
@@ -738,7 +748,7 @@ get_info() {
 
             # 生成 Argo 节点链接（path 统一 /argo）
             if [ "${ARGO_PROTOCOL}" = "xhttp" ]; then
-                echo "vless://${cur_uuid}@${CFIP}:${CFPORT}?encryption=none&security=tls&sni=${argodomain}&fp=chrome&type=xhttp&host=${argodomain}&path=%2Fargo&mode=stream-one#Argo-XHTTP"
+                echo "vless://${cur_uuid}@${CFIP}:${CFPORT}?encryption=none&security=tls&sni=${argodomain}&fp=chrome&type=xhttp&host=${argodomain}&path=%2Fargo#Argo-XHTTP"
             else
                 echo "vless://${cur_uuid}@${CFIP}:${CFPORT}?encryption=none&security=tls&sni=${argodomain}&fp=chrome&type=ws&host=${argodomain}&path=%2Fargo%3Fed%3D2560#Argo-WS"
             fi
@@ -909,12 +919,16 @@ manage_argo() {
                 ARGO_PROTOCOL="ws"
             fi
             echo "${ARGO_PROTOCOL}" > "${argo_protocol_conf}"
-            # 仅更新 xray inbound，隧道服务文件不变（固定隧道 exec_cmd 与协议无关）
+            # 原位替换 argo inbound，保持顺序
             local _ib; _ib=$(_argo_inbound_json)
-            jq --argjson p "${ARGO_PORT}" 'del(.inbounds[] | select(.port == $p))' \
-                "${config_dir}" > "${config_dir}.tmp" && mv "${config_dir}.tmp" "${config_dir}"
-            jq --argjson ib "${_ib}" '.inbounds += [$ib]' \
-                "${config_dir}" > "${config_dir}.tmp" && mv "${config_dir}.tmp" "${config_dir}"
+            jq --argjson ib "${_ib}" '
+                (.inbounds | map(select(.listen == "127.0.0.1")) | length) as $n |
+                if $n > 0 then
+                    .inbounds = [.inbounds[] | if .listen == "127.0.0.1" then $ib else . end]
+                else
+                    .inbounds = [$ib] + .inbounds
+                end
+            ' "${config_dir}" > "${config_dir}.tmp" && mv "${config_dir}.tmp" "${config_dir}"
             restart_xray
             green "协议已切换为：${ARGO_PROTOCOL}"
             # 更新节点链接
