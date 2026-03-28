@@ -135,7 +135,7 @@ _argo_inbound_json() {
   "settings": { "clients": [{ "id": "%s" }], "decryption": "none" },
   "streamSettings": {
     "network": "xhttp", "security": "none",
-    "xhttpSettings": { "host": "", "path": "/argo", "mode": "stream-one" }
+    "xhttpSettings": { "host": "", "path": "/argo", "mode": "auto" }
   },
   "sniffing": { "enabled": true, "destOverride": ["http","tls","quic"], "metadataOnly": false }
 }' "${ARGO_PORT}" "${uuid}"
@@ -240,7 +240,7 @@ ask_argo_protocol() {
     green  "请选择 Argo 隧道传输协议："
     skyblue "-----------------------------"
     green  "1. WS（WebSocket，支持临时/固定隧道，默认）"
-    green  "2. XHTTP（stream-one 模式，仅支持固定隧道）"
+    green  "2. XHTTP（auto 模式，仅支持固定隧道）"
     skyblue "-----------------------------"
     reading "请输入选择(1-2，回车默认1): " proto_choice
     case "${proto_choice}" in
@@ -256,7 +256,7 @@ ask_argo_protocol() {
     mkdir -p "${work_dir}"
     echo "${ARGO_PROTOCOL}" > "${argo_protocol_conf}"
     case "${ARGO_PROTOCOL}" in
-        xhttp) green "已选择：XHTTP 固定隧道（stream-one）" ;;
+        xhttp) green "已选择：XHTTP 固定隧道（auto 模式）" ;;
         ws)    green "已选择：WS 隧道" ;;
     esac
     echo ""
@@ -268,7 +268,7 @@ ask_freeflow_mode() {
     skyblue "--------------------------------------"
     green  "1. VLESS + WS          （明文，port 80）"
     green  "2. VLESS + HTTPUpgrade （明文，port 80）"
-    green  "3. VLESS + XHTTP       （stream-one，port 80）"
+    green  "3. VLESS + XHTTP       （auto 模式，port 80）"
     green  "4. 不启用 FreeFlow（默认）"
     skyblue "--------------------------------------"
     reading "请输入选择(1-4，回车默认4): " ff_choice
@@ -317,7 +317,7 @@ get_freeflow_inbound_json() {
                 "${uuid}" "${FF_PATH}"
             ;;
         xhttp)
-            printf '{"port":80,"listen":"::","protocol":"vless","settings":{"clients":[{"id":"%s"}],"decryption":"none"},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"host":"","path":"%s","mode":"stream-one"}},"sniffing":{"enabled":true,"destOverride":["http","tls","quic"],"metadataOnly":false}}' \
+            printf '{"port":80,"listen":"::","protocol":"vless","settings":{"clients":[{"id":"%s"}],"decryption":"none"},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"host":"","path":"%s","mode":"auto"}},"sniffing":{"enabled":true,"destOverride":["http","tls","quic"],"metadataOnly":false}}' \
                 "${uuid}" "${FF_PATH}"
             ;;
     esac
@@ -896,7 +896,7 @@ manage_argo() {
             green  "请选择固定隧道传输协议：" >&2
             skyblue "-----------------------------" >&2
             green  "1. WS（WebSocket，默认）" >&2
-            green  "2. XHTTP（stream-one 模式）" >&2
+            green  "2. XHTTP（auto 模式）" >&2
             skyblue "-----------------------------" >&2
             reading "请输入选择(1-2，回车默认维持当前 ${ARGO_PROTOCOL}): " p_choice
             case "${p_choice}" in
