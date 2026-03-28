@@ -210,7 +210,7 @@ install_shortcut() {
 exec /usr/local/bin/xray2go "$@"
 EOF
     chmod +x "${shortcut_path}"
-    green "快捷方式已创建！输入 s 即可快速启动脚本"
+    green "快捷方式已创建/脚本已更新！输入 s 即可快速启动脚本"
 }
 
 # ── 交互提问 ─────────────────────────────────────────────────
@@ -1145,7 +1145,7 @@ menu() {
         green  "5. 查看节点信息"
         green  "6. 修改 UUID"
         green  "7. Xray 自动重启管理"
-        green  "8. 创建快捷方式 (s)"
+        green  "8. 创建快捷方式/脚本更新 (s)"
         echo   "================="
         red    "0. 退出脚本"
         echo   "==========="
