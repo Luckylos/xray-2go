@@ -386,7 +386,7 @@ install_xray() {
 {
   "log": { "access": "/dev/null", "error": "/dev/null", "loglevel": "none" },
   "inbounds": [ ${_ib} ],
-  "dns": { "servers": ["https+local://8.8.8.8/dns-query"] },
+  "dns": { "servers": ["https+local://1.1.1.1/dns-query"] },
   "outbounds": [
     { "protocol": "freedom", "tag": "direct" },
     { "protocol": "blackhole", "tag": "block" }
@@ -398,7 +398,7 @@ EOF
 {
   "log": { "access": "/dev/null", "error": "/dev/null", "loglevel": "none" },
   "inbounds": [],
-  "dns": { "servers": ["https+local://8.8.8.8/dns-query"] },
+  "dns": { "servers": ["https+local://1.1.1.1/dns-query"] },
   "outbounds": [
     { "protocol": "freedom", "tag": "direct" },
     { "protocol": "blackhole", "tag": "block" }
@@ -748,9 +748,9 @@ get_info() {
 
             # 生成 Argo 节点链接（path 统一 /argo）
             if [ "${ARGO_PROTOCOL}" = "xhttp" ]; then
-                echo "vless://${cur_uuid}@${CFIP}:${CFPORT}?encryption=none&security=tls&sni=${argodomain}&fp=chrome&type=xhttp&host=${argodomain}&path=%2Fargo&mode=auto#Argo-XHTTP"
+                echo "vless://${cur_uuid}@${CFIP}:${CFPORT}?encryption=none&security=tls&sni=${argodomain}&fp=firefox&type=xhttp&host=${argodomain}&path=%2Fargo&mode=auto#Argo-XHTTP"
             else
-                echo "vless://${cur_uuid}@${CFIP}:${CFPORT}?encryption=none&security=tls&sni=${argodomain}&fp=chrome&type=ws&host=${argodomain}&path=%2Fargo%3Fed%3D2560#Argo-WS"
+                echo "vless://${cur_uuid}@${CFIP}:${CFPORT}?encryption=none&security=tls&sni=${argodomain}&fp=firefox&type=ws&host=${argodomain}&path=%2Fargo%3Fed%3D2560#Argo-WS"
             fi
         fi
 
