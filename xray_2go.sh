@@ -37,7 +37,7 @@ readonly CLIENT_FILE="${WORK_DIR}/url.txt"
 readonly ARGO_LOG="${WORK_DIR}/argo.log"
 readonly SHORTCUT="/usr/local/bin/s"
 readonly SELF_DEST="/usr/local/bin/xray2go"
-readonly UPSTREAM_URL="https://raw.githubusercontent.com/Luckylos/xray-2go/refs/heads/main/xray_2go_v2.sh"
+readonly UPSTREAM_URL="https://raw.githubusercontent.com/Luckylos/xray-2go/refs/heads/main/xray_2go.sh"
 
 # 持久化状态文件（保持与 v1 路径兼容，便于滚动升级）
 readonly ST_ARGO_MODE="${WORK_DIR}/argo_mode.conf"
