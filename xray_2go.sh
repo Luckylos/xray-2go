@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# xray-2go v2.0
+# xray-2go v2.0 — 工业级重构
 # 协议插件架构：Argo WS/XHTTP + FreeFlow WS/HTTPUpgrade/XHTTP
 # 首选平台：Debian 12 / Ubuntu | 兼容：CentOS/RHEL、Alpine (OpenRC)
 # 架构分层：UI → Platform → Config-IO → JSON-Plugin → Link-Plugin →
@@ -112,6 +112,7 @@ spinner_stop() {
 }
 
 _pause() {
+    local _dummy
     printf "${_C_RED}按回车键继续...${_C_RST}" >&2
     read -r _dummy </dev/tty || true
 }
@@ -178,11 +179,12 @@ check_deps() {
     log_ok "依赖检查通过"
 }
 
-# 内核版本比较：_kernel_ge MAJOR MINOR
+# 内核版本比较：_kernel_ge MAJOR MINOR（剥离非数字后缀，兼容 4.9-generic 等格式）
 _kernel_ge() {
     local cur; cur=$(uname -r)
-    local cm="${cur%%.*}"; local cr="${cur#*.}"; cr="${cr%%.*}"
-    [ "${cm}" -gt "$1" ] || { [ "${cm}" -eq "$1" ] && [ "${cr}" -ge "$2" ]; }
+    local cm="${cur%%.*}"
+    local cr="${cur#*.}"; cr="${cr%%.*}"; cr="${cr%%[^0-9]*}"
+    [ "${cm}" -gt "$1" ] || { [ "${cm}" -eq "$1" ] && [ "${cr:-0}" -ge "$2" ]; }
 }
 
 # BBR 检测与可选启用
@@ -198,6 +200,7 @@ check_bbr() {
     prompt "是否现在启用 BBR？(y/N): " _bbr_ans
     case "${_bbr_ans:-n}" in y|Y)
         modprobe tcp_bbr 2>/dev/null || true
+        mkdir -p /etc/modules-load.d /etc/sysctl.d
         echo "tcp_bbr" > /etc/modules-load.d/xray2go-bbr.conf
         cat > /etc/sysctl.d/88-xray2go-bbr.conf <<'EOF'
 net.core.default_qdisc = fq
@@ -241,7 +244,7 @@ _gen_uuid() {
         cat /proc/sys/kernel/random/uuid
     else
         od -An -N16 -tx1 /dev/urandom | tr -d ' \n' | \
-        awk '{h=$0; printf "%s-%s-4%s-%s%s-%s\n",
+        awk 'BEGIN{srand()} {h=$0; printf "%s-%s-4%s-%s%s-%s\n",
             substr(h,1,8), substr(h,9,4), substr(h,14,3),
             substr("89ab",int(rand()*4)+1,1), substr(h,18,3), substr(h,21,12)}'
     fi
@@ -337,7 +340,7 @@ get_realip() {
     fi
 }
 
-# 指数退避轮询 Argo 日志，最多等待约 30s
+# 指数退避轮询 Argo 日志：初始等 3s，后续 3→6→8→8→8→8，最多等待约 44s
 get_temp_domain() {
     local domain delay=3 i=1
     sleep 3
@@ -550,8 +553,12 @@ build_all_links() {
                 *)     _link_argo_ws    "${uuid}" "${argo_domain}" "${cfip}" "${cfport}" ;;
             esac
         fi
-        if [ "${FREEFLOW_MODE}" != "none" ] && [ -n "${ip:-}" ]; then
-            _link_ff "${uuid}" "${ip}"
+        if [ "${FREEFLOW_MODE}" != "none" ]; then
+            if [ -n "${ip:-}" ]; then
+                _link_ff "${uuid}" "${ip}"
+            else
+                log_warn "无法获取服务器 IP，FreeFlow 节点链接已跳过（可稍后通过 [4. FreeFlow 管理] 重新生成）"
+            fi
         fi
     } > "${CLIENT_FILE}"
 }
@@ -675,7 +682,8 @@ register_tunnel_service() {
 }
 
 _daemon_reload() {
-    [ "${_SYSTEMD_DIRTY}" -eq 1 ] || return 0
+    is_systemd                       || return 0
+    [ "${_SYSTEMD_DIRTY}" -eq 1 ]    || return 0
     systemctl daemon-reload 2>/dev/null || true
     _SYSTEMD_DIRTY=0
 }
@@ -765,6 +773,11 @@ install_core() {
     [ "${ARGO_MODE}" = "yes" ] && { download_cloudflared || return 1; }
 
     write_xray_config || return 1
+
+    # 两者均禁用时警告，继续安装但节点为空
+    if [ "${ARGO_MODE}" = "no" ] && [ "${FREEFLOW_MODE}" = "none" ]; then
+        log_warn "Argo 与 FreeFlow 均未启用，xray 将以零入站模式运行（无可用节点）"
+    fi
 
     # 服务注册（幂等：若文件未变则不触发 reload）
     register_xray_service
@@ -892,10 +905,10 @@ EOF
 reset_temp_tunnel() {
     register_tunnel_service "$(_tunnel_cmd_temp)"
     _daemon_reload
-    rm -f "${ST_DOMAIN_FIXED}"
+    rm -f "${ST_DOMAIN_FIXED}" "${WORK_DIR}/tunnel.yml" "${WORK_DIR}/tunnel.json"
     ARGO_PROTOCOL="ws"
     _st_write "${ST_ARGO_PROTO}" "ws"
-    apply_argo_inbound || log_error "更新 xray inbound 失败"
+    apply_argo_inbound || log_error "更新 xray inbound 失败（可手动重启 xray 恢复）"
 }
 
 refresh_temp_domain() {
@@ -913,7 +926,9 @@ refresh_temp_domain() {
     awk -v d="${domain}" '
         /#Argo-WS$/ { sub(/sni=[^&]*/, "sni="d); sub(/host=[^&]*/, "host="d) }
         { print }
-    ' "${CLIENT_FILE}" > "${CLIENT_FILE}.tmp" && mv "${CLIENT_FILE}.tmp" "${CLIENT_FILE}"
+    ' "${CLIENT_FILE}" > "${CLIENT_FILE}.tmp" \
+        && mv "${CLIENT_FILE}.tmp" "${CLIENT_FILE}" \
+        || { rm -f "${CLIENT_FILE}.tmp"; log_error "节点文件更新失败"; return 1; }
 
     print_nodes
     log_ok "节点已更新"
@@ -1134,16 +1149,36 @@ manage_argo() {
                 ;;
             2)
                 is_fixed_tunnel || { log_warn "当前为临时隧道，请先配置固定隧道"; _pause; continue; }
-                [ "${ARGO_PROTOCOL}" = "ws" ] && ARGO_PROTOCOL="xhttp" || ARGO_PROTOCOL="ws"
+                if [ "${ARGO_PROTOCOL}" = "ws" ]; then
+                    ARGO_PROTOCOL="xhttp"
+                else
+                    ARGO_PROTOCOL="ws"
+                fi
                 _st_write "${ST_ARGO_PROTO}" "${ARGO_PROTOCOL}"
-                apply_argo_inbound && restart_xray && log_ok "协议已切换: ${ARGO_PROTOCOL}"
-                fixed_domain=$(_st_read "${ST_DOMAIN_FIXED}")
-                build_all_links "${fixed_domain:-}"; print_nodes
+                if apply_argo_inbound && restart_xray; then
+                    log_ok "协议已切换: ${ARGO_PROTOCOL}"
+                    fixed_domain=$(_st_read "${ST_DOMAIN_FIXED}")
+                    build_all_links "${fixed_domain:-}"; print_nodes
+                else
+                    log_error "协议切换失败，回滚协议标记"
+                    # 回滚内存状态（服务配置未变，jq_edit 失败时 config 也未变）
+                    [ "${ARGO_PROTOCOL}" = "xhttp" ] && ARGO_PROTOCOL="ws" || ARGO_PROTOCOL="xhttp"
+                    _st_write "${ST_ARGO_PROTO}" "${ARGO_PROTOCOL}"
+                fi
                 ;;
             3)
                 [ "${ARGO_PROTOCOL}" = "xhttp" ] && \
                     { log_error "请先切换协议为 WS 再切回临时隧道"; _pause; continue; }
-                reset_temp_tunnel && restart_xray && refresh_temp_domain
+                reset_temp_tunnel || { _pause; continue; }
+                restart_xray      || { _pause; continue; }
+                restart_argo      || { _pause; continue; }
+                log_step "等待临时域名（最多约 44s）..."
+                local _new_td
+                _new_td=$(get_temp_domain) \
+                    || { log_warn "未能获取临时域名，可稍后用 [4. 刷新临时域名] 重试"; _pause; continue; }
+                log_ok "ArgoDomain: ${_new_td}"
+                build_all_links "${_new_td}"
+                print_nodes
                 ;;
             4) refresh_temp_domain ;;
             5)
@@ -1177,8 +1212,12 @@ manage_argo() {
                 restart_xray && restart_argo
                 log_ok "回源端口已修改: ${_p}"
                 ;;
-            6) svc_ctrl start  tunnel && log_ok "隧道已启动" ;;
-            7) svc_ctrl stop   tunnel && log_ok "隧道已停止" ;;
+            6) svc_ctrl start  tunnel \
+                && log_ok "隧道已启动" \
+                || log_error "隧道启动失败，请检查服务日志" ;;
+            7) svc_ctrl stop   tunnel \
+                && log_ok "隧道已停止" \
+                || log_error "隧道停止失败" ;;
             0) return ;;
             *) log_error "无效选项" ;;
         esac
@@ -1216,6 +1255,9 @@ manage_freeflow() {
                 restart_xray; log_ok "FreeFlow 已变更"; print_nodes
                 ;;
             2)
+                if [ "${FREEFLOW_MODE}" = "none" ]; then
+                    log_warn "FreeFlow 未启用，请先选择 [1. 添加/变更方式]"; _pause; continue
+                fi
                 prompt "新 path（回车保持 ${FF_PATH}）: " _p
                 if [ -n "${_p:-}" ]; then
                     case "${_p}" in /*) FF_PATH="${_p}" ;; *) FF_PATH="/${_p}" ;; esac
@@ -1227,7 +1269,8 @@ manage_freeflow() {
                         awk -v nl="${new_link}" \
                             '/#FreeFlow/{print nl; next} {print}' \
                             "${CLIENT_FILE}" > "${CLIENT_FILE}.tmp" \
-                            && mv "${CLIENT_FILE}.tmp" "${CLIENT_FILE}"
+                            && mv "${CLIENT_FILE}.tmp" "${CLIENT_FILE}" \
+                            || rm -f "${CLIENT_FILE}.tmp"
                     fi
                     restart_xray; log_ok "path 已修改: ${FF_PATH}"; print_nodes
                 fi
@@ -1235,8 +1278,11 @@ manage_freeflow() {
             3)
                 FREEFLOW_MODE="none"; _save_ff_conf
                 apply_ff_inbound || { log_error "卸载失败"; _pause; continue; }
-                grep -v '#FreeFlow' "${CLIENT_FILE}" 2>/dev/null > "${CLIENT_FILE}.tmp" \
-                    && mv "${CLIENT_FILE}.tmp" "${CLIENT_FILE}"
+                if [ -f "${CLIENT_FILE}" ]; then
+                    grep -v '#FreeFlow' "${CLIENT_FILE}" > "${CLIENT_FILE}.tmp" \
+                        && mv "${CLIENT_FILE}.tmp" "${CLIENT_FILE}" \
+                        || rm -f "${CLIENT_FILE}.tmp"
+                fi
                 restart_xray; log_ok "FreeFlow 已卸载"
                 ;;
             0) return ;;
@@ -1305,10 +1351,10 @@ menu() {
         printf "${_C_BOLD}${_C_PUR}  ╔══════════════════════════════╗${_C_RST}\n"
         printf "${_C_BOLD}${_C_PUR}  ║      Xray-2go  v2.0          ║${_C_RST}\n"
         printf "${_C_BOLD}${_C_PUR}  ╠══════════════════════════════╣${_C_RST}\n"
-        printf "${_C_BOLD}${_C_PUR}  ║${_C_RST}  Xray:     ${xcolor}%-20s${_C_RST}${_C_PUR} ${_C_RST}\n"  "${xstat}"
-        printf "${_C_BOLD}${_C_PUR}  ║${_C_RST}  Argo:     %-20s${_C_PUR} ${_C_RST}\n"  "${argo_disp}"
-        printf "${_C_BOLD}${_C_PUR}  ║${_C_RST}  FF:       %-20s${_C_PUR} ${_C_RST}\n"  "${ff_disp}"
-        printf "${_C_BOLD}${_C_PUR}  ║${_C_RST}  重启间隔: ${_C_CYN}%-2s min${_C_RST}               ${_C_PUR} ${_C_RST}\n" "${RESTART_INTERVAL}"
+        printf "${_C_BOLD}${_C_PUR}  ║${_C_RST}  Xray:     ${xcolor}%-20s${_C_RST}${_C_PUR}║${_C_RST}\n"  "${xstat}"
+        printf "${_C_BOLD}${_C_PUR}  ║${_C_RST}  Argo:     %-20s${_C_PUR}║${_C_RST}\n"  "${argo_disp}"
+        printf "${_C_BOLD}${_C_PUR}  ║${_C_RST}  FF:       %-20s${_C_PUR}║${_C_RST}\n"  "${ff_disp}"
+        printf "${_C_BOLD}${_C_PUR}  ║${_C_RST}  重启间隔: ${_C_CYN}%-2s min${_C_RST}               ${_C_PUR}║${_C_RST}\n" "${RESTART_INTERVAL}"
         printf "${_C_BOLD}${_C_PUR}  ╚══════════════════════════════╝${_C_RST}\n"
         echo ""
         printf "  ${_C_GRN}1.${_C_RST} 安装 Xray-2go\n"
@@ -1371,17 +1417,20 @@ menu() {
                                 else
                                     log_warn "固定隧道配置失败，回退临时隧道"
                                     restart_argo
-                                    local _td; _td=$(get_temp_domain) \
-                                        || { _td="<未获取>"; log_warn "未能获取临时域名，可稍后刷新"; }
+                                    local _td; _td=$(get_temp_domain) || _td=""
+                                    [ -z "${_td}" ] && log_warn "未能获取临时域名，可从 [3. Argo 管理] 刷新"
                                     build_all_links "${_td}"
                                 fi
                                 ;;
                             *)
-                                log_step "等待 Argo 临时域名..."
+                                log_step "等待 Argo 临时域名（最多约 44s）..."
                                 restart_argo
-                                local _td; _td=$(get_temp_domain) \
-                                    || { _td="<未获取>"; log_warn "未能获取临时域名，可从 [3. Argo 管理] 刷新"; }
-                                [ "${_td}" != "<未获取>" ] && log_ok "ArgoDomain: ${_td}"
+                                local _td; _td=$(get_temp_domain) || _td=""
+                                if [ -n "${_td}" ]; then
+                                    log_ok "ArgoDomain: ${_td}"
+                                else
+                                    log_warn "未能获取临时域名，可从 [3. Argo 管理→4] 刷新"
+                                fi
                                 build_all_links "${_td}"
                                 ;;
                         esac
