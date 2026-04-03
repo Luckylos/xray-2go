@@ -1537,12 +1537,12 @@ menu() {
 
         clear; echo ""
         printf "${_C_BOLD}${_C_PUR}  ╔═══════════════════════════════╗${_C_RST}\n"
-        printf "${_C_BOLD}${_C_PUR}  ║   Xray-2go  v3.0  SSOT/AC    ║${_C_RST}\n"
+        printf "${_C_BOLD}${_C_PUR}  ║   Xray-2go  v3.0  SSOT/AC     ║${_C_RST}\n"
         printf "${_C_BOLD}${_C_PUR}  ╠═══════════════════════════════╣${_C_RST}\n"
-        printf "${_C_BOLD}${_C_PUR}  ║${_C_RST}  Xray : ${_xcolor}%-22s${_C_RST}${_C_PUR}║${_C_RST}\n"  "${_xstat}"
-        printf "${_C_BOLD}${_C_PUR}  ║${_C_RST}  Argo : %-22s${_C_PUR}║${_C_RST}\n"  "${_argo_disp}"
-        printf "${_C_BOLD}${_C_PUR}  ║${_C_RST}  FF   : %-22s${_C_PUR}║${_C_RST}\n"  "${_ff_disp}"
-        printf "${_C_BOLD}${_C_PUR}  ║${_C_RST}  Cron : ${_C_CYN}%-2s min${_C_RST}                  ${_C_PUR}║${_C_RST}\n" "$(state_get '.cron')"
+        printf "${_C_BOLD}${_C_PUR}  ║${_C_RST}  Xray : ${_xcolor}%-22s${_C_RST}${_C_PUR} ${_C_RST}\n"  "${_xstat}"
+        printf "${_C_BOLD}${_C_PUR}  ║${_C_RST}  Argo : %-22s${_C_PUR} ${_C_RST}\n"  "${_argo_disp}"
+        printf "${_C_BOLD}${_C_PUR}  ║${_C_RST}  FF   : %-22s${_C_PUR} ${_C_RST}\n"  "${_ff_disp}"
+        printf "${_C_BOLD}${_C_PUR}  ║${_C_RST}  Cron : ${_C_CYN}%-2s min${_C_RST}                  ${_C_PUR} ${_C_RST}\n" "$(state_get '.cron')"
         printf "${_C_BOLD}${_C_PUR}  ╚═══════════════════════════════╝${_C_RST}\n\n"
 
         printf "  ${_C_GRN}1.${_C_RST} 安装 Xray-2go\n"
