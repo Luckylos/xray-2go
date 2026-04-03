@@ -11,6 +11,7 @@
 # 支持协议：Argo WS/XHTTP · FreeFlow WS/HTTPUpgrade/XHTTP · Reality Vision
 # 目标平台：Debian 12/Ubuntu (systemd) · Alpine (OpenRC)
 # ==============================================================================
+
 set -uo pipefail
 
 # ==============================================================================
@@ -222,7 +223,7 @@ preflight_check() {
 #    "reality":{ "enabled": false, "port": 443, "sni": "www.microsoft.com",
 #                "pbk": null, "pvk": null, "sid": null },
 #    "cron":   0,
-#    "cfip":   "cf.tencentapp.cn",
+#    "cfip":   "cdns.doon.eu.org",
 #    "cfport": "443"
 #  }
 #
@@ -240,10 +241,10 @@ readonly _STATE_DEFAULT='{
   "argo":    {"enabled":true,  "protocol":"ws",   "port":8888,
               "mode":"temp",   "domain":null,      "token":null},
   "ff":      {"enabled":false, "protocol":"none", "path":"/"},
-  "reality": {"enabled":false, "port":443, "sni":"www.microsoft.com",
+  "reality": {"enabled":false, "port":443, "sni":"addons.mozilla.org",
               "pbk":null, "pvk":null, "sid":null},
   "cron":    0,
-  "cfip":    "cf.tencentapp.cn",
+  "cfip":    "cdns.doon.eu.org",
   "cfport":  "443"
 }'
 
@@ -1480,6 +1481,158 @@ manage_freeflow() {
     done
 }
 
+# ==============================================================================
+# §20b  Reality 询问 + 管理子菜单
+# ==============================================================================
+
+# ── 安装向导：采集 Reality 配置（纯输入，不调用业务逻辑）
+ask_reality_mode() {
+    echo ""; log_title "VLESS + Reality Vision（TCP 直连，独立端口，无需 Argo）"
+    printf "  ${_C_GRN}1.${_C_RST} 启用 Reality\n"
+    printf "  ${_C_GRN}2.${_C_RST} 不启用 ${_C_YLW}[默认]${_C_RST}\n"
+    local _c; prompt "请选择 (1-2，回车默认2): " _c
+    case "${_c:-2}" in
+        1) state_set '.reality.enabled = true' ;;
+        *) state_set '.reality.enabled = false'; log_info "不启用 Reality"; echo ""; return 0 ;;
+    esac
+
+    # ── 监听端口
+    local _default_port; _default_port=$(state_get '.reality.port')
+    local _rp; prompt "监听端口（回车默认 ${_default_port}）: " _rp
+    if [ -n "${_rp:-}" ]; then
+        case "${_rp}" in
+            *[!0-9]*) log_warn "端口格式无效，使用默认值 ${_default_port}" ;;
+            *)
+                if [ "${_rp}" -ge 1 ] && [ "${_rp}" -le 65535 ]; then
+                    state_set '.reality.port = ($p|tonumber)' --arg p "${_rp}"
+                else
+                    log_warn "端口超出范围 1-65535，使用默认值 ${_default_port}"
+                fi ;;
+        esac
+    fi
+    local _rport; _rport=$(state_get '.reality.port')
+    port_in_use "${_rport}" && log_warn "端口 ${_rport} 已被占用，可安装后通过 Reality 管理修改"
+
+    # ── 伪装 SNI（参考 ArgoX 项目：addons.mozilla.org 为业界推荐默认值）
+    local _default_sni; _default_sni=$(state_get '.reality.sni')
+    log_info "SNI 建议：addons.mozilla.org / www.microsoft.com / www.apple.com"
+    local _sni; prompt "伪装 SNI 域名（回车默认 ${_default_sni}）: " _sni
+    if [ -n "${_sni:-}" ]; then
+        printf '%s' "${_sni}" | grep -qE '^[a-zA-Z0-9]([a-zA-Z0-9._-]*[a-zA-Z0-9])?$' \
+            && state_set '.reality.sni = $s' --arg s "${_sni}" \
+            || log_warn "SNI 域名格式不合法，使用默认值 ${_default_sni}"
+    fi
+
+    log_info "Reality 已配置 — 端口: $(state_get '.reality.port')  SNI: $(state_get '.reality.sni')"
+    log_info "密钥对将在安装时由 xray x25519 自动生成"
+    echo ""
+}
+
+# ── Reality 管理子菜单
+manage_reality() {
+    [ -f "${CONFIG_FILE}" ] || { log_warn "请先安装 Xray-2go"; sleep 1; return; }
+
+    while true; do
+        local _r_en _r_port _r_sni _r_pbk _r_pvk _r_sid
+        _r_en=$(  state_get '.reality.enabled')
+        _r_port=$(state_get '.reality.port')
+        _r_sni=$( state_get '.reality.sni')
+        _r_pbk=$( state_get '.reality.pbk')
+        _r_pvk=$( state_get '.reality.pvk')
+        _r_sid=$( state_get '.reality.sid')
+
+        # 密钥显示：公钥显示前 16 字符 + ...，私钥不显示
+        local _pbk_disp="未生成"
+        [ -n "${_r_pbk:-}" ] && [ "${_r_pbk}" != "null" ] \
+            && _pbk_disp="${_r_pbk:0:16}...（完整见节点链接）"
+
+        clear; echo ""; log_title "══ Reality 管理 (VLESS+TCP+XTLS-Vision) ══"
+        if [ "${_r_en}" = "true" ]; then
+            printf "  状态: ${_C_GRN}已启用${_C_RST}\n"
+        else
+            printf "  状态: ${_C_YLW}未启用${_C_RST}\n"
+        fi
+        printf "  端口: ${_C_YLW}%s${_C_RST}  SNI: ${_C_CYN}%s${_C_RST}\n" "${_r_port}" "${_r_sni}"
+        printf "  公钥: %s\n" "${_pbk_disp}"
+        [ -n "${_r_sid:-}" ] && [ "${_r_sid}" != "null" ] \
+            && printf "  ShortId: ${_C_CYN}%s${_C_RST}\n" "${_r_sid}"
+        _hr
+        printf "  ${_C_GRN}1.${_C_RST} 启用 Reality\n"
+        printf "  ${_C_RED}2.${_C_RST} 禁用 Reality\n"
+        printf "  ${_C_GRN}3.${_C_RST} 修改监听端口（当前: ${_C_YLW}${_r_port}${_C_RST}）\n"
+        printf "  ${_C_GRN}4.${_C_RST} 修改伪装 SNI（当前: ${_C_CYN}${_r_sni}${_C_RST}）\n"
+        printf "  ${_C_GRN}5.${_C_RST} 重新生成密钥对 (x25519 + shortId)\n"
+        printf "  ${_C_GRN}6.${_C_RST} 查看节点链接\n"
+        printf "  ${_C_PUR}0.${_C_RST} 返回主菜单\n"; _hr
+        local _c; prompt "请输入选择: " _c
+
+        case "${_c:-}" in
+            1)
+                # 检查密钥对是否就绪；若不存在则先生成
+                if [ -z "${_r_pvk:-}" ] || [ "${_r_pvk}" = "null" ]; then
+                    log_step "首次启用，生成 x25519 密钥对..."
+                    [ -x "${XRAY_BIN}" ] || { log_error "xray 未就绪"; _pause; continue; }
+                    _gen_reality_keypair || { _pause; continue; }
+                    state_set '.reality.sid = $s' --arg s "$(_gen_reality_sid)" || true
+                fi
+                state_set '.reality.enabled = true' || { _pause; continue; }
+                config_commit || { _pause; continue; }
+                state_persist || log_warn "state.json 写入失败"
+                log_ok "Reality 已启用"; print_nodes ;;
+            2)
+                state_set '.reality.enabled = false' || { _pause; continue; }
+                config_commit || { _pause; continue; }
+                state_persist || log_warn "state.json 写入失败"
+                log_ok "Reality 已禁用" ;;
+            3)
+                local _p; prompt "新端口（回车随机）: " _p
+                if [ -z "${_p:-}" ]; then
+                    _p=$(shuf -i 1024-65000 -n 1 2>/dev/null || \
+                         awk 'BEGIN{srand();print int(rand()*63976)+1024}')
+                fi
+                case "${_p:-}" in ''|*[!0-9]*) log_error "无效端口"; _pause; continue ;; esac
+                { [ "${_p}" -ge 1 ] && [ "${_p}" -le 65535 ]; } \
+                    || { log_error "端口须在 1-65535 之间"; _pause; continue; }
+                if port_in_use "${_p}"; then
+                    log_warn "端口 ${_p} 已被占用"
+                    local _ans; prompt "仍然继续？(y/N): " _ans
+                    case "${_ans:-n}" in y|Y) : ;; *) _pause; continue ;; esac
+                fi
+                state_set '.reality.port = ($p|tonumber)' --arg p "${_p}" || { _pause; continue; }
+                config_commit || { _pause; continue; }
+                state_persist || log_warn "state.json 写入失败"
+                log_ok "Reality 端口已更新: ${_p}"; print_nodes ;;
+            4)
+                log_info "建议：addons.mozilla.org / www.microsoft.com / www.apple.com"
+                local _sni; prompt "新 SNI（回车保持 ${_r_sni}）: " _sni
+                if [ -n "${_sni:-}" ]; then
+                    printf '%s' "${_sni}" | grep -qE '^[a-zA-Z0-9]([a-zA-Z0-9._-]*[a-zA-Z0-9])?$' \
+                        || { log_error "SNI 格式不合法"; _pause; continue; }
+                    state_set '.reality.sni = $s' --arg s "${_sni}" || { _pause; continue; }
+                    config_commit || { _pause; continue; }
+                    state_persist || log_warn "state.json 写入失败"
+                    log_ok "SNI 已更新: ${_sni}"; print_nodes
+                fi ;;
+            5)
+                [ -x "${XRAY_BIN}" ] || { log_error "xray 未就绪，请先安装"; _pause; continue; }
+                log_step "重新生成 x25519 密钥对..."
+                _gen_reality_keypair || { _pause; continue; }
+                state_set '.reality.sid = $s' --arg s "$(_gen_reality_sid)" || { _pause; continue; }
+                # 仅在 Reality 已启用时提交配置
+                if [ "$(state_get '.reality.enabled')" = "true" ]; then
+                    config_commit || { _pause; continue; }
+                fi
+                state_persist || log_warn "state.json 写入失败"
+                log_ok "密钥对已更新"
+                [ "$(state_get '.reality.enabled')" = "true" ] && print_nodes ;;
+            6) print_nodes ;;
+            0) return ;;
+            *) log_error "无效选项" ;;
+        esac
+        _pause
+    done
+}
+
 manage_restart() {
     while true; do
         local _iv; _iv=$(state_get '.cron')
@@ -1535,26 +1688,36 @@ menu() {
             _argo_disp="未启用"
         fi
 
+        local _r_en _r_disp
+        _r_en=$(state_get '.reality.enabled')
+        if [ "${_r_en}" = "true" ]; then
+            _r_disp="已启用 (port=$(state_get '.reality.port'), sni=$(state_get '.reality.sni'))"
+        else
+            _r_disp="未启用"
+        fi
+
         clear; echo ""
-        printf "${_C_BOLD}${_C_PUR}  ╔═══════════════════════════════╗${_C_RST}\n"
-        printf "${_C_BOLD}${_C_PUR}  ║   Xray-2go  v3.0  SSOT/AC     ║${_C_RST}\n"
-        printf "${_C_BOLD}${_C_PUR}  ╠═══════════════════════════════╣${_C_RST}\n"
-        printf "${_C_BOLD}${_C_PUR}  ║${_C_RST}  Xray : ${_xcolor}%-22s${_C_RST}${_C_PUR} ${_C_RST}\n"  "${_xstat}"
-        printf "${_C_BOLD}${_C_PUR}  ║${_C_RST}  Argo : %-22s${_C_PUR} ${_C_RST}\n"  "${_argo_disp}"
-        printf "${_C_BOLD}${_C_PUR}  ║${_C_RST}  FF   : %-22s${_C_PUR} ${_C_RST}\n"  "${_ff_disp}"
-        printf "${_C_BOLD}${_C_PUR}  ║${_C_RST}  Cron : ${_C_CYN}%-2s min${_C_RST}                  ${_C_PUR} ${_C_RST}\n" "$(state_get '.cron')"
-        printf "${_C_BOLD}${_C_PUR}  ╚═══════════════════════════════╝${_C_RST}\n\n"
+        printf "${_C_BOLD}${_C_PUR}  ╔═══════════════════════════════════╗${_C_RST}\n"
+        printf "${_C_BOLD}${_C_PUR}  ║    Xray-2go  v3.0  SSOT/AC        ║${_C_RST}\n"
+        printf "${_C_BOLD}${_C_PUR}  ╠═══════════════════════════════════╣${_C_RST}\n"
+        printf "${_C_BOLD}${_C_PUR}  ║${_C_RST}  Xray    : ${_xcolor}%-24s${_C_RST}${_C_PUR} ${_C_RST}\n"  "${_xstat}"
+        printf "${_C_BOLD}${_C_PUR}  ║${_C_RST}  Argo    : %-24s${_C_PUR} ${_C_RST}\n"  "${_argo_disp}"
+        printf "${_C_BOLD}${_C_PUR}  ║${_C_RST}  FF      : %-24s${_C_PUR} ${_C_RST}\n"  "${_ff_disp}"
+        printf "${_C_BOLD}${_C_PUR}  ║${_C_RST}  Reality : %-24s${_C_PUR} ${_C_RST}\n"  "${_r_disp}"
+        printf "${_C_BOLD}${_C_PUR}  ║${_C_RST}  Cron    : ${_C_CYN}%-2s min${_C_RST}                     ${_C_PUR} ${_C_RST}\n" "$(state_get '.cron')"
+        printf "${_C_BOLD}${_C_PUR}  ╚═══════════════════════════════════╝${_C_RST}\n\n"
 
         printf "  ${_C_GRN}1.${_C_RST} 安装 Xray-2go\n"
         printf "  ${_C_RED}2.${_C_RST} 卸载 Xray-2go\n"; _hr
         printf "  ${_C_GRN}3.${_C_RST} Argo 管理\n"
-        printf "  ${_C_GRN}4.${_C_RST} FreeFlow 管理\n"; _hr
+        printf "  ${_C_GRN}4.${_C_RST} FreeFlow 管理\n"
+        printf "  ${_C_GRN}9.${_C_RST} Reality 管理\n"; _hr
         printf "  ${_C_GRN}5.${_C_RST} 查看节点\n"
         printf "  ${_C_GRN}6.${_C_RST} 修改 UUID\n"
         printf "  ${_C_GRN}7.${_C_RST} 自动重启管理\n"
         printf "  ${_C_GRN}8.${_C_RST} 快捷方式/脚本更新\n"; _hr
         printf "  ${_C_RED}0.${_C_RST} 退出\n\n"
-        local _c; prompt "请输入选择 (0-8): " _c; echo ""
+        local _c; prompt "请输入选择 (0-9): " _c; echo ""
 
         case "${_c:-}" in
             1)
@@ -1564,12 +1727,20 @@ menu() {
                     ask_argo_mode
                     [ "$(state_get '.argo.enabled')" = "true" ] && ask_argo_protocol
                     ask_freeflow_mode
+                    ask_reality_mode
 
                     [ "$(state_get '.argo.enabled')" = "true" ] && \
                         port_in_use "$(state_get '.argo.port')" && \
                         log_warn "端口 $(state_get '.argo.port') 已被占用，可安装后修改"
                     [ "$(state_get '.ff.enabled')" = "true" ] && port_in_use 8080 && \
                         log_warn "端口 8080 已被占用，FreeFlow 可能无法启动"
+                    # Reality 端口与 Argo 端口冲突检测
+                    if [ "$(state_get '.reality.enabled')" = "true" ]; then
+                        local _rport; _rport=$(state_get '.reality.port')
+                        local _aport; _aport=$(state_get '.argo.port')
+                        [ "${_rport}" = "${_aport}" ] && \
+                            log_warn "Reality 端口 (${_rport}) 与 Argo 回源端口相同，请安装后修改其中一个"
+                    fi
 
                     check_systemd_resolved
                     check_bbr
@@ -1622,8 +1793,9 @@ menu() {
                 || { log_warn "请先安装 Xray-2go"; } ;;
             7) manage_restart ;;
             8) install_shortcut ;;
+            9) manage_reality ;;
             0) log_info "已退出"; exit 0 ;;
-            *) log_error "无效选项，请输入 0-8" ;;
+            *) log_error "无效选项，请输入 0-9" ;;
         esac
         _pause
     done
