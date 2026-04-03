@@ -11,7 +11,6 @@
 # 支持协议：Argo WS/XHTTP · FreeFlow WS/HTTPUpgrade/XHTTP · Reality Vision
 # 目标平台：Debian 12/Ubuntu (systemd) · Alpine (OpenRC)
 # ==============================================================================
-
 set -uo pipefail
 
 # ==============================================================================
@@ -458,16 +457,53 @@ _urlencode_path() {
 }
 
 # Reality x25519 密钥对（依赖已下载的 xray 二进制）
+# 根本原因记录：xray x25519 在部分构建版本将密钥输出到 stderr 而非 stdout，
+# 原 2>/dev/null 会将其完全丢弃，导致解析失败。修复：统一用 2>&1 捕获全部输出。
 _gen_reality_keypair() {
     [ -x "${XRAY_BIN}" ] || { log_error "xray 未就绪，无法生成密钥对"; return 1; }
-    local _out; _out=$("${XRAY_BIN}" x25519 2>/dev/null) \
-        || { log_error "xray x25519 执行失败"; return 1; }
+
+    # ── 同时捕获 stdout + stderr（xray 在某些构建中将密钥写到 stderr）
+    local _out _rc
+    _out=$("${XRAY_BIN}" x25519 2>&1)
+    _rc=$?
+
+    if [ "${_rc}" -ne 0 ]; then
+        log_error "xray x25519 执行失败 (exit ${_rc})"
+        [ -n "${_out:-}" ] && printf '%s\n' "${_out}" | while IFS= read -r _l; do
+            log_error "  xray: ${_l}"
+        done
+        return 1
+    fi
+
+    if [ -z "${_out:-}" ]; then
+        log_error "xray x25519 无任何输出，二进制可能损坏（尝试重新安装）"
+        return 1
+    fi
+
+    # ── 解析密钥：grep -i 兼容大小写变体，tr -d '\r' 消除 CRLF 污染
     local _pvk _pbk
-    _pvk=$(printf '%s' "${_out}" | awk '/Private key:/{print $NF}')
-    _pbk=$(printf '%s' "${_out}" | awk '/Public key:/{print $NF}')
-    [ -n "${_pvk:-}" ] && [ -n "${_pbk:-}" ] || { log_error "密钥解析失败"; return 1; }
-    state_set '.reality.pvk = $v | .reality.pbk = $b' --arg v "${_pvk}" --arg b "${_pbk}"
-    log_ok "x25519 密钥对已生成"
+    _pvk=$(printf '%s\n' "${_out}" | grep -i 'private' | awk '{print $NF}' | tr -d '\r\n')
+    _pbk=$(printf '%s\n' "${_out}" | grep -i 'public'  | awk '{print $NF}' | tr -d '\r\n')
+
+    if [ -z "${_pvk:-}" ] || [ -z "${_pbk:-}" ]; then
+        log_error "密钥字段解析失败 — xray x25519 原始输出:"
+        printf '%s\n' "${_out}" | while IFS= read -r _l; do
+            log_error "  xray: ${_l}"
+        done
+        log_error "如持续失败请通过 [选项 2. 卸载] 后重装以更新 xray 二进制"
+        return 1
+    fi
+
+    # ── 基本格式校验：base64url 字符集（xray x25519 密钥长度约 43 字符）
+    local _b64url='^[A-Za-z0-9_=-]{20,}$'
+    printf '%s' "${_pvk}" | grep -qE "${_b64url}" \
+        || { log_error "私钥格式异常: ${_pvk}"; return 1; }
+    printf '%s' "${_pbk}" | grep -qE "${_b64url}" \
+        || { log_error "公钥格式异常: ${_pbk}"; return 1; }
+
+    state_set '.reality.pvk = $v | .reality.pbk = $b' \
+        --arg v "${_pvk}" --arg b "${_pbk}" || return 1
+    log_ok "x25519 密钥对已生成 (pubkey: ${_pbk:0:16}...)"
 }
 
 # Reality shortId：优先 openssl，降级 /dev/urandom + od
@@ -1698,7 +1734,7 @@ menu() {
 
         clear; echo ""
         printf "${_C_BOLD}${_C_PUR}  ╔═══════════════════════════════════╗${_C_RST}\n"
-        printf "${_C_BOLD}${_C_PUR}  ║    Xray-2go  v3.0  SSOT/AC        ║${_C_RST}\n"
+        printf "${_C_BOLD}${_C_PUR}  ║     Xray-2go  v3.0  SSOT/AC       ║${_C_RST}\n"
         printf "${_C_BOLD}${_C_PUR}  ╠═══════════════════════════════════╣${_C_RST}\n"
         printf "${_C_BOLD}${_C_PUR}  ║${_C_RST}  Xray    : ${_xcolor}%-24s${_C_RST}${_C_PUR} ${_C_RST}\n"  "${_xstat}"
         printf "${_C_BOLD}${_C_PUR}  ║${_C_RST}  Argo    : %-24s${_C_PUR} ${_C_RST}\n"  "${_argo_disp}"
