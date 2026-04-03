@@ -148,20 +148,20 @@ preflight_check() {
 # Schema：
 # {
 #   "uuid":   "<自动生成>",
-#   "argo":   {"enabled":true,  "protocol":"ws",   "port":8080,
+#   "argo":   {"enabled":true,  "protocol":"ws",   "port":8888,
 #              "mode":"temp",   "domain":null,      "token":null},
 #   "ff":     {"enabled":false, "protocol":"none", "path":"/"},
-#   "cfip":   "cdns.doon.eu.org",
+#   "cfip":   "cf.tencentapp.cn",
 #   "cfport": "443"
 # }
 _STATE=""
 
 readonly _STATE_DEFAULT='{
   "uuid":   "",
-  "argo":   {"enabled":true,  "protocol":"ws", "port":8080,
+  "argo":   {"enabled":true,  "protocol":"ws", "port":8888,
              "mode":"temp",   "domain":null,   "token":null},
   "ff":     {"enabled":false, "protocol":"none", "path":"/"},
-  "cfip":   "cdns.doon.eu.org",
+  "cfip":   "cf.tencentapp.cn",
   "cfport": "443"
 }'
 
@@ -327,7 +327,7 @@ _gen_inbound_snippet() {
                 ws)
                     jq -n --arg uuid "${_uuid}" --arg path "${_path}" \
                           --argjson sniff "${_SNIFF}" '{
-                        port:80, listen:"::", protocol:"vless",
+                        port:8080, listen:"::", protocol:"vless",
                         settings:{clients:[{id:$uuid}], decryption:"none"},
                         streamSettings:{network:"ws", security:"none",
                             wsSettings:{path:$path}},
@@ -335,7 +335,7 @@ _gen_inbound_snippet() {
                 httpupgrade)
                     jq -n --arg uuid "${_uuid}" --arg path "${_path}" \
                           --argjson sniff "${_SNIFF}" '{
-                        port:80, listen:"::", protocol:"vless",
+                        port:8080, listen:"::", protocol:"vless",
                         settings:{clients:[{id:$uuid}], decryption:"none"},
                         streamSettings:{network:"httpupgrade", security:"none",
                             httpupgradeSettings:{path:$path}},
@@ -343,7 +343,7 @@ _gen_inbound_snippet() {
                 xhttp)
                     jq -n --arg uuid "${_uuid}" --arg path "${_path}" \
                           --argjson sniff "${_SNIFF}" '{
-                        port:80, listen:"::", protocol:"vless",
+                        port:8080, listen:"::", protocol:"vless",
                         settings:{clients:[{id:$uuid}], decryption:"none"},
                         streamSettings:{network:"xhttp", security:"none",
                             xhttpSettings:{host:"", path:$path, mode:"stream-one"}},
@@ -537,13 +537,13 @@ _get_share_links() {
             local _pe; _pe=$(_urlencode_path "$(state_get '.ff.path')")
             case "$(state_get '.ff.protocol')" in
                 ws)
-                    printf 'vless://%s@%s:80?encryption=none&security=none&type=ws&host=%s&path=%s#FreeFlow-WS\n' \
+                    printf 'vless://%s@%s:8080?encryption=none&security=none&type=ws&host=%s&path=%s#FreeFlow-WS\n' \
                         "${_uuid}" "${_ip}" "${_ip}" "${_pe}" ;;
                 httpupgrade)
-                    printf 'vless://%s@%s:80?encryption=none&security=none&type=httpupgrade&host=%s&path=%s#FreeFlow-HTTPUpgrade\n' \
+                    printf 'vless://%s@%s:8080?encryption=none&security=none&type=httpupgrade&host=%s&path=%s#FreeFlow-HTTPUpgrade\n' \
                         "${_uuid}" "${_ip}" "${_ip}" "${_pe}" ;;
                 xhttp)
-                    printf 'vless://%s@%s:80?encryption=none&security=none&type=xhttp&host=%s&path=%s&mode=stream-one#FreeFlow-XHTTP\n' \
+                    printf 'vless://%s@%s:8080?encryption=none&security=none&type=xhttp&host=%s&path=%s&mode=stream-one#FreeFlow-XHTTP\n' \
                         "${_uuid}" "${_ip}" "${_ip}" "${_pe}" ;;
             esac
         else
@@ -847,7 +847,7 @@ ask_argo_protocol() {
 }
 
 ask_freeflow_mode() {
-    echo ""; log_title "FreeFlow（明文 port 80）"
+    echo ""; log_title "FreeFlow（明文 port 8080）"
     printf "  ${_GRN}1.${_RST} VLESS + WS\n"
     printf "  ${_GRN}2.${_RST} VLESS + HTTPUpgrade\n"
     printf "  ${_GRN}3.${_RST} VLESS + XHTTP (stream-one)\n"
@@ -860,7 +860,7 @@ ask_freeflow_mode() {
         *) state_set '.ff.enabled = false | .ff.protocol = "none"'
            log_info "不启用 FreeFlow"; echo ""; return 0 ;;
     esac
-    port_in_use 80 && log_warn "端口 80 已被占用，FreeFlow 可能无法启动"
+    port_in_use 8080 && log_warn "端口 8080 已被占用，FreeFlow 可能无法启动"
     local _p; prompt "FreeFlow path（回车默认 /）: " _p
     case "${_p:-/}" in /*) : ;; *) _p="/${_p:-}"; esac
     state_set '.ff.path = $p' --arg p "${_p:-/}"
@@ -1020,9 +1020,9 @@ menu() {
         printf "${_BOLD}${_PUR}  ╔═══════════════════════════════╗${_RST}\n"
         printf "${_BOLD}${_PUR}  ║     Xray-2go  v3.1            ║${_RST}\n"
         printf "${_BOLD}${_PUR}  ╠═══════════════════════════════╣${_RST}\n"
-        printf "${_BOLD}${_PUR}  ║${_RST}  Xray : ${_xc}%-22s${_RST}${_PUR}║${_RST}\n" "${_xs}"
-        printf "${_BOLD}${_PUR}  ║${_RST}  Argo : %-22s${_PUR}║${_RST}\n" "${_ad}"
-        printf "${_BOLD}${_PUR}  ║${_RST}  FF   : %-22s${_PUR}║${_RST}\n" "${_fd}"
+        printf "${_BOLD}${_PUR}  ║${_RST}  Xray : ${_xc}%-22s${_RST}${_PUR} ${_RST}\n" "${_xs}"
+        printf "${_BOLD}${_PUR}  ║${_RST}  Argo : %-22s${_PUR} ${_RST}\n" "${_ad}"
+        printf "${_BOLD}${_PUR}  ║${_RST}  FF   : %-22s${_PUR} ${_RST}\n" "${_fd}"
         printf "${_BOLD}${_PUR}  ╚═══════════════════════════════╝${_RST}\n\n"
 
         printf "  ${_GRN}1.${_RST} 安装 Xray-2go\n"
@@ -1047,8 +1047,8 @@ menu() {
                     [ "$(state_get '.argo.enabled')" = "true" ] && \
                         port_in_use "$(state_get '.argo.port')" && \
                         log_warn "端口 $(state_get '.argo.port') 已被占用，可安装后修改"
-                    [ "$(state_get '.ff.enabled')" = "true" ] && port_in_use 80 && \
-                        log_warn "端口 80 已被占用，FreeFlow 可能无法启动"
+                    [ "$(state_get '.ff.enabled')" = "true" ] && port_in_use 8080 && \
+                        log_warn "端口 8080 已被占用，FreeFlow 可能无法启动"
 
                     check_systemd_resolved
                     check_bbr
