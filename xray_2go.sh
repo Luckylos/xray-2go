@@ -877,7 +877,6 @@ _get_share_links() {
         else
             _s5_host="${_s5_listen}"
         fi
-
         if [ -n "${_s5_host:-}" ]; then
             if [ "${_s5_auth}" = "password" ] \
                 && [ -n "${_s5_user:-}" ] && [ -n "${_s5_pass:-}" ]; then
