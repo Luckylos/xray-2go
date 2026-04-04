@@ -882,10 +882,10 @@ _get_share_links() {
             if [ "${_s5_auth}" = "password" ] \
                 && [ -n "${_s5_user:-}" ] && [ -n "${_s5_pass:-}" ]; then
                 local _auth="${_s5_user}:${_s5_pass}"
-                printf 'socks5://%s@%s:%s#SOCKS5-Auth\n' \
-                    "$(_socks5_auth_base64 "${_auth}")" "${_s5_host}" "${_s5_port}"
+                printf 'socks://%s@%s:%s#SOCKS5-Auth\n' \
+                    "$(_socks_auth_base64 "${_auth}")" "${_s5_host}" "${_s5_port}"
             else
-                printf 'socks5://%s:%s#SOCKS5-NoAuth\n' "${_s5_host}" "${_s5_port}"
+                printf 'socks://%s:%s#SOCKS5-NoAuth\n' "${_s5_host}" "${_s5_port}"
             fi
         else
             log_warn "无法获取服务器 IP，SOCKS5 节点已跳过"
