@@ -883,7 +883,7 @@ _get_share_links() {
                 && [ -n "${_s5_user:-}" ] && [ -n "${_s5_pass:-}" ]; then
                 local _auth="${_s5_user}:${_s5_pass}"
                 printf 'socks://%s@%s:%s#SOCKS5-Auth\n' \
-                    "$(_socks_auth_base64 "${_auth}")" "${_s5_host}" "${_s5_port}"
+                    "$(_socks5_auth_base64 "${_auth}")" "${_s5_host}" "${_s5_port}"
             else
                 printf 'socks://%s:%s#SOCKS5-NoAuth\n' "${_s5_host}" "${_s5_port}"
             fi
