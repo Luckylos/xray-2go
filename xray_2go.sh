@@ -1945,8 +1945,8 @@ menu() {
         printf "  ${_C_RED}2.${_C_RST} 卸载 Xray-2go\n"; _hr
         printf "  ${_C_GRN}3.${_C_RST} Argo 管理\n"
         printf "  ${_C_GRN}4.${_C_RST} Reality 管理\n"
-        printf "  ${_C_GRN}5.${_C_RST} SOCKS5 管理\n"; _hr
-        printf "  ${_C_GRN}6.${_C_RST} FreeFlow 管理\n"
+        printf "  ${_C_GRN}5.${_C_RST} SOCKS5 管理\n"
+        printf "  ${_C_GRN}6.${_C_RST} FreeFlow 管理\n"; _hr
         printf "  ${_C_GRN}7.${_C_RST} 查看节点\n"
         printf "  ${_C_GRN}8.${_C_RST} 修改 UUID\n"
         printf "  ${_C_GRN}9.${_C_RST} 自动重启管理\n"
