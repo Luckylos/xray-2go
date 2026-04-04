@@ -349,28 +349,28 @@ _STATE=""
 # state.json Schema（含 SOCKS5 节，向后兼容旧版本）：
 # {
 #   "uuid":    "<自动生成>",
-#   "argo":    { "enabled":true,  "protocol":"ws",   "port":8080,
+#   "argo":    { "enabled":true,  "protocol":"ws",   "port":8888,
 #                "mode":"temp",   "domain":null,      "token":null },
 #   "ff":      { "enabled":false, "protocol":"none", "path":"/" },
 #   "reality": { "enabled":false, "port":443, "sni":"addons.mozilla.org",
 #                "pbk":null, "pvk":null, "sid":null },
-#   "socks5":  { "enabled":false, "port":1080, "listen":"0.0.0.0",
+#   "socks5":  { "enabled":false, "port":108080, "listen":"0.0.0.0",
 #                "auth":"noauth", "user":"", "pass":"" },
 #   "cron":    0,
-#   "cfip":    "cdns.doon.eu.org",
+#   "cfip":    "cf.tencentapp.cn",
 #   "cfport":  "443"
 # }
 readonly _STATE_DEFAULT='{
   "uuid":    "",
-  "argo":    {"enabled":true,  "protocol":"ws",   "port":8080,
+  "argo":    {"enabled":true,  "protocol":"ws",   "port":8888,
               "mode":"temp",   "domain":null,      "token":null},
   "ff":      {"enabled":false, "protocol":"none", "path":"/"},
   "reality": {"enabled":false, "port":443, "sni":"addons.mozilla.org",
               "pbk":null, "pvk":null, "sid":null},
-  "socks5":  {"enabled":false, "port":1080, "listen":"0.0.0.0",
+  "socks5":  {"enabled":false, "port":108080, "listen":"0.0.0.0",
               "auth":"noauth", "user":"", "pass":""},
   "cron":    0,
-  "cfip":    "cdns.doon.eu.org",
+  "cfip":    "cf.tencentapp.cn",
   "cfport":  "443"
 }'
 
@@ -413,7 +413,7 @@ _state_ensure_uuid() {
 _state_ensure_socks5() {
     local _check; _check=$(state_get '.socks5')
     if [ -z "${_check:-}" ] || [ "${_check}" = "null" ]; then
-        state_set '.socks5 = {"enabled":false,"port":1080,"listen":"0.0.0.0",
+        state_set '.socks5 = {"enabled":false,"port":108080,"listen":"0.0.0.0",
                               "auth":"noauth","user":"","pass":""}'
     fi
 }
@@ -628,7 +628,7 @@ _gen_inbound_snippet() {
                     }' ;;
             esac ;;
 
-        # ── FreeFlow（明文 port 80，WS/HTTPUpgrade/XHTTP）
+        # ── FreeFlow（明文 port 8080，WS/HTTPUpgrade/XHTTP）
         ff)
             local _ff_proto _ff_path
             _ff_proto=$(state_get '.ff.protocol')
@@ -639,7 +639,7 @@ _gen_inbound_snippet() {
                         --arg uuid  "${_uuid}" \
                         --arg path  "${_ff_path}" \
                         --argjson sniff "${_SNIFF_JSON}" '{
-                        port:80, listen:"::", protocol:"vless",
+                        port:8080, listen:"::", protocol:"vless",
                         settings:{clients:[{id:$uuid}], decryption:"none"},
                         streamSettings:{network:"ws", security:"none",
                             wsSettings:{path:$path}},
@@ -650,7 +650,7 @@ _gen_inbound_snippet() {
                         --arg uuid  "${_uuid}" \
                         --arg path  "${_ff_path}" \
                         --argjson sniff "${_SNIFF_JSON}" '{
-                        port:80, listen:"::", protocol:"vless",
+                        port:8080, listen:"::", protocol:"vless",
                         settings:{clients:[{id:$uuid}], decryption:"none"},
                         streamSettings:{network:"httpupgrade", security:"none",
                             httpupgradeSettings:{path:$path}},
@@ -661,7 +661,7 @@ _gen_inbound_snippet() {
                         --arg uuid  "${_uuid}" \
                         --arg path  "${_ff_path}" \
                         --argjson sniff "${_SNIFF_JSON}" '{
-                        port:80, listen:"::", protocol:"vless",
+                        port:8080, listen:"::", protocol:"vless",
                         settings:{clients:[{id:$uuid}], decryption:"none"},
                         streamSettings:{network:"xhttp", security:"none",
                             xhttpSettings:{host:"", path:$path, mode:"stream-one"}},
@@ -847,13 +847,13 @@ _get_share_links() {
             _penc=$(_urlencode_path "${_path}")
             case "${_ff_proto}" in
                 ws)
-                    printf 'vless://%s@%s:80?encryption=none&security=none&type=ws&host=%s&path=%s#FreeFlow-WS\n' \
+                    printf 'vless://%s@%s:8080?encryption=none&security=none&type=ws&host=%s&path=%s#FreeFlow-WS\n' \
                         "${_uuid}" "${_ip}" "${_ip}" "${_penc}" ;;
                 httpupgrade)
-                    printf 'vless://%s@%s:80?encryption=none&security=none&type=httpupgrade&host=%s&path=%s#FreeFlow-HTTPUpgrade\n' \
+                    printf 'vless://%s@%s:8080?encryption=none&security=none&type=httpupgrade&host=%s&path=%s#FreeFlow-HTTPUpgrade\n' \
                         "${_uuid}" "${_ip}" "${_ip}" "${_penc}" ;;
                 xhttp)
-                    printf 'vless://%s@%s:80?encryption=none&security=none&type=xhttp&host=%s&path=%s&mode=stream-one#FreeFlow-XHTTP\n' \
+                    printf 'vless://%s@%s:8080?encryption=none&security=none&type=xhttp&host=%s&path=%s&mode=stream-one#FreeFlow-XHTTP\n' \
                         "${_uuid}" "${_ip}" "${_ip}" "${_penc}" ;;
             esac
         else
@@ -1414,7 +1414,7 @@ ask_argo_protocol() {
 
 # @description 安装向导：询问 FreeFlow 明文协议
 ask_freeflow_mode() {
-    echo ""; log_title "FreeFlow（明文 port 80）"
+    echo ""; log_title "FreeFlow（明文 port 8080）"
     printf "  ${_C_GRN}1.${_C_RST} VLESS + WS\n"
     printf "  ${_C_GRN}2.${_C_RST} VLESS + HTTPUpgrade\n"
     printf "  ${_C_GRN}3.${_C_RST} VLESS + XHTTP (stream-one)\n"
@@ -1427,7 +1427,7 @@ ask_freeflow_mode() {
         *) state_set '.ff.enabled = false | .ff.protocol = "none"'
            log_info "不启用 FreeFlow"; echo ""; return 0 ;;
     esac
-    port_in_use 80 && log_warn "端口 80 已被占用，FreeFlow 可能无法启动"
+    port_in_use 8080 && log_warn "端口 8080 已被占用，FreeFlow 可能无法启动"
     local _p; prompt "FreeFlow path（回车默认 /）: " _p
     case "${_p:-/}" in /*) : ;; *) _p="/${_p}" ;; esac
     state_set '.ff.path = $p' --arg p "${_p:-/}"
@@ -1462,7 +1462,7 @@ ask_reality_mode() {
         && log_warn "端口 $(state_get '.reality.port') 已被占用，可安装后通过 Reality 管理修改"
 
     local _default_sni; _default_sni=$(state_get '.reality.sni')
-    log_info "SNI 建议：addons.mozilla.org / www.microsoft.com / www.apple.com"
+    log_info "SNI 建议：addons.mozilla.org / www.microsoft.com"
     local _sni; prompt "伪装 SNI 域名（回车默认 ${_default_sni}）: " _sni
     if [ -n "${_sni:-}" ]; then
         printf '%s' "${_sni}" | grep -qE '^[a-zA-Z0-9]([a-zA-Z0-9._-]*[a-zA-Z0-9])?$' \
@@ -1941,14 +1941,14 @@ menu() {
         # 绘制状态面板
         clear; echo ""
         printf "${_C_BOLD}${_C_PUR}  ╔══════════════════════════════════════════╗${_C_RST}\n"
-        printf "${_C_BOLD}${_C_PUR}  ║       Xray-2go  v4.0  SSOT/AC           ║${_C_RST}\n"
+        printf "${_C_BOLD}${_C_PUR}  ║        Xray-2go  v4.0  SSOT/AC           ║${_C_RST}\n"
         printf "${_C_BOLD}${_C_PUR}  ╠══════════════════════════════════════════╣${_C_RST}\n"
-        printf "${_C_BOLD}${_C_PUR}  ║${_C_RST}  Xray    : ${_xcolor}%-30s${_C_RST}${_C_PUR}║${_C_RST}\n"  "${_xstat}"
-        printf "${_C_BOLD}${_C_PUR}  ║${_C_RST}  Argo    : %-30s${_C_PUR}║${_C_RST}\n"  "${_argo_disp}"
-        printf "${_C_BOLD}${_C_PUR}  ║${_C_RST}  FF      : %-30s${_C_PUR}║${_C_RST}\n"  "${_ff_disp}"
-        printf "${_C_BOLD}${_C_PUR}  ║${_C_RST}  Reality : %-30s${_C_PUR}║${_C_RST}\n"  "${_r_disp}"
-        printf "${_C_BOLD}${_C_PUR}  ║${_C_RST}  SOCKS5  : %-30s${_C_PUR}║${_C_RST}\n"  "${_s5_disp}"
-        printf "${_C_BOLD}${_C_PUR}  ║${_C_RST}  Cron    : ${_C_CYN}%-2s min${_C_RST}                          ${_C_PUR}║${_C_RST}\n" "$(state_get '.cron')"
+        printf "${_C_BOLD}${_C_PUR}  ║${_C_RST}  Xray    : ${_xcolor}%-30s${_C_RST}${_C_PUR} ${_C_RST}\n"  "${_xstat}"
+        printf "${_C_BOLD}${_C_PUR}  ║${_C_RST}  Argo    : %-30s${_C_PUR} ${_C_RST}\n"  "${_argo_disp}"
+        printf "${_C_BOLD}${_C_PUR}  ║${_C_RST}  FF      : %-30s${_C_PUR} ${_C_RST}\n"  "${_ff_disp}"
+        printf "${_C_BOLD}${_C_PUR}  ║${_C_RST}  Reality : %-30s${_C_PUR} ${_C_RST}\n"  "${_r_disp}"
+        printf "${_C_BOLD}${_C_PUR}  ║${_C_RST}  SOCKS5  : %-30s${_C_PUR} ${_C_RST}\n"  "${_s5_disp}"
+        printf "${_C_BOLD}${_C_PUR}  ║${_C_RST}  Cron    : ${_C_CYN}%-2s min${_C_RST}                          ${_C_PUR} ${_C_RST}\n" "$(state_get '.cron')"
         printf "${_C_BOLD}${_C_PUR}  ╚══════════════════════════════════════════╝${_C_RST}\n\n"
 
         # 菜单选项
@@ -1956,12 +1956,12 @@ menu() {
         printf "  ${_C_RED}2.${_C_RST} 卸载 Xray-2go\n"; _hr
         printf "  ${_C_GRN}3.${_C_RST} Argo 管理\n"
         printf "  ${_C_GRN}4.${_C_RST} FreeFlow 管理\n"
-        printf "  ${_C_GRN}9.${_C_RST} Reality 管理\n"
-        printf "  ${_C_GRN}A.${_C_RST} SOCKS5 管理\n"; _hr
-        printf "  ${_C_GRN}5.${_C_RST} 查看节点\n"
-        printf "  ${_C_GRN}6.${_C_RST} 修改 UUID\n"
-        printf "  ${_C_GRN}7.${_C_RST} 自动重启管理\n"
-        printf "  ${_C_GRN}8.${_C_RST} 快捷方式/脚本更新\n"; _hr
+        printf "  ${_C_GRN}5.${_C_RST} Reality 管理\n"
+        printf "  ${_C_GRN}6.${_C_RST} SOCKS5 管理\n"; _hr
+        printf "  ${_C_GRN}7.${_C_RST} 查看节点\n"
+        printf "  ${_C_GRN}8.${_C_RST} 修改 UUID\n"
+        printf "  ${_C_GRN}9.${_C_RST} 自动重启管理\n"
+        printf "  ${_C_GRN}s.${_C_RST} 快捷方式/脚本更新\n"; _hr
         printf "  ${_C_RED}0.${_C_RST} 退出\n\n"
         local _c; prompt "请输入选择 (0-9/A): " _c; echo ""
 
@@ -1981,8 +1981,8 @@ menu() {
                     [ "$(state_get '.argo.enabled')" = "true" ] && \
                         port_in_use "$(state_get '.argo.port')" && \
                         log_warn "端口 $(state_get '.argo.port') 已被占用，可安装后修改"
-                    [ "$(state_get '.ff.enabled')" = "true" ] && port_in_use 80 && \
-                        log_warn "端口 80 已被占用，FreeFlow 可能无法启动"
+                    [ "$(state_get '.ff.enabled')" = "true" ] && port_in_use 8080 && \
+                        log_warn "端口 8080 已被占用，FreeFlow 可能无法启动"
                     if [ "$(state_get '.reality.enabled')" = "true" ]; then
                         local _rport _aport
                         _rport=$(state_get '.reality.port')
@@ -2045,12 +2045,12 @@ menu() {
             2) uninstall_all ;;
             3) manage_argo ;;
             4) manage_freeflow ;;
-            5) [ "${_cx}" -eq 0 ] && print_nodes || log_warn "Xray-2go 未安装或未运行" ;;
-            6) [ -f "${CONFIG_FILE}" ] && manage_uuid || log_warn "请先安装 Xray-2go" ;;
-            7) manage_restart ;;
-            8) install_shortcut ;;
-            9) manage_reality ;;
-            a|A) manage_socks5 ;;
+            5) manage_reality ;;
+            6) manage_socks5 ;;
+            7) [ "${_cx}" -eq 0 ] && print_nodes || log_warn "Xray-2go 未安装或未运行" ;;
+            8) [ -f "${CONFIG_FILE}" ] && manage_uuid || log_warn "请先安装 Xray-2go" ;;
+            9) manage_restart ;;
+            s) install_shortcut ;;
             0) log_info "已退出"; exit 0 ;;
             *) log_error "无效选项，请输入 0-9 或 A" ;;
         esac
