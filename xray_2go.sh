@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+
 # ==============================================================================
 # xray-2go v7.0
 # 协议支持：Argo 固定隧道(WS/XHTTP) · FreeFlow(WS/HTTPUpgrade/XHTTP)
@@ -7,6 +8,7 @@
 # 架构原则：SSOT(state.json) · 协议注册表 · 声明式配置合成 · 原子提交验证 · 零持久化节点解析
 # 架构分层：core → state → protocol → config → runtime → cli
 # ==============================================================================
+
 set -uo pipefail
 
 [ "${BASH_VERSINFO[0]}" -ge 4 ] \
@@ -548,7 +550,6 @@ _protocol_registry_init() {
     LINK_REGISTRY[vltcp]="link_vltcp"
 }
 
-readonly _SNIFF='{"enabled":true,"destOverride":["http","tls","quic"],"metadataOnly":false}'
 
 # ==============================================================================
 # §12 LAYER 3: PROTOCOL — 入站配置生成（纯函数）
@@ -558,6 +559,14 @@ readonly _SNIFF='{"enabled":true,"destOverride":["http","tls","quic"],"metadataO
 #   - 返回空串：该协议当前禁用（正常情况，非错误）
 #   - 返回非零：配置参数有误（错误情况）
 #   - 严禁：systemctl / 文件写入 / curl / 修改 _STATE
+#
+# 精简说明（纯落地代理，无服务端路由）：
+#   - sniffing        全部删除：sniff 结果无消费者，纯消耗
+#   - security:"none" 全部删除：xray 默认值
+#   - show:false      删除：realitySettings 默认值
+#   - xver:0          删除：PROXY Protocol 默认禁用
+#   - host:""         删除：xhttpSettings 空字符串无效果
+#   - streamSettings  vltcp 整块删除：network:"tcp"/security:"none" 均为默认值
 # ==============================================================================
 
 protocol_argo() {
@@ -568,21 +577,17 @@ protocol_argo() {
     _uuid=$(state_get '.uuid')
     case "${_proto}" in
         xhttp)
-            jq -n --argjson port "${_port}" --arg uuid "${_uuid}" \
-                   --argjson sniff "${_SNIFF}" '{
+            jq -n --argjson port "${_port}" --arg uuid "${_uuid}" '{
                 port:$port, listen:"127.0.0.1", protocol:"vless",
                 settings:{clients:[{id:$uuid}], decryption:"none"},
-                streamSettings:{network:"xhttp", security:"none",
-                    xhttpSettings:{host:"", path:"/argo", mode:"auto"}},
-                sniffing:$sniff}' ;;
+                streamSettings:{network:"xhttp",
+                    xhttpSettings:{path:"/argo", mode:"auto"}}}' ;;
         *)
-            jq -n --argjson port "${_port}" --arg uuid "${_uuid}" \
-                   --argjson sniff "${_SNIFF}" '{
+            jq -n --argjson port "${_port}" --arg uuid "${_uuid}" '{
                 port:$port, listen:"127.0.0.1", protocol:"vless",
                 settings:{clients:[{id:$uuid}], decryption:"none"},
-                streamSettings:{network:"ws", security:"none",
-                    wsSettings:{path:"/argo"}},
-                sniffing:$sniff}' ;;
+                streamSettings:{network:"ws",
+                    wsSettings:{path:"/argo"}}}' ;;
     esac
 }
 
@@ -595,29 +600,23 @@ protocol_ff() {
     _uuid=$(state_get '.uuid')
     case "${_proto}" in
         ws)
-            jq -n --arg uuid "${_uuid}" --arg path "${_path}" \
-                   --argjson sniff "${_SNIFF}" '{
+            jq -n --arg uuid "${_uuid}" --arg path "${_path}" '{
                 port:8080, listen:"::", protocol:"vless",
                 settings:{clients:[{id:$uuid}], decryption:"none"},
-                streamSettings:{network:"ws", security:"none",
-                    wsSettings:{path:$path}},
-                sniffing:$sniff}' ;;
+                streamSettings:{network:"ws",
+                    wsSettings:{path:$path}}}' ;;
         httpupgrade)
-            jq -n --arg uuid "${_uuid}" --arg path "${_path}" \
-                   --argjson sniff "${_SNIFF}" '{
+            jq -n --arg uuid "${_uuid}" --arg path "${_path}" '{
                 port:8080, listen:"::", protocol:"vless",
                 settings:{clients:[{id:$uuid}], decryption:"none"},
-                streamSettings:{network:"httpupgrade", security:"none",
-                    httpupgradeSettings:{path:$path}},
-                sniffing:$sniff}' ;;
+                streamSettings:{network:"httpupgrade",
+                    httpupgradeSettings:{path:$path}}}' ;;
         xhttp)
-            jq -n --arg uuid "${_uuid}" --arg path "${_path}" \
-                   --argjson sniff "${_SNIFF}" '{
+            jq -n --arg uuid "${_uuid}" --arg path "${_path}" '{
                 port:8080, listen:"::", protocol:"vless",
                 settings:{clients:[{id:$uuid}], decryption:"none"},
-                streamSettings:{network:"xhttp", security:"none",
-                    xhttpSettings:{host:"", path:$path, mode:"stream-one"}},
-                sniffing:$sniff}' ;;
+                streamSettings:{network:"xhttp",
+                    xhttpSettings:{path:$path, mode:"stream-one"}}}' ;;
         *)
             log_error "protocol_ff: 未知协议 ${_proto}"; return 1 ;;
     esac
@@ -639,25 +638,21 @@ protocol_reality() {
     case "${_net}" in
         xhttp)
             jq -n --argjson port "${_port}" --arg uuid "${_uuid}" \
-                   --arg sni "${_sni}" --arg pvk "${_pvk}" --arg sid "${_sid}" \
-                   --argjson sniff "${_SNIFF}" '{
+                   --arg sni "${_sni}" --arg pvk "${_pvk}" --arg sid "${_sid}" '{
                 port:$port, listen:"::", protocol:"vless",
                 settings:{clients:[{id:$uuid}], decryption:"none"},
                 streamSettings:{network:"xhttp", security:"reality",
-                    realitySettings:{show:false, dest:($sni+":443"), xver:0,
+                    realitySettings:{dest:($sni+":443"),
                         serverNames:[$sni], privateKey:$pvk, shortIds:[$sid]},
-                    xhttpSettings:{host:"", path:"/", mode:"auto"}},
-                sniffing:$sniff}' ;;
+                    xhttpSettings:{path:"/", mode:"auto"}}}' ;;
         *)
             jq -n --argjson port "${_port}" --arg uuid "${_uuid}" \
-                   --arg sni "${_sni}" --arg pvk "${_pvk}" --arg sid "${_sid}" \
-                   --argjson sniff "${_SNIFF}" '{
+                   --arg sni "${_sni}" --arg pvk "${_pvk}" --arg sid "${_sid}" '{
                 port:$port, listen:"::", protocol:"vless",
                 settings:{clients:[{id:$uuid, flow:"xtls-rprx-vision"}], decryption:"none"},
                 streamSettings:{network:"tcp", security:"reality",
-                    realitySettings:{show:false, dest:($sni+":443"), xver:0,
-                        serverNames:[$sni], privateKey:$pvk, shortIds:[$sid]}},
-                sniffing:$sniff}' ;;
+                    realitySettings:{dest:($sni+":443"),
+                        serverNames:[$sni], privateKey:$pvk, shortIds:[$sid]}}}' ;;
     esac
 }
 
@@ -668,11 +663,9 @@ protocol_vltcp() {
     _listen=$(state_get '.vltcp.listen')
     _uuid=$(state_get '.uuid')
     jq -n --argjson port "${_port}" --arg listen "${_listen}" \
-           --arg uuid "${_uuid}" --argjson sniff "${_SNIFF}" '{
+           --arg uuid "${_uuid}" '{
         port:$port, listen:$listen, protocol:"vless",
-        settings:{clients:[{id:$uuid}], decryption:"none"},
-        streamSettings:{network:"tcp", security:"none"},
-        sniffing:$sniff}'
+        settings:{clients:[{id:$uuid}], decryption:"none"}}'
 }
 
 # ==============================================================================
