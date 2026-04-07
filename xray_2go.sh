@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-
 # ==============================================================================
 # xray-2go v7.0
 # 协议支持：Argo 固定隧道(WS/XHTTP) · FreeFlow(WS/HTTPUpgrade/XHTTP)
@@ -7,7 +6,6 @@
 # 平台支持：Debian/Ubuntu (systemd) · Alpine (OpenRC)
 # 架构分层：core → state → protocol → config → runtime → cli
 # ==============================================================================
-
 set -uo pipefail
 
 [ "${BASH_VERSINFO[0]}" -ge 4 ] \
@@ -63,12 +61,12 @@ readonly C_RST=$'\033[0m'  C_BOLD=$'\033[1m'
 readonly C_RED=$'\033[1;91m'  C_GRN=$'\033[1;32m'  C_YLW=$'\033[1;33m'
 readonly C_PUR=$'\033[1;35m'  C_CYN=$'\033[1;36m'
 
-log_info()  { printf "${C_CYN}[INFO]${C_RST} %s\n"      "$*"; }
-log_ok()    { printf "${C_GRN}[ OK ]${C_RST} %s\n"      "$*"; }
-log_warn()  { printf "${C_YLW}[WARN]${C_RST} %s\n"      "$*" >&2; }
-log_error() { printf "${C_RED}[ERR ]${C_RST} %s\n"      "$*" >&2; }
-log_step()  { printf "${C_PUR}[....] %s${C_RST}\n"      "$*"; }
-log_title() { printf "\n${C_BOLD}${C_PUR}%s${C_RST}\n"  "$*"; }
+log_info()  { printf "${C_CYN}[INFO]${C_RST} %s\n"     "$*"; }
+log_ok()    { printf "${C_GRN}[ OK ]${C_RST} %s\n"     "$*"; }
+log_warn()  { printf "${C_YLW}[WARN]${C_RST} %s\n"     "$*" >&2; }
+log_error() { printf "${C_RED}[ERR ]${C_RST} %s\n"     "$*" >&2; }
+log_step()  { printf "${C_PUR}[....] %s${C_RST}\n"     "$*"; }
+log_title() { printf "\n${C_BOLD}${C_PUR}%s${C_RST}\n" "$*"; }
 die()       { log_error "$1"; exit "${2:-1}"; }
 
 prompt() {
@@ -119,8 +117,6 @@ _detect_init() {
 
 is_systemd() { [ "${_INIT_SYS}" = "systemd" ]; }
 is_openrc()  { [ "${_INIT_SYS}" = "openrc"  ]; }
-is_alpine()  { [ -f /etc/alpine-release ]; }
-is_debian()  { [ -f /etc/debian_version ]; }
 
 detect_arch() {
     [ -n "${_ARCH_XRAY:-}" ] && return 0
@@ -456,8 +452,8 @@ _gen_reality_sid() {
 # §11 PROTOCOL — 注册表
 #
 # 新增协议步骤：
-#   1. 实现 protocol_<name>() 纯函数（§12）
-#   2. 实现 link_<name>() 纯函数（§13）
+#   1. 实现 protocol_<n>() 纯函数（§12）
+#   2. 实现 link_<n>() 纯函数（§13）
 #   3. 在 _protocol_registry_init() 注册两个函数
 #   4. 在 _PROTOCOL_ORDER 末尾追加名称
 #   → config_synthesize / _get_share_links 无需修改
@@ -483,11 +479,11 @@ _protocol_registry_init() {
 #
 # 输出 xray inbound JSON 到 stdout；返回空串表示协议已禁用（非错误）。
 # 精简原则（纯落地，无服务端路由）：
-#   · 无 sniffing：结果无消费者
-#   · 无 security:"none" / network:"tcp"：xray 默认值
-#   · 无 show/xver：realitySettings 默认值
-#   · 无 host:""：xhttpSettings 空字符串无效果
-#   · vltcp 无 streamSettings：全为默认值，整块省略
+#   · 无 sniffing          结果无消费者
+#   · 无 security:"none"   xray 默认值
+#   · 无 show/xver         realitySettings 默认值
+#   · 无 host:""           xhttpSettings 空字符串无效果
+#   · vltcp 无 streamSettings  全为默认值，整块省略
 # ==============================================================================
 protocol_argo() {
     [ "$(state_get '.argo.enabled')" = "true" ] || return 0
@@ -667,8 +663,8 @@ link_vltcp() {
 # ==============================================================================
 # §14 CONFIG — 配置合成（state → stdout JSON，纯函数）
 #
-# 通过 PROTOCOL_REGISTRY 按 _PROTOCOL_ORDER 顺序动态组合 inbounds。
-# outbounds 只保留 freedom；无路由规则，无 DNS，无 blackhole。
+# 生成结构：log(loglevel:none) + inbounds + outbounds(freedom only)
+# 无 dns / routing / policy / stats / blackhole：纯落地代理不需要任何服务端处理
 # ==============================================================================
 config_synthesize() {
     local _ibs="[]" _ib _name _fn
@@ -1656,5 +1652,4 @@ main() {
     state_init
     menu
 }
-
 main "$@"
