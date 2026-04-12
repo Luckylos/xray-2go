@@ -691,10 +691,10 @@ link_argo() {
     [ -n "${_domain:-}" ] && [ "${_domain}" != "null" ] || return 0
     case "${_proto}" in
         xhttp)
-            printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=firefox&type=xhttp&host=%s&path=%%2Fargo&mode=auto#Argo-XHTTP\n' \
+            printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=chrome&type=xhttp&host=%s&path=%%2Fargo&mode=auto#Argo-XHTTP\n' \
                 "${_uuid}" "${_cfip}" "${_cfport}" "${_domain}" "${_domain}" ;;
         *)
-            printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=firefox&type=ws&host=%s&path=%%2Fargo%%3Fed%%3D2560#Argo-WS\n' \
+            printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=chrome&type=ws&host=%s&path=%%2Fargo%%3Fed%%3D2560#Argo-WS\n' \
                 "${_uuid}" "${_cfip}" "${_cfport}" "${_domain}" "${_domain}" ;;
     esac
 }
