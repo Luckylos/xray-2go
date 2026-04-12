@@ -1,23 +1,26 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# xray-2go v7.1
+# xray-2go v7.2
 # 协议支持：Argo 固定隧道(WS/XHTTP) · FreeFlow(WS/HTTPUpgrade/XHTTP)
 #           Reality(TCP/XHTTP) · VLESS-TCP 明文落地
 # 平台支持：Debian/Ubuntu (systemd) · Alpine (OpenRC)
 # 架构分层：core → state → protocol → config → runtime → cli
 #
-# v7.1 变更（相对 v7.0）：
-#   [安全] download_xray 添加 SHA256 校验（从 GitHub releases 获取）
-#   [安全] _gen_reality_sid 改为 head+xxd 方式，避免 od 格式差异
-#   [稳定] systemd unit 添加 Restart=always / RestartSec=3 / LimitNOFILE=1048576
-#   [稳定] tunnel systemd unit 添加 Restart=always / RestartSec=5
-#   [稳定] Argo tunnel 协议由 http2 改为 quic（Cloudflare 官方推荐）
-#   [运维] state_persist / apply_config 写前自动备份（带时间戳）
-#   [运维] loglevel "none" → "warning"，便于排障
-#   [部署] 新增 open_firewall_port()，自动处理 ufw/firewalld/iptables
-#   [部署] exec_install_core 安装后调用防火墙开放 + Argo 健康检查
+# v7.2 变更（相对 v7.1）：
+#   [稳定] _detect_init: /proc/1/comm 验证 init，增加容器环境检测
+#   [稳定] pkg_require: 捕获安装 exit code，apt-get cache 时效检测
+#   [稳定] download_xray: binary 三重验证(存在+可执行+可运行)，多镜像 fallback
+#   [稳定] exec_install_core: 安装失败自动清理本次新下载的 binary
+#   [稳定] config_synthesize: 端口+listen 冲突运行时检测
+#   [稳定] 防火墙模块全部重写: firewall_sync 幂等同步，_fw_open/-_close 去重
+#   [稳定] _cleanup_exit: TTY 检测后再调用 tput cnorm
+#   [稳定] _tpl_xray_openrc: 添加 output_log/error_log，修复日志静默丢弃
+#   [维护] _PROTOCOL_ORDER: string→array，修复 SC2086，for 循环改用 [@]
+#   [维护] get_realip: 进程内缓存，4 个 link 函数不再重复请求
+#   [维护] state 事务: begin/commit/rollback，安装向导全程事务保护
 # ==============================================================================
 set -uo pipefail
+
 [ "${BASH_VERSINFO[0]}" -ge 4 ] \
     || { printf '\033[1;91m[ERR ] 需要 bash 4.0 或更高版本\033[0m\n' >&2; exit 1; }
 
@@ -34,6 +37,14 @@ readonly SHORTCUT="/usr/local/bin/s"
 readonly SELF_DEST="/usr/local/bin/xray2go"
 readonly UPSTREAM_URL="https://raw.githubusercontent.com/Luckylos/xray-2go/refs/heads/main/xray_2go.sh"
 readonly _STATE_SCHEMA_VERSION=2
+readonly _FW_PORTS_FILE="${WORK_DIR}/.fw_ports"
+
+# 可按需增减镜像（顺序即优先级）
+readonly _XRAY_MIRRORS=(
+    "https://github.com/XTLS/Xray-core/releases/download"
+    "https://ghfast.top/https://github.com/XTLS/Xray-core/releases/download"
+    "https://hub.fastgit.xyz/XTLS/Xray-core/releases/download"
+)
 
 # ==============================================================================
 # §2  临时文件沙箱
@@ -47,7 +58,8 @@ trap '_cleanup_int'  INT TERM
 _cleanup_exit() {
     [ "${_SPINNER_PID}" -ne 0 ] && kill "${_SPINNER_PID}" 2>/dev/null || true
     [ -n "${_TMP_DIR:-}" ]      && rm -rf "${_TMP_DIR}"   2>/dev/null || true
-    tput cnorm 2>/dev/null || true
+    # 仅在 TTY 环境下恢复光标，避免非交互场景产生 tput 错误
+    [ -t 1 ] && tput cnorm 2>/dev/null || true
 }
 
 _cleanup_int() {
@@ -110,19 +122,28 @@ spinner_stop() {
 
 # ==============================================================================
 # §4  CORE — 平台检测
+# 通过 /proc/1/comm 验证 systemd 确实是 PID 1，防止 Alpine 上 systemd 包存在但
+# 未作 init 时被误判。增加容器环境检测，提前给出服务管理受限警告。
 # ==============================================================================
 _INIT_SYS=""
 _ARCH_CF=""
 _ARCH_XRAY=""
 
 _detect_init() {
-    if command -v systemctl >/dev/null 2>&1 && systemctl --version >/dev/null 2>&1; then
+    if [ -f /.dockerenv ] || \
+       grep -qE 'docker|lxc|containerd' /proc/1/cgroup 2>/dev/null; then
+        log_warn "检测到容器环境，服务管理功能可能受限"
+    fi
+    local _pid1_comm
+    _pid1_comm=$(cat /proc/1/comm 2>/dev/null | tr -d '\n' || printf 'unknown')
+    if [ "${_pid1_comm}" = "systemd" ] && command -v systemctl >/dev/null 2>&1; then
         _INIT_SYS="systemd"
     elif command -v rc-update >/dev/null 2>&1; then
         _INIT_SYS="openrc"
     else
-        die "不支持的 init 系统（需要 systemd 或 OpenRC）"
+        die "不支持的 init 系统（PID 1: ${_pid1_comm}，需要 systemd 或 OpenRC）"
     fi
+    log_info "Init 系统: ${_INIT_SYS}  PID1: ${_pid1_comm}"
 }
 
 is_systemd() { [ "${_INIT_SYS}" = "systemd" ]; }
@@ -142,6 +163,8 @@ detect_arch() {
 
 # ==============================================================================
 # §5  CORE — 工具函数
+# pkg_require: 捕获包管理器 exit code；apt-get 按 cache 时效决定是否 update
+# get_realip:  进程内缓存，同一运行周期只发起一次 HTTP 请求
 # ==============================================================================
 check_root() { [ "${EUID:-$(id -u)}" -eq 0 ] || die "请在 root 下运行脚本"; }
 
@@ -149,21 +172,27 @@ pkg_require() {
     local _pkg="$1" _bin="${2:-$1}"
     command -v "${_bin}" >/dev/null 2>&1 && return 0
     log_step "安装依赖: ${_pkg}"
-    if   command -v apt-get >/dev/null 2>&1; then
+    local _rc=0
+    if command -v apt-get >/dev/null 2>&1; then
+        if ! find /var/cache/apt/pkgcache.bin -mtime -1 >/dev/null 2>&1; then
+            DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1 || true
+        fi
         DEBIAN_FRONTEND=noninteractive apt-get install -y "${_pkg}" >/dev/null 2>&1
-    elif command -v dnf >/dev/null 2>&1; then dnf install -y "${_pkg}" >/dev/null 2>&1
-    elif command -v yum >/dev/null 2>&1; then yum install -y "${_pkg}" >/dev/null 2>&1
-    elif command -v apk >/dev/null 2>&1; then apk add       "${_pkg}" >/dev/null 2>&1
+        _rc=$?
+    elif command -v dnf     >/dev/null 2>&1; then dnf install -y "${_pkg}" >/dev/null 2>&1; _rc=$?
+    elif command -v yum     >/dev/null 2>&1; then yum install -y "${_pkg}" >/dev/null 2>&1; _rc=$?
+    elif command -v apk     >/dev/null 2>&1; then apk add       "${_pkg}" >/dev/null 2>&1; _rc=$?
     else die "未找到包管理器，无法安装 ${_pkg}"; fi
     hash -r 2>/dev/null || true
-    command -v "${_bin}" >/dev/null 2>&1 || die "${_pkg} 安装失败，请手动安装后重试"
+    [ "${_rc}" -ne 0 ] && die "${_pkg} 安装失败 (exit ${_rc})，请手动安装后重试"
+    command -v "${_bin}" >/dev/null 2>&1 \
+        || die "${_bin} 安装后仍不可用，请检查 ${_pkg} 包名是否正确"
     log_ok "${_pkg} 已就绪"
 }
 
 preflight_check() {
     log_step "依赖预检..."
     for _d in curl unzip jq; do pkg_require "${_d}"; done
-    # xxd 用于 Reality shortId 生成（比 od 格式更稳定）
     command -v xxd >/dev/null 2>&1 || pkg_require "xxd" "xxd" 2>/dev/null || \
         log_info "xxd 未安装 — Reality shortId 将 fallback 到 openssl/od"
     command -v openssl >/dev/null 2>&1 \
@@ -190,20 +219,26 @@ port_in_use() {
         /proc/net/tcp /proc/net/tcp6 2>/dev/null
 }
 
+_CACHED_REALIP=""
+
 get_realip() {
-    local _ip _org _v6
+    [ -n "${_CACHED_REALIP:-}" ] && { printf '%s' "${_CACHED_REALIP}"; return 0; }
+    local _ip _org _v6 _result=""
     _ip=$(curl -sf --max-time 5 https://api.ipify.org 2>/dev/null) || true
     if [ -z "${_ip:-}" ]; then
         _v6=$(curl -sf --max-time 5 https://api6.ipify.org 2>/dev/null) || true
-        [ -n "${_v6:-}" ] && printf '[%s]' "${_v6}" || printf ''; return
-    fi
-    _org=$(curl -sf --max-time 5 "https://ipinfo.io/${_ip}/org" 2>/dev/null) || true
-    if printf '%s' "${_org:-}" | grep -qiE 'Cloudflare|UnReal|AEZA|Andrei'; then
-        _v6=$(curl -sf --max-time 5 https://api6.ipify.org 2>/dev/null) || true
-        [ -n "${_v6:-}" ] && printf '[%s]' "${_v6}" || printf '%s' "${_ip}"
+        [ -n "${_v6:-}" ] && _result="[${_v6}]"
     else
-        printf '%s' "${_ip}"
+        _org=$(curl -sf --max-time 5 "https://ipinfo.io/${_ip}/org" 2>/dev/null) || true
+        if printf '%s' "${_org:-}" | grep -qiE 'Cloudflare|UnReal|AEZA|Andrei'; then
+            _v6=$(curl -sf --max-time 5 https://api6.ipify.org 2>/dev/null) || true
+            [ -n "${_v6:-}" ] && _result="[${_v6}]" || _result="${_ip}"
+        else
+            _result="${_ip}"
+        fi
     fi
+    _CACHED_REALIP="${_result}"
+    printf '%s' "${_CACHED_REALIP}"
 }
 
 urlencode_path() {
@@ -221,69 +256,128 @@ _kernel_ge() {
 }
 
 # ==============================================================================
-# §5a CORE — 防火墙自动开放（新增 v7.1）
+# §5a CORE — 防火墙模块（全部重写）
 #
-# 优先级：ufw → firewall-cmd → iptables/ip6tables
-# 仅开放 TCP，非阻塞（失败只 warn 不 die）
+# 设计原则：
+#   _fw_open  : iptables -C 检查后再 -I，幂等
+#   _fw_close : 循环 -D 直到规则不存在，清除全部重复规则
+#   firewall_sync: 计算期望端口集合 diff .fw_ports 记录，自动增删
+#                  端口变更、协议禁用后旧规则自动清理，多次运行无副作用
 # ==============================================================================
-open_firewall_port() {
-    local _port="$1" _proto="${2:-tcp}"
-    [ -z "${_port:-}" ] && return 0
-    # ufw（Debian/Ubuntu 默认）
-    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q 'active'; then
-        ufw allow "${_port}/${_proto}" >/dev/null 2>&1 \
-            && { log_ok "ufw: 已开放 ${_port}/${_proto}"; return 0; } \
-            || { log_warn "ufw: 开放 ${_port}/${_proto} 失败"; }
+
+_fw_read_managed() {
+    grep -E '^[0-9]+$' "${_FW_PORTS_FILE}" 2>/dev/null | sort -un || true
+}
+
+_fw_get_expected_ports() {
+    local _out=""
+    [ "$(state_get '.reality.enabled')" = "true" ] && \
+        _out="${_out}$(state_get '.reality.port')\n"
+    [ "$(state_get '.vltcp.enabled')" = "true" ] && \
+        _out="${_out}$(state_get '.vltcp.port')\n"
+    [ "$(state_get '.ff.enabled')" = "true" ] && \
+        [ "$(state_get '.ff.protocol')" != "none" ] && \
+        _out="${_out}8080\n"
+    printf '%b' "${_out}" | grep -E '^[0-9]+$' | sort -un
+}
+
+_fw_open() {
+    local _port="$1" _proto="${2:-tcp}" _any=0
+    if command -v ufw >/dev/null 2>&1 && \
+       ufw status 2>/dev/null | grep -q '^Status: active'; then
+        if ! ufw status numbered 2>/dev/null | grep -qE "^[[:space:]]*[0-9]+.*${_port}/${_proto}"; then
+            ufw allow "${_port}/${_proto}" >/dev/null 2>&1 && _any=1
+        fi
     fi
-    # firewalld（RHEL/CentOS/Fedora）
     if command -v firewall-cmd >/dev/null 2>&1 && \
        firewall-cmd --state >/dev/null 2>&1; then
-        firewall-cmd --permanent --add-port="${_port}/${_proto}" >/dev/null 2>&1 && \
-        firewall-cmd --reload >/dev/null 2>&1 \
-            && { log_ok "firewalld: 已开放 ${_port}/${_proto}"; return 0; } \
-            || { log_warn "firewalld: 开放 ${_port}/${_proto} 失败"; }
-    fi
-    # iptables 兜底
-    if command -v iptables >/dev/null 2>&1; then
-        iptables  -I INPUT -p "${_proto}" --dport "${_port}" -j ACCEPT 2>/dev/null && \
-        ip6tables -I INPUT -p "${_proto}" --dport "${_port}" -j ACCEPT 2>/dev/null || true
-        # 尝试持久化
-        if command -v iptables-save >/dev/null 2>&1; then
-            iptables-save  > /etc/iptables/rules.v4  2>/dev/null || \
-            iptables-save  > /etc/sysconfig/iptables 2>/dev/null || true
+        if ! firewall-cmd --query-port="${_port}/${_proto}" --permanent >/dev/null 2>&1; then
+            firewall-cmd --permanent --add-port="${_port}/${_proto}" >/dev/null 2>&1 && \
+                firewall-cmd --reload >/dev/null 2>&1 && _any=1
         fi
-        log_ok "iptables: 已开放 ${_port}/${_proto}"
-        return 0
     fi
-    log_warn "未检测到活跃防火墙，端口 ${_port} 无需手动开放或请手动处理"
+    if command -v iptables >/dev/null 2>&1; then
+        iptables -C INPUT -p "${_proto}" --dport "${_port}" -j ACCEPT 2>/dev/null || {
+            iptables -I INPUT -p "${_proto}" --dport "${_port}" -j ACCEPT 2>/dev/null
+            _any=1
+        }
+        ip6tables -C INPUT -p "${_proto}" --dport "${_port}" -j ACCEPT 2>/dev/null || {
+            ip6tables -I INPUT -p "${_proto}" --dport "${_port}" -j ACCEPT 2>/dev/null || true
+        }
+    fi
+    [ "${_any}" -eq 1 ] && log_ok "防火墙已开放: ${_port}/${_proto}" || \
+        log_info "防火墙端口已存在: ${_port}/${_proto}"
+}
+
+_fw_close() {
+    local _port="$1" _proto="${2:-tcp}"
+    if command -v ufw >/dev/null 2>&1 && \
+       ufw status 2>/dev/null | grep -q '^Status: active'; then
+        ufw delete allow "${_port}/${_proto}" >/dev/null 2>&1 || true
+    fi
+    if command -v firewall-cmd >/dev/null 2>&1 && \
+       firewall-cmd --state >/dev/null 2>&1; then
+        firewall-cmd --permanent --remove-port="${_port}/${_proto}" >/dev/null 2>&1 && \
+            firewall-cmd --reload >/dev/null 2>&1 || true
+    fi
+    if command -v iptables >/dev/null 2>&1; then
+        local _n=0
+        while iptables -C INPUT -p "${_proto}" --dport "${_port}" -j ACCEPT 2>/dev/null; do
+            iptables -D INPUT -p "${_proto}" --dport "${_port}" -j ACCEPT 2>/dev/null || break
+            _n=$(( _n + 1 )); [ "${_n}" -gt 20 ] && break
+        done
+        _n=0
+        while ip6tables -C INPUT -p "${_proto}" --dport "${_port}" -j ACCEPT 2>/dev/null; do
+            ip6tables -D INPUT -p "${_proto}" --dport "${_port}" -j ACCEPT 2>/dev/null || break
+            _n=$(( _n + 1 )); [ "${_n}" -gt 20 ] && break
+        done
+    fi
+    log_info "防火墙已关闭: ${_port}/${_proto}"
+}
+
+firewall_sync() {
+    log_step "同步防火墙规则..."
+    mkdir -p "${WORK_DIR}"
+    local _expected _managed _p
+
+    _expected=$(_fw_get_expected_ports)
+    _managed=$(_fw_read_managed)
+
+    for _p in ${_managed}; do
+        printf '%s\n' ${_expected} | grep -qx "${_p}" || _fw_close "${_p}" tcp
+    done
+    for _p in ${_expected}; do
+        _fw_open "${_p}" tcp
+    done
+
+    if [ -n "${_expected:-}" ]; then
+        printf '%s\n' ${_expected} > "${_FW_PORTS_FILE}" 2>/dev/null || true
+    else
+        rm -f "${_FW_PORTS_FILE}" 2>/dev/null || true
+    fi
 }
 
 # ==============================================================================
-# §5b CORE — Argo 隧道健康检查（新增 v7.1）
-#
-# 隧道启动后等待最多 15s，curl 探测 Cloudflare edge 连通性
-# 通过 Argo 域名发起请求，HTTP 4xx 也视为连通（边缘已收到）
+# §5b CORE — Argo 隧道健康检查（v7.1 保留）
 # ==============================================================================
 check_argo_health() {
     local _domain; _domain=$(state_get '.argo.domain')
     [ -n "${_domain:-}" ] && [ "${_domain}" != "null" ] || return 0
-
     log_step "Argo 健康检查（等待隧道就绪，最长 15s）..."
-    local _i _rc=1
+    local _i
     for _i in 3 6 9 12 15; do
         sleep "${_i}" 2>/dev/null || sleep 3
-        # HTTP 2xx/3xx/4xx 均表示边缘已收到请求，隧道连通
         local _code
         _code=$(curl -sfL --max-time 5 --connect-timeout 3 \
             -o /dev/null -w '%{http_code}' \
             "https://${_domain}/" 2>/dev/null) || true
         case "${_code:-000}" in
-            [2345]??) log_ok "Argo 隧道连通 (HTTP ${_code}, domain=${_domain})"; return 0 ;;
+            [2345]??) log_ok "Argo 隧道连通 (HTTP ${_code})"; return 0 ;;
         esac
         [ "${_i}" -lt 15 ] && printf '\r%s' "  等待中... (${_i}s)" >&2
     done
     printf '\n' >&2
-    log_warn "Argo 健康检查超时，请稍后通过 [3. Argo 管理] 确认隧道状态"
+    log_warn "Argo 健康检查超时，请稍后通过 [3. Argo 管理] 确认"
     return 1
 }
 
@@ -321,24 +415,9 @@ fix_time_sync() {
 
 # ==============================================================================
 # §7  STATE — 核心操作
-#
-# Schema v2:
-# {
-#   "_schema": 2,
-#   "uuid":    "",
-#   "argo":    {"enabled":true,  "protocol":"ws", "port":8888,
-#               "mode":"fixed",  "domain":null,   "token":null},
-#   "ff":      {"enabled":false, "protocol":"none", "path":"/"},
-#   "reality": {"enabled":false, "port":443, "sni":"addons.mozilla.org",
-#               "network":"tcp", "pbk":null, "pvk":null, "sid":null},
-#   "vltcp":   {"enabled":false, "port":1234, "listen":"0.0.0.0"},
-#   "cron":    0,
-#   "cfip":    "cf.tencentapp.cn",
-#   "cfport":  "443"
-# }
-# 写操作规则：所有写操作必须经由 state_set，禁止直接操作 _STATE
 # ==============================================================================
 _STATE=""
+_STATE_SNAPSHOT=""
 
 readonly _STATE_DEFAULT='{
   "_schema": 2,
@@ -368,14 +447,11 @@ state_set() {
     [ -n "${_n:-}" ] && _STATE="${_n}" || { log_error "state_set 返回空 JSON"; return 1; }
 }
 
-# [v7.1] 写入前自动备份 state.json（带时间戳，保留最近一份）
 state_persist() {
     mkdir -p "${WORK_DIR}"
-    # 备份现有 state.json
     if [ -f "${STATE_FILE}" ]; then
         local _ts; _ts=$(date +%Y%m%d_%H%M%S 2>/dev/null || printf 'bak')
         cp -f "${STATE_FILE}" "${STATE_FILE}.${_ts}.bak" 2>/dev/null || true
-        # 仅保留最新一份备份，清理旧备份
         ls -t "${STATE_FILE}".*.bak 2>/dev/null | tail -n +2 | xargs rm -f 2>/dev/null || true
     fi
     local _t; _t=$(_tmp_file "state_XXXXXX.json") || return 1
@@ -383,27 +459,28 @@ state_persist() {
     mv "${_t}" "${STATE_FILE}"
 }
 
+# 事务机制：安装向导使用 begin/commit/rollback 保护 _STATE 不被脏写
+state_begin_txn()    { _STATE_SNAPSHOT="${_STATE}"; }
+state_commit_txn()   { _STATE_SNAPSHOT=""; state_persist || log_warn "state.json 写入失败"; }
+state_rollback_txn() {
+    [ -n "${_STATE_SNAPSHOT:-}" ] && { _STATE="${_STATE_SNAPSHOT}"; log_info "状态已回滚"; }
+    _STATE_SNAPSHOT=""
+}
+
 # ==============================================================================
 # §8  STATE — 默认值补全与 Schema 迁移
 # ==============================================================================
 state_merge_default() {
     local _c
-
     _c=$(state_get '.vltcp')
     { [ -z "${_c:-}" ] || [ "${_c}" = "null" ]; } && \
         state_set '.vltcp = {"enabled":false,"port":1234,"listen":"0.0.0.0"}'
-
     _c=$(state_get '.reality.network')
-    { [ -z "${_c:-}" ] || [ "${_c}" = "null" ]; } && \
-        state_set '.reality.network = "tcp"'
-
+    { [ -z "${_c:-}" ] || [ "${_c}" = "null" ]; } && state_set '.reality.network = "tcp"'
     _c=$(state_get '.cfip')
-    { [ -z "${_c:-}" ] || [ "${_c}" = "null" ]; } && \
-        state_set '.cfip = "cf.tencentapp.cn"'
-
+    { [ -z "${_c:-}" ] || [ "${_c}" = "null" ]; } && state_set '.cfip = "cf.tencentapp.cn"'
     _c=$(state_get '.cfport')
-    { [ -z "${_c:-}" ] || [ "${_c}" = "null" ]; } && \
-        state_set '.cfport = "443"'
+    { [ -z "${_c:-}" ] || [ "${_c}" = "null" ]; } && state_set '.cfport = "443"'
 }
 
 state_version() {
@@ -421,7 +498,6 @@ state_version() {
 # ==============================================================================
 _state_migrate_legacy() {
     local _r
-
     if [ -f "${CONFIG_FILE}" ]; then
         _r=$(jq -r 'first(.inbounds[]? | select(.protocol=="vless")
                     | .settings.clients[0].id) // empty' "${CONFIG_FILE}" 2>/dev/null || true)
@@ -431,7 +507,6 @@ _state_migrate_legacy() {
         case "${_r:-}" in ''|*[!0-9]*) :;; *)
             state_set '.argo.port = ($p|tonumber)' --arg p "${_r}";; esac
     fi
-
     _r=$(cat "${WORK_DIR}/argo_mode.conf" 2>/dev/null || true)
     case "${_r:-}" in yes) state_set '.argo.enabled = true';;
                       no)  state_set '.argo.enabled = false';; esac
@@ -439,7 +514,6 @@ _state_migrate_legacy() {
     case "${_r:-}" in ws|xhttp) state_set '.argo.protocol = $p' --arg p "${_r}";; esac
     _r=$(cat "${WORK_DIR}/domain_fixed.txt" 2>/dev/null || true)
     [ -n "${_r:-}" ] && state_set '.argo.domain = $d | .argo.mode = "fixed"' --arg d "${_r}"
-
     if [ -f "${WORK_DIR}/freeflow.conf" ]; then
         local _l1 _l2
         _l1=$(sed -n '1p' "${WORK_DIR}/freeflow.conf" 2>/dev/null || true)
@@ -451,7 +525,6 @@ _state_migrate_legacy() {
         esac
         [ -n "${_l2:-}" ] && state_set '.ff.path = $p' --arg p "${_l2}"
     fi
-
     if [ -f "${WORK_DIR}/reality.conf" ]; then
         local _rm _rp _rs _rpbk _rpvk _rsid
         _rm=$(  sed -n '1p' "${WORK_DIR}/reality.conf" 2>/dev/null || true)
@@ -468,11 +541,9 @@ _state_migrate_legacy() {
         [ -n "${_rpvk:-}" ] && state_set '.reality.pvk = $k' --arg k "${_rpvk}"
         [ -n "${_rsid:-}" ] && state_set '.reality.sid = $s' --arg s "${_rsid}"
     fi
-
     _r=$(cat "${WORK_DIR}/restart.conf" 2>/dev/null || true)
     case "${_r:-}" in ''|*[!0-9]*):;; *)
         state_set '.cron = ($r|tonumber)' --arg r "${_r}";; esac
-
     log_info "已从历史配置文件完成状态迁移"
 }
 
@@ -513,15 +584,12 @@ _gen_reality_keypair() {
     local _out _rc
     _out=$("${XRAY_BIN}" x25519 2>&1); _rc=$?
     [ "${_rc}" -ne 0 ] && { log_error "xray x25519 失败 (exit ${_rc})"; return 1; }
-    [ -z "${_out:-}" ] && { log_error "xray x25519 无输出，二进制可能损坏"; return 1; }
+    [ -z "${_out:-}" ] && { log_error "xray x25519 无输出"; return 1; }
     local _pvk _pbk
     _pvk=$(printf '%s\n' "${_out}" | grep -i 'private' | awk '{print $NF}' | tr -d '\r\n')
     _pbk=$(printf '%s\n' "${_out}" | grep -i 'public'  | awk '{print $NF}' | tr -d '\r\n')
     if [ -z "${_pvk:-}" ] || [ -z "${_pbk:-}" ]; then
-        log_error "密钥解析失败，xray 原始输出:"
-        printf '%s\n' "${_out}" | while IFS= read -r _l; do log_error "  ${_l}"; done
-        log_error "如持续失败请卸载后重装以更新 xray 二进制"
-        return 1
+        log_error "密钥解析失败"; return 1
     fi
     local _b64='^[A-Za-z0-9_=-]{20,}$'
     printf '%s' "${_pvk}" | grep -qE "${_b64}" || { log_error "私钥格式异常"; return 1; }
@@ -531,37 +599,27 @@ _gen_reality_keypair() {
     log_ok "x25519 密钥对已生成 (pubkey: ${_pbk:0:16}...)"
 }
 
-# [v7.1] shortId 生成：优先 openssl → xxd → od，保证 hex 格式正确
 _gen_reality_sid() {
-    # 优先 openssl（最标准）
     command -v openssl >/dev/null 2>&1 && { openssl rand -hex 8 2>/dev/null; return; }
-    # xxd 方式（比 od 格式更稳定，无空格问题）
-    command -v xxd >/dev/null 2>&1 && \
+    command -v xxd    >/dev/null 2>&1 && \
         { head -c 8 /dev/urandom 2>/dev/null | xxd -p | tr -d '\n'; return; }
-    # 最终 fallback：od
     od -An -N8 -tx1 /dev/urandom | tr -d ' \n'
 }
 
 # ==============================================================================
 # §11 PROTOCOL — 注册表
-#
-# 新增协议步骤：
-#   1. 实现 protocol_<n>() 纯函数（§12）
-#   2. 实现 link_<n>() 纯函数（§13）
-#   3. 在 _protocol_registry_init() 注册两个函数
-#   4. 在 _PROTOCOL_ORDER 末尾追加名称
-#   → config_synthesize / _get_share_links 无需修改
+# _PROTOCOL_ORDER 改为 bash array，for 循环使用 "${_PROTOCOL_ORDER[@]}"
+# 新增协议只需末尾追加数组元素，无需修改其他逻辑
 # ==============================================================================
 declare -A PROTOCOL_REGISTRY
 declare -A LINK_REGISTRY
-_PROTOCOL_ORDER="argo ff reality vltcp"
+_PROTOCOL_ORDER=("argo" "ff" "reality" "vltcp")
 
 _protocol_registry_init() {
     PROTOCOL_REGISTRY[argo]="protocol_argo"
     PROTOCOL_REGISTRY[ff]="protocol_ff"
     PROTOCOL_REGISTRY[reality]="protocol_reality"
     PROTOCOL_REGISTRY[vltcp]="protocol_vltcp"
-
     LINK_REGISTRY[argo]="link_argo"
     LINK_REGISTRY[ff]="link_ff"
     LINK_REGISTRY[reality]="link_reality"
@@ -569,21 +627,12 @@ _protocol_registry_init() {
 }
 
 # ==============================================================================
-# §12 PROTOCOL — 入站配置生成（纯函数，禁止副作用）
-#
-# 输出 xray inbound JSON 到 stdout；返回空串表示协议已禁用（非错误）。
-# 精简原则（纯落地，无服务端路由）：
-#   · 无 sniffing          结果无消费者
-#   · 无 security:"none"   xray 默认值
-#   · 无 show/xver         realitySettings 默认值
-#   · 无 host:""           xhttpSettings 空字符串无效果
-#   · vltcp 无 streamSettings  全为默认值，整块省略
+# §12 PROTOCOL — 入站配置生成
 # ==============================================================================
 protocol_argo() {
     [ "$(state_get '.argo.enabled')" = "true" ] || return 0
     local _port _proto _uuid
-    _port=$(state_get '.argo.port')
-    _proto=$(state_get '.argo.protocol')
+    _port=$(state_get '.argo.port'); _proto=$(state_get '.argo.protocol')
     _uuid=$(state_get '.uuid')
     case "${_proto}" in
         xhttp)
@@ -606,15 +655,13 @@ protocol_ff() {
     local _proto; _proto=$(state_get '.ff.protocol')
     [ "${_proto}" != "none" ] || return 0
     local _path _uuid
-    _path=$(state_get '.ff.path')
-    _uuid=$(state_get '.uuid')
+    _path=$(state_get '.ff.path'); _uuid=$(state_get '.uuid')
     case "${_proto}" in
         ws)
             jq -n --arg uuid "${_uuid}" --arg path "${_path}" '{
                 port:8080, listen:"::", protocol:"vless",
                 settings:{clients:[{id:$uuid}], decryption:"none"},
-                streamSettings:{network:"ws",
-                    wsSettings:{path:$path}}}' ;;
+                streamSettings:{network:"ws", wsSettings:{path:$path}}}' ;;
         httpupgrade)
             jq -n --arg uuid "${_uuid}" --arg path "${_path}" '{
                 port:8080, listen:"::", protocol:"vless",
@@ -627,8 +674,7 @@ protocol_ff() {
                 settings:{clients:[{id:$uuid}], decryption:"none"},
                 streamSettings:{network:"xhttp",
                     xhttpSettings:{path:$path, mode:"stream-one"}}}' ;;
-        *)
-            log_error "protocol_ff: 未知协议 ${_proto}"; return 1 ;;
+        *) log_error "protocol_ff: 未知协议 ${_proto}"; return 1 ;;
     esac
 }
 
@@ -636,15 +682,12 @@ protocol_reality() {
     [ "$(state_get '.reality.enabled')" = "true" ] || return 0
     local _pvk; _pvk=$(state_get '.reality.pvk')
     if [ -z "${_pvk:-}" ] || [ "${_pvk}" = "null" ]; then
-        log_warn "Reality 密钥未就绪，已跳过该入站"
-        return 0
+        log_warn "Reality 密钥未就绪，已跳过该入站"; return 0
     fi
     local _port _sni _sid _net _uuid
-    _port=$(state_get '.reality.port')
-    _sni=$(state_get  '.reality.sni')
-    _sid=$(state_get  '.reality.sid')
-    _net=$(state_get  '.reality.network'); _net="${_net:-tcp}"
-    _uuid=$(state_get '.uuid')
+    _port=$(state_get '.reality.port'); _sni=$(state_get '.reality.sni')
+    _sid=$(state_get  '.reality.sid');  _net=$(state_get '.reality.network')
+    _net="${_net:-tcp}";                _uuid=$(state_get '.uuid')
     case "${_net}" in
         xhttp)
             jq -n --argjson port "${_port}" --arg uuid "${_uuid}" \
@@ -669,8 +712,7 @@ protocol_reality() {
 protocol_vltcp() {
     [ "$(state_get '.vltcp.enabled')" = "true" ] || return 0
     local _port _listen _uuid
-    _port=$(state_get '.vltcp.port')
-    _listen=$(state_get '.vltcp.listen')
+    _port=$(state_get '.vltcp.port'); _listen=$(state_get '.vltcp.listen')
     _uuid=$(state_get '.uuid')
     jq -n --argjson port "${_port}" --arg listen "${_listen}" --arg uuid "${_uuid}" '{
         port:$port, listen:$listen, protocol:"vless",
@@ -678,23 +720,21 @@ protocol_vltcp() {
 }
 
 # ==============================================================================
-# §13 PROTOCOL — 节点链接生成（纯函数，禁止副作用）
+# §13 PROTOCOL — 节点链接生成
 # ==============================================================================
 link_argo() {
     [ "$(state_get '.argo.enabled')" = "true" ] || return 0
     local _domain _proto _uuid _cfip _cfport
-    _domain=$(state_get '.argo.domain')
-    _proto=$(state_get  '.argo.protocol')
-    _uuid=$(state_get   '.uuid')
-    _cfip=$(state_get   '.cfip')
+    _domain=$(state_get '.argo.domain'); _proto=$(state_get '.argo.protocol')
+    _uuid=$(state_get '.uuid');          _cfip=$(state_get '.cfip')
     _cfport=$(state_get '.cfport')
     [ -n "${_domain:-}" ] && [ "${_domain}" != "null" ] || return 0
     case "${_proto}" in
         xhttp)
-            printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=chrome&type=xhttp&host=%s&path=%%2Fargo&mode=auto#Argo-XHTTP\n' \
+            printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=firefox&type=xhttp&host=%s&path=%%2Fargo&mode=auto#Argo-XHTTP\n' \
                 "${_uuid}" "${_cfip}" "${_cfport}" "${_domain}" "${_domain}" ;;
         *)
-            printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=chrome&type=ws&host=%s&path=%%2Fargo%%3Fed%%3D2560#Argo-WS\n' \
+            printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=firefox&type=ws&host=%s&path=%%2Fargo%%3Fed%%3D2560#Argo-WS\n' \
                 "${_uuid}" "${_cfip}" "${_cfport}" "${_domain}" "${_domain}" ;;
     esac
 }
@@ -706,18 +746,14 @@ link_ff() {
     local _ip; _ip=$(get_realip)
     if [ -z "${_ip:-}" ]; then log_warn "无法获取服务器 IP，FreeFlow 节点已跳过"; return 0; fi
     local _penc _uuid
-    _penc=$(urlencode_path "$(state_get '.ff.path')")
-    _uuid=$(state_get '.uuid')
+    _penc=$(urlencode_path "$(state_get '.ff.path')"); _uuid=$(state_get '.uuid')
     case "${_proto}" in
-        ws)
-            printf 'vless://%s@%s:8080?encryption=none&security=none&type=ws&host=%s&path=%s#FreeFlow-WS\n' \
-                "${_uuid}" "${_ip}" "${_ip}" "${_penc}" ;;
-        httpupgrade)
-            printf 'vless://%s@%s:8080?encryption=none&security=none&type=httpupgrade&host=%s&path=%s#FreeFlow-HTTPUpgrade\n' \
-                "${_uuid}" "${_ip}" "${_ip}" "${_penc}" ;;
-        xhttp)
-            printf 'vless://%s@%s:8080?encryption=none&security=none&type=xhttp&host=%s&path=%s&mode=stream-one#FreeFlow-XHTTP\n' \
-                "${_uuid}" "${_ip}" "${_ip}" "${_penc}" ;;
+        ws)          printf 'vless://%s@%s:8080?encryption=none&security=none&type=ws&host=%s&path=%s#FreeFlow-WS\n' \
+                         "${_uuid}" "${_ip}" "${_ip}" "${_penc}" ;;
+        httpupgrade) printf 'vless://%s@%s:8080?encryption=none&security=none&type=httpupgrade&host=%s&path=%s#FreeFlow-HTTPUpgrade\n' \
+                         "${_uuid}" "${_ip}" "${_ip}" "${_penc}" ;;
+        xhttp)       printf 'vless://%s@%s:8080?encryption=none&security=none&type=xhttp&host=%s&path=%s&mode=stream-one#FreeFlow-XHTTP\n' \
+                         "${_uuid}" "${_ip}" "${_ip}" "${_penc}" ;;
     esac
 }
 
@@ -728,25 +764,21 @@ link_reality() {
     local _ip; _ip=$(get_realip)
     if [ -z "${_ip:-}" ]; then log_warn "无法获取服务器 IP，Reality 节点已跳过"; return 0; fi
     local _rnet _uuid
-    _rnet=$(state_get '.reality.network'); _rnet="${_rnet:-tcp}"
-    _uuid=$(state_get '.uuid')
+    _rnet=$(state_get '.reality.network'); _rnet="${_rnet:-tcp}"; _uuid=$(state_get '.uuid')
     case "${_rnet}" in
-        xhttp)
-            printf 'vless://%s@%s:%s?encryption=none&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=xhttp&path=%%2F&mode=auto#Reality-XHTTP\n' \
-                "${_uuid}" "${_ip}" "$(state_get '.reality.port')" \
-                "$(state_get '.reality.sni')" "${_rpbk}" "$(state_get '.reality.sid')" ;;
-        *)
-            printf 'vless://%s@%s:%s?encryption=none&flow=xtls-rprx-vision&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=tcp&headerType=none#Reality-Vision\n' \
-                "${_uuid}" "${_ip}" "$(state_get '.reality.port')" \
-                "$(state_get '.reality.sni')" "${_rpbk}" "$(state_get '.reality.sid')" ;;
+        xhttp) printf 'vless://%s@%s:%s?encryption=none&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=xhttp&path=%%2F&mode=auto#Reality-XHTTP\n' \
+                   "${_uuid}" "${_ip}" "$(state_get '.reality.port')" \
+                   "$(state_get '.reality.sni')" "${_rpbk}" "$(state_get '.reality.sid')" ;;
+        *)     printf 'vless://%s@%s:%s?encryption=none&flow=xtls-rprx-vision&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=tcp&headerType=none#Reality-Vision\n' \
+                   "${_uuid}" "${_ip}" "$(state_get '.reality.port')" \
+                   "$(state_get '.reality.sni')" "${_rpbk}" "$(state_get '.reality.sid')" ;;
     esac
 }
 
 link_vltcp() {
     [ "$(state_get '.vltcp.enabled')" = "true" ] || return 0
     local _listen _vhost _uuid
-    _listen=$(state_get '.vltcp.listen')
-    _uuid=$(state_get   '.uuid')
+    _listen=$(state_get '.vltcp.listen'); _uuid=$(state_get '.uuid')
     [ "${_listen}" = "0.0.0.0" ] || [ "${_listen}" = "::" ] \
         && _vhost=$(get_realip) || _vhost="${_listen}"
     if [ -z "${_vhost:-}" ]; then log_warn "无法获取服务器 IP，VLESS-TCP 节点已跳过"; return 0; fi
@@ -755,20 +787,29 @@ link_vltcp() {
 }
 
 # ==============================================================================
-# §14 CONFIG — 配置合成（state → stdout JSON，纯函数）
-#
-# 生成结构：log(loglevel:warning) + inbounds + outbounds(freedom only)
-# [v7.1] loglevel 由 "none" 改为 "warning"，便于排障，不影响性能
-# 无 dns / routing / policy / stats / blackhole：纯落地代理不需要任何服务端处理
+# §14 CONFIG — 配置合成
+# 端口+listen 冲突检测：相同 listen:port 组合被多个协议使用时跳过后者并报错
 # ==============================================================================
 config_synthesize() {
-    local _ibs="[]" _ib _name _fn
+    local _ibs="[]" _ib _name _fn _used_keys=""
 
-    for _name in ${_PROTOCOL_ORDER}; do
+    for _name in "${_PROTOCOL_ORDER[@]}"; do
         _fn="${PROTOCOL_REGISTRY[${_name}]:-}"
         [ -n "${_fn:-}" ] || continue
         _ib=$("${_fn}") || { log_error "协议 ${_name} 配置生成失败"; return 1; }
         [ -n "${_ib:-}" ] || continue
+
+        local _p _l _key
+        _p=$(printf '%s' "${_ib}" | jq -r '.port // empty')
+        _l=$(printf '%s' "${_ib}" | jq -r '.listen // "0.0.0.0"')
+        _key="${_l}:${_p}"
+        if printf '%s\n' ${_used_keys} | grep -qxF "${_key}"; then
+            log_error "端口冲突: ${_key} 已被占用，跳过协议 [${_name}]"
+            log_error "  请在对应管理菜单中修改端口后重新应用配置"
+            continue
+        fi
+        _used_keys="${_used_keys} ${_key}"
+
         _ibs=$(printf '%s' "${_ibs}" | jq --argjson ib "${_ib}" '. + [$ib]') \
             || { log_error "inbounds 组装失败 (${_name})"; return 1; }
     done
@@ -776,7 +817,6 @@ config_synthesize() {
     [ "$(printf '%s' "${_ibs}" | jq 'length')" -eq 0 ] && \
         log_warn "所有入站均已禁用，xray 将以零入站模式运行"
 
-    # [v7.1] loglevel: "warning"（原 "none"）
     jq -n --argjson inbounds "${_ibs}" '{
         log:      {loglevel:"warning"},
         inbounds: $inbounds,
@@ -789,7 +829,7 @@ config_synthesize() {
 # ==============================================================================
 _get_share_links() {
     local _name _fn
-    for _name in ${_PROTOCOL_ORDER}; do
+    for _name in "${_PROTOCOL_ORDER[@]}"; do
         _fn="${LINK_REGISTRY[${_name}]:-}"
         [ -n "${_fn:-}" ] || continue
         "${_fn}" || true
@@ -809,7 +849,8 @@ print_nodes() {
 }
 
 # ==============================================================================
-# §16 RUNTIME — 服务管理（屏蔽 systemd / OpenRC 差异）
+# §16 RUNTIME — 服务管理
+# _tpl_xray_openrc: 增加 output_log/error_log，修复 OpenRC 日志静默丢弃
 # ==============================================================================
 _SYSD_DIRTY=0
 
@@ -846,22 +887,19 @@ _svc_write() {
     printf '%s' "${_content}" > "${_dest}"; return 1
 }
 
-# [v7.1] 添加 Restart=always / RestartSec=3 / LimitNOFILE=1048576
-#        防止 VPS 重启/网络波动导致 xray downtime
 _tpl_xray_systemd() {
     printf '[Unit]\nDescription=Xray Service\nDocumentation=https://github.com/XTLS/Xray-core\nAfter=network.target nss-lookup.target\nWants=network-online.target\n\n[Service]\nType=simple\nNoNewPrivileges=yes\nExecStart=%s run -c %s\nRestart=always\nRestartSec=3\nRestartPreventExitStatus=23\nLimitNOFILE=1048576\n\n[Install]\nWantedBy=multi-user.target\n' \
         "${XRAY_BIN}" "${CONFIG_FILE}"
 }
 
-# [v7.1] tunnel 同样添加 Restart=always / RestartSec=5
-#        Cloudflare QUIC 连接偶发中断时自动恢复
 _tpl_tunnel_systemd() {
     printf '[Unit]\nDescription=Cloudflare Tunnel\nAfter=network.target\n\n[Service]\nType=simple\nNoNewPrivileges=yes\nTimeoutStartSec=0\nExecStart=/bin/sh -c '"'"'%s >> %s 2>&1'"'"'\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n' \
         "$1" "${ARGO_LOG}"
 }
 
 _tpl_xray_openrc() {
-    printf '#!/sbin/openrc-run\ndescription="Xray service"\ncommand="%s"\ncommand_args="run -c %s"\ncommand_background=true\npidfile="/var/run/xray.pid"\n' \
+    mkdir -p /var/log/xray 2>/dev/null || true
+    printf '#!/sbin/openrc-run\ndescription="Xray service"\ncommand="%s"\ncommand_args="run -c %s"\ncommand_background=true\noutput_log="/var/log/xray/xray.log"\nerror_log="/var/log/xray/error.log"\npidfile="/var/run/xray.pid"\n' \
         "${XRAY_BIN}" "${CONFIG_FILE}"
 }
 
@@ -891,17 +929,12 @@ apply_tunnel_service() {
 
 # ==============================================================================
 # §17 RUNTIME — Argo 隧道命令与配置文件
-#
-# [v7.1] 协议由 http2 改为 quic
-#        Cloudflare 官方推荐 QUIC，减少握手延迟，连接更稳定
-#        参考：https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/
 # ==============================================================================
 _build_tunnel_cmd() {
     if [ -f "${WORK_DIR}/tunnel.yml" ]; then
         printf '%s tunnel --edge-ip-version auto --config %s run' \
             "${ARGO_BIN}" "${WORK_DIR}/tunnel.yml"
     else
-        # [v7.1] --protocol quic（原 http2）
         printf '%s tunnel --edge-ip-version auto --no-autoupdate --protocol quic run --token %s' \
             "${ARGO_BIN}" "$(state_get '.argo.token')"
     fi
@@ -910,7 +943,6 @@ _build_tunnel_cmd() {
 _gen_argo_config() {
     local _domain="$1" _tid="$2" _cred="$3"
     local _port; _port=$(state_get '.argo.port')
-    # [v7.1] protocol: quic（原 http2）
     printf 'tunnel: %s\ncredentials-file: %s\nprotocol: quic\n\ningress:\n  - hostname: %s\n    service: http://localhost:%s\n    originRequest:\n      noTLSVerify: true\n  - service: http_status:404\n' \
         "${_tid}" "${_cred}" "${_domain}" "${_port}" > "${WORK_DIR}/tunnel.yml" \
         || { log_error "tunnel.yml 写入失败"; return 1; }
@@ -918,63 +950,91 @@ _gen_argo_config() {
 }
 
 # ==============================================================================
-# §18 RUNTIME — 下载
-#
-# [v7.1] download_xray 添加 SHA256 校验
-#        从 GitHub releases 获取 checksums 文件并验证，防止供应链攻击
+# §18 RUNTIME — 下载（全部重写）
+# _xray_latest_tag: GitHub API（与文件 CDN 不同域，独立信任链）
+# _download_with_fallback: 多镜像依次尝试
+# download_xray: 三重验证现有 binary（存在+可执行+可运行），失败清理残留
 # ==============================================================================
+
+_xray_latest_tag() {
+    curl -sfL --max-time 10 \
+        "https://api.github.com/repos/XTLS/Xray-core/releases/latest" \
+        2>/dev/null | jq -r '.tag_name // empty' 2>/dev/null || true
+}
+
+_download_with_fallback() {
+    local _filename="$1" _dest="$2" _tag="$3"
+    local _mirror
+    for _mirror in "${_XRAY_MIRRORS[@]}"; do
+        spinner_start "下载 ${_filename}"
+        curl -sfL --connect-timeout 15 --max-time 120 \
+            -o "${_dest}" "${_mirror}/${_tag}/${_filename}"
+        local _rc=$?
+        spinner_stop
+        if [ "${_rc}" -eq 0 ] && [ -s "${_dest}" ]; then
+            return 0
+        fi
+        log_warn "镜像失败，尝试下一个..."
+        rm -f "${_dest}" 2>/dev/null || true
+    done
+    log_error "所有镜像均下载失败: ${_filename}"
+    return 1
+}
+
 download_xray() {
     detect_arch
-    [ -f "${XRAY_BIN}" ] && { log_info "xray 已存在，跳过下载"; return 0; }
+    if [ -f "${XRAY_BIN}" ] && [ -x "${XRAY_BIN}" ] && \
+       "${XRAY_BIN}" version >/dev/null 2>&1; then
+        local _cur
+        _cur=$("${XRAY_BIN}" version 2>/dev/null | head -1 | \
+               grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+        log_info "xray 已存在 (v${_cur:-unknown})，跳过下载"
+        return 0
+    fi
+    rm -f "${XRAY_BIN}" 2>/dev/null || true
 
-    local _base_url="https://github.com/XTLS/Xray-core/releases/latest/download"
+    local _tag; _tag=$(_xray_latest_tag)
+    [ -z "${_tag:-}" ] && { log_warn "无法获取版本号，使用 latest 重定向"; _tag="latest"; }
+
     local _zip_name="Xray-linux-${_ARCH_XRAY}.zip"
-    local _url="${_base_url}/${_zip_name}"
     local _z; _z=$(_tmp_file "xray_XXXXXX.zip") || return 1
 
-    spinner_start "下载 Xray (${_ARCH_XRAY})"
-    curl -sfL --connect-timeout 15 --max-time 120 -o "${_z}" "${_url}"; local _rc=$?
-    spinner_stop
-    [ "${_rc}" -ne 0 ] && { log_error "Xray 下载失败"; return 1; }
+    _download_with_fallback "${_zip_name}" "${_z}" "${_tag}" || return 1
 
-    # [v7.1] SHA256 校验
-    log_step "验证 Xray 文件完整性（SHA256）..."
-    local _sha_url="${_base_url}/Xray-linux-${_ARCH_XRAY}.zip.dgst"
-    local _sha_file; _sha_file=$(_tmp_file "xray_XXXXXX.dgst") || return 1
-    if curl -sfL --connect-timeout 10 --max-time 30 -o "${_sha_file}" "${_sha_url}" 2>/dev/null; then
-        # dgst 文件格式：多行，SHA2-256 行形如 "SHA2-256(filename)= <hash>"
-        local _expected_hash
-        _expected_hash=$(grep -i 'SHA2-256' "${_sha_file}" 2>/dev/null | \
-                         awk '{print $NF}' | head -1 | tr -d '[:space:]') || true
-        if [ -n "${_expected_hash:-}" ] && command -v sha256sum >/dev/null 2>&1; then
-            local _actual_hash
-            _actual_hash=$(sha256sum "${_z}" | awk '{print $1}' | tr -d '[:space:]')
-            if [ "${_actual_hash}" = "${_expected_hash}" ]; then
-                log_ok "SHA256 校验通过"
-            else
-                log_error "SHA256 校验失败！文件可能已损坏或被篡改"
-                log_error "  期望: ${_expected_hash}"
-                log_error "  实际: ${_actual_hash}"
-                rm -f "${_z}"
-                return 1
+    if [ "${_tag}" != "latest" ] && command -v sha256sum >/dev/null 2>&1; then
+        log_step "校验 SHA256..."
+        local _dgst _expected _actual
+        _dgst=$(curl -sfL --max-time 15 \
+            "https://github.com/XTLS/Xray-core/releases/download/${_tag}/${_zip_name}.dgst" \
+            2>/dev/null) || true
+        _expected=$(printf '%s' "${_dgst:-}" | grep -i 'SHA2-256' | \
+                    awk '{print $NF}' | head -1 | tr -d '[:space:]')
+        if [ -n "${_expected:-}" ]; then
+            _actual=$(sha256sum "${_z}" | awk '{print $1}')
+            if [ "${_actual}" != "${_expected}" ]; then
+                log_error "SHA256 校验失败 (期望: ${_expected}, 实际: ${_actual})"
+                rm -f "${_z}"; return 1
             fi
+            log_ok "SHA256 校验通过"
         else
-            log_warn "无法执行 SHA256 校验（缺少 sha256sum 或 hash 文件格式异常），跳过校验"
+            log_warn "未获取到 SHA256 校验值，跳过校验"
         fi
-    else
-        log_warn "无法获取 SHA256 校验文件，跳过完整性验证"
     fi
 
-    unzip -t "${_z}" >/dev/null 2>&1 || { log_error "Xray zip 损坏"; return 1; }
-    unzip -o "${_z}" xray -d "${WORK_DIR}/" >/dev/null 2>&1 || { log_error "Xray 解压失败"; return 1; }
+    unzip -t "${_z}" >/dev/null 2>&1 || { log_error "zip 文件损坏"; rm -f "${_z}"; return 1; }
+    unzip -o "${_z}" xray -d "${WORK_DIR}/" >/dev/null 2>&1 \
+        || { log_error "解压失败"; return 1; }
     [ -f "${XRAY_BIN}" ] || { log_error "解压后未找到 xray 二进制"; return 1; }
     chmod +x "${XRAY_BIN}"
-    log_ok "Xray 下载完成 ($("${XRAY_BIN}" version 2>/dev/null | head -1 | awk '{print $2}'))"
+    log_ok "Xray 安装完成 ($("${XRAY_BIN}" version 2>/dev/null | head -1 | awk '{print $2}'))"
 }
 
 download_cloudflared() {
     detect_arch
-    [ -f "${ARGO_BIN}" ] && { log_info "cloudflared 已存在，跳过下载"; return 0; }
+    if [ -f "${ARGO_BIN}" ] && [ -x "${ARGO_BIN}" ]; then
+        log_info "cloudflared 已存在，跳过下载"; return 0
+    fi
+    rm -f "${ARGO_BIN}" 2>/dev/null || true
     local _url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${_ARCH_CF}"
     spinner_start "下载 cloudflared (${_ARCH_CF})"
     curl -sfL --connect-timeout 15 --max-time 120 -o "${ARGO_BIN}" "${_url}"; local _rc=$?
@@ -986,9 +1046,7 @@ download_cloudflared() {
 }
 
 # ==============================================================================
-# §19 RUNTIME — 配置原子提交（合成 → 验证 → 写入 → 重启）
-#
-# [v7.1] 写入前自动备份 config.json（带时间戳，保留最近一份）
+# §19 RUNTIME — 配置原子提交
 # ==============================================================================
 apply_config() {
     local _t; _t=$(_tmp_file "xray_next_XXXXXX.json") || return 1
@@ -1008,8 +1066,6 @@ apply_config() {
     fi
 
     mkdir -p "${WORK_DIR}"
-
-    # [v7.1] 写入前备份 config.json
     if [ -f "${CONFIG_FILE}" ]; then
         local _ts; _ts=$(date +%Y%m%d_%H%M%S 2>/dev/null || printf 'bak')
         cp -f "${CONFIG_FILE}" "${CONFIG_FILE}.${_ts}.bak" 2>/dev/null || true
@@ -1027,26 +1083,39 @@ apply_config() {
 
 # ==============================================================================
 # §20 RUNTIME — 安装与卸载
-#
-# [v7.1] exec_install_core 新增：
-#   - 防火墙自动开放所有启用协议的端口
-#   - Argo 启动后健康检查
+# exec_install_core: 记录安装前 binary 状态，失败时清理本次新下载的文件
+# exec_uninstall: 先同步防火墙清理托管端口，再删除 WORK_DIR
 # ==============================================================================
+_INSTALL_XRAY_WAS_PRESENT=0
+_INSTALL_ARGO_WAS_PRESENT=0
+
+_exec_install_cleanup() {
+    log_warn "安装中断，清理本次新下载的文件..."
+    [ "${_INSTALL_XRAY_WAS_PRESENT}" -eq 0 ] && rm -f "${XRAY_BIN}" 2>/dev/null || true
+    [ "${_INSTALL_ARGO_WAS_PRESENT}" -eq 0 ] && rm -f "${ARGO_BIN}" 2>/dev/null || true
+}
+
 exec_install_core() {
-    clear; log_title "══════════ 安装 Xray-2go v7 ══════════"
+    clear; log_title "══════════ 安装 Xray-2go v7.2 ══════════"
     preflight_check
     mkdir -p "${WORK_DIR}" && chmod 750 "${WORK_DIR}"
 
-    download_xray || return 1
-    [ "$(state_get '.argo.enabled')" = "true" ] && { download_cloudflared || return 1; }
+    [ -f "${XRAY_BIN}" ] && [ -x "${XRAY_BIN}" ] && \
+        _INSTALL_XRAY_WAS_PRESENT=1 || _INSTALL_XRAY_WAS_PRESENT=0
+    [ -f "${ARGO_BIN}" ] && [ -x "${ARGO_BIN}" ] && \
+        _INSTALL_ARGO_WAS_PRESENT=1 || _INSTALL_ARGO_WAS_PRESENT=0
+
+    download_xray        || { _exec_install_cleanup; return 1; }
+    [ "$(state_get '.argo.enabled')" = "true" ] && \
+        { download_cloudflared || { _exec_install_cleanup; return 1; }; }
 
     if [ "$(state_get '.reality.enabled')" = "true" ]; then
         log_step "生成 Reality x25519 密钥对..."
-        _gen_reality_keypair || return 1
+        _gen_reality_keypair || { _exec_install_cleanup; return 1; }
         state_set '.reality.sid = $s' --arg s "$(_gen_reality_sid)"
     fi
 
-    apply_config || return 1
+    apply_config || { _exec_install_cleanup; return 1; }
 
     apply_xray_service
     [ "$(state_get '.argo.enabled')" = "true" ] && apply_tunnel_service
@@ -1059,19 +1128,7 @@ exec_install_core() {
     fi
 
     fix_time_sync
-
-    # [v7.1] 防火墙自动开放各协议端口
-    log_step "检测并开放防火墙端口..."
-    if [ "$(state_get '.reality.enabled')" = "true" ]; then
-        open_firewall_port "$(state_get '.reality.port')" tcp
-    fi
-    if [ "$(state_get '.vltcp.enabled')" = "true" ]; then
-        open_firewall_port "$(state_get '.vltcp.port')" tcp
-    fi
-    if [ "$(state_get '.ff.enabled')" = "true" ] && \
-       [ "$(state_get '.ff.protocol')" != "none" ]; then
-        open_firewall_port 8080 tcp
-    fi
+    firewall_sync   # 幂等防火墙同步
 
     log_step "启动服务..."
     exec_svc enable xray
@@ -1092,6 +1149,16 @@ exec_uninstall() {
     local _a; prompt "确定要卸载 xray-2go？(y/N): " _a
     case "${_a:-n}" in y|Y) :;; *) log_info "已取消"; return;; esac
     log_step "卸载中..."
+
+    # 清理防火墙规则（依赖 state，必须在 rm -rf WORK_DIR 前执行）
+    if [ -f "${STATE_FILE}" ]; then
+        log_step "清理防火墙规则..."
+        local _managed; _managed=$(_fw_read_managed)
+        local _p
+        for _p in ${_managed}; do _fw_close "${_p}" tcp; done
+        rm -f "${_FW_PORTS_FILE}" 2>/dev/null || true
+    fi
+
     exec_remove_auto_restart
     for _s in xray tunnel; do
         exec_svc stop    "${_s}" 2>/dev/null || true
@@ -1156,8 +1223,6 @@ apply_fixed_tunnel() {
     state_persist || log_warn "state.json 写入失败"
     exec_svc restart tunnel || { log_error "tunnel 重启失败"; return 1; }
     log_ok "固定隧道已配置 (domain=${_domain})"
-
-    # [v7.1] 固定隧道配置完成后执行健康检查
     check_argo_health || true
 }
 
@@ -1280,7 +1345,7 @@ check_argo() {
 }
 
 # ==============================================================================
-# §26 CLI — 安装向导（纯交互输入）
+# §26 CLI — 安装向导
 # ==============================================================================
 ask_argo_mode() {
     echo ""; log_title "Argo 固定隧道"
@@ -1335,7 +1400,6 @@ ask_reality_mode() {
         1) state_set '.reality.enabled = true';;
         *) state_set '.reality.enabled = false'; log_info "不启用 Reality"; echo ""; return 0;;
     esac
-
     local _dp; _dp=$(state_get '.reality.port')
     local _rp; prompt "监听端口（回车默认 ${_dp}）: " _rp
     if [ -n "${_rp:-}" ]; then
@@ -1348,7 +1412,6 @@ ask_reality_mode() {
     fi
     port_in_use "$(state_get '.reality.port')" && \
         log_warn "端口 $(state_get '.reality.port') 已被占用，可安装后修改"
-
     local _ds; _ds=$(state_get '.reality.sni')
     log_info "SNI 建议：addons.mozilla.org / www.microsoft.com / www.apple.com"
     local _sni; prompt "伪装 SNI（回车默认 ${_ds}）: " _sni
@@ -1357,7 +1420,6 @@ ask_reality_mode() {
             && state_set '.reality.sni = $s' --arg s "${_sni}" \
             || log_warn "SNI 格式不合法，使用默认值 ${_ds}"
     fi
-
     echo ""
     printf "  ${C_GRN}1.${C_RST} TCP + XTLS-Vision ${C_YLW}[默认]${C_RST}\n"
     printf "  ${C_GRN}2.${C_RST} XHTTP + Reality (auto)\n"
@@ -1367,7 +1429,7 @@ ask_reality_mode() {
         *) state_set '.reality.network = "tcp"';   log_info "已选：TCP + XTLS-Vision";;
     esac
     log_info "Reality 配置完成 — 端口:$(state_get '.reality.port') SNI:$(state_get '.reality.sni') 传输:$(state_get '.reality.network')"
-    log_info "密钥对将在安装时自动生成"; echo ""
+    echo ""
 }
 
 ask_vltcp_mode() {
@@ -1379,7 +1441,6 @@ ask_vltcp_mode() {
         1) state_set '.vltcp.enabled = true';;
         *) state_set '.vltcp.enabled = false'; log_info "不启用 VLESS-TCP"; echo ""; return 0;;
     esac
-
     local _dp; _dp=$(state_get '.vltcp.port')
     local _vp; prompt "监听端口（回车默认 ${_dp}）: " _vp
     if [ -n "${_vp:-}" ]; then
@@ -1392,20 +1453,17 @@ ask_vltcp_mode() {
     fi
     port_in_use "$(state_get '.vltcp.port')" && \
         log_warn "端口 $(state_get '.vltcp.port') 已被占用，可安装后修改"
-
     local _dl; _dl=$(state_get '.vltcp.listen')
     local _vl; prompt "监听地址（回车默认 ${_dl}，0.0.0.0=所有接口）: " _vl
     [ -n "${_vl:-}" ] && state_set '.vltcp.listen = $l' --arg l "${_vl}"
-
     log_info "VLESS-TCP 配置完成 — 端口:$(state_get '.vltcp.port') 监听:$(state_get '.vltcp.listen')"
     echo ""
 }
 
 # ==============================================================================
 # §27 CLI — 管理子菜单
+# manage_reality / manage_vltcp: open_firewall_port → firewall_sync
 # ==============================================================================
-
-# 通用端口输入（输出新端口到 stdout，已调用 state_set 更新；失败返回非零）
 _input_port() {
     local _jq_path="$1" _p
     prompt "新端口（回车随机）: " _p
@@ -1425,13 +1483,11 @@ _input_port() {
 manage_argo() {
     [ "$(state_get '.argo.enabled')" = "true" ] || { log_warn "未启用 Argo"; sleep 1; return; }
     [ -f "${ARGO_BIN}" ]                         || { log_warn "Argo 未安装"; sleep 1; return; }
-
     while true; do
         local _astat _domain _proto _port
         _astat=$(check_argo)
         _domain=$(state_get '.argo.domain'); _proto=$(state_get '.argo.protocol')
         _port=$(state_get '.argo.port')
-
         clear; echo ""; log_title "══ Argo 固定隧道管理 ══"
         printf "  状态: ${C_GRN}%s${C_RST}  协议: ${C_CYN}%s${C_RST}  端口: ${C_YLW}%s${C_RST}\n" \
             "${_astat}" "${_proto}" "${_port}"
@@ -1449,7 +1505,6 @@ manage_argo() {
         printf "  ${C_GRN}6.${C_RST} 健康检查\n"
         printf "  ${C_PUR}0.${C_RST} 返回\n"; _hr
         local _c; prompt "请输入选择: " _c
-
         case "${_c:-}" in
             1)
                 echo ""
@@ -1473,7 +1528,7 @@ manage_argo() {
             3) exec_update_argo_port ;;
             4) exec_svc start  tunnel && log_ok "隧道已启动" || log_error "启动失败" ;;
             5) exec_svc stop   tunnel && log_ok "隧道已停止" || log_error "停止失败" ;;
-            6) check_argo_health || true ;;   # [v7.1] 新增健康检查入口
+            6) check_argo_health || true ;;
             0) return ;;
             *) log_error "无效选项" ;;
         esac
@@ -1486,7 +1541,6 @@ manage_freeflow() {
         local _en _proto _path
         _en=$(state_get '.ff.enabled'); _proto=$(state_get '.ff.protocol')
         _path=$(state_get '.ff.path')
-
         clear; echo ""; log_title "══ FreeFlow 管理 ══"
         [ "${_en}" = "true" ] && [ "${_proto}" != "none" ] \
             && printf "  状态: ${C_GRN}已启用${C_RST}  协议: ${C_CYN}%s${C_RST}  path: ${C_YLW}%s${C_RST}\n" \
@@ -1498,12 +1552,12 @@ manage_freeflow() {
         printf "  ${C_RED}3.${C_RST} 卸载 FreeFlow\n"
         printf "  ${C_PUR}0.${C_RST} 返回\n"; _hr
         local _c; prompt "请输入选择: " _c
-
         case "${_c:-}" in
             1)
                 ask_freeflow_mode
                 apply_config  || { log_error "配置更新失败"; _pause; continue; }
                 state_persist || log_warn "state.json 写入失败"
+                firewall_sync
                 log_ok "FreeFlow 已变更"; print_nodes ;;
             2)
                 if [ "${_en}" != "true" ] || [ "${_proto}" = "none" ]; then
@@ -1521,6 +1575,7 @@ manage_freeflow() {
                 state_set '.ff.enabled = false | .ff.protocol = "none"' || { _pause; continue; }
                 apply_config  || { log_error "卸载失败"; _pause; continue; }
                 state_persist || log_warn "state.json 写入失败"
+                firewall_sync
                 log_ok "FreeFlow 已卸载" ;;
             0) return ;;
             *) log_error "无效选项" ;;
@@ -1531,7 +1586,6 @@ manage_freeflow() {
 
 manage_reality() {
     [ -f "${CONFIG_FILE}" ] || { log_warn "请先安装 Xray-2go"; sleep 1; return; }
-
     while true; do
         local _en _port _sni _pbk _pvk _sid _net _pbk_disp
         _en=$(  state_get '.reality.enabled');  _port=$(state_get '.reality.port')
@@ -1540,7 +1594,6 @@ manage_reality() {
         _net=$( state_get '.reality.network');  _net="${_net:-tcp}"
         _pbk_disp="未生成"
         [ -n "${_pbk:-}" ] && [ "${_pbk}" != "null" ] && _pbk_disp="${_pbk:0:16}..."
-
         clear; echo ""; log_title "══ Reality 管理 ══"
         [ "${_en}" = "true" ] \
             && printf "  状态: ${C_GRN}已启用${C_RST}\n" \
@@ -1560,7 +1613,6 @@ manage_reality() {
         printf "  ${C_GRN}7.${C_RST} 查看节点\n"
         printf "  ${C_PUR}0.${C_RST} 返回\n"; _hr
         local _c; prompt "请输入选择: " _c
-
         case "${_c:-}" in
             1)
                 if [ -z "${_pvk:-}" ] || [ "${_pvk}" = "null" ]; then
@@ -1571,18 +1623,19 @@ manage_reality() {
                 state_set '.reality.enabled = true' || { _pause; continue; }
                 apply_config  || { _pause; continue; }
                 state_persist || log_warn "state.json 写入失败"
+                firewall_sync
                 log_ok "Reality 已启用"; print_nodes ;;
             2)
                 state_set '.reality.enabled = false' || { _pause; continue; }
                 apply_config  || { _pause; continue; }
                 state_persist || log_warn "state.json 写入失败"
+                firewall_sync
                 log_ok "Reality 已禁用" ;;
             3)
                 local _np; _np=$(_input_port '.reality.port') || { _pause; continue; }
                 apply_config  || { _pause; continue; }
                 state_persist || log_warn "state.json 写入失败"
-                # [v7.1] 端口变更后同步防火墙
-                open_firewall_port "${_np}" tcp || true
+                firewall_sync
                 log_ok "端口已更新: ${_np}"; print_nodes ;;
             4)
                 log_info "建议：addons.mozilla.org / www.microsoft.com / www.apple.com"
@@ -1619,13 +1672,11 @@ manage_reality() {
 
 manage_vltcp() {
     [ -f "${CONFIG_FILE}" ] || { log_warn "请先安装 Xray-2go"; sleep 1; return; }
-
     while true; do
         local _en _port _listen
         _en=$(    state_get '.vltcp.enabled')
         _port=$(  state_get '.vltcp.port')
         _listen=$(state_get '.vltcp.listen')
-
         clear; echo ""; log_title "══ VLESS-TCP 明文落地管理 ══"
         [ "${_en}" = "true" ] \
             && printf "  状态: ${C_GRN}已启用${C_RST}\n" \
@@ -1639,26 +1690,24 @@ manage_vltcp() {
         printf "  ${C_GRN}5.${C_RST} 查看节点链接\n"
         printf "  ${C_PUR}0.${C_RST} 返回\n"; _hr
         local _c; prompt "请输入选择: " _c
-
         case "${_c:-}" in
             1)
                 state_set '.vltcp.enabled = true' || { _pause; continue; }
                 apply_config  || { _pause; continue; }
                 state_persist || log_warn "state.json 写入失败"
-                # [v7.1] 启用时同步防火墙
-                open_firewall_port "${_port}" tcp || true
+                firewall_sync
                 log_ok "VLESS-TCP 已启用 (端口: ${_port})"; print_nodes ;;
             2)
                 state_set '.vltcp.enabled = false' || { _pause; continue; }
                 apply_config  || { _pause; continue; }
                 state_persist || log_warn "state.json 写入失败"
+                firewall_sync
                 log_ok "VLESS-TCP 已禁用" ;;
             3)
                 local _np; _np=$(_input_port '.vltcp.port') || { _pause; continue; }
                 apply_config  || { _pause; continue; }
                 state_persist || log_warn "state.json 写入失败"
-                # [v7.1] 端口变更后同步防火墙
-                open_firewall_port "${_np}" tcp || true
+                firewall_sync
                 log_ok "端口已更新: ${_np}"
                 [ "${_en}" = "true" ] && print_nodes ;;
             4)
@@ -1706,13 +1755,13 @@ manage_restart() {
 
 # ==============================================================================
 # §28 CLI — 主菜单
+# _menu_do_install 使用 state 事务保护，安装失败后 _STATE 回滚至向导启动前
 # ==============================================================================
 _menu_collect_status() {
     local _xs _cx
     _xs=$(check_xray); _cx=$?
     [ "${_cx}" -eq 0 ] && _MENU_XC="${C_GRN}" || _MENU_XC="${C_RED}"
     _MENU_XS="${_xs}"; _MENU_CX="${_cx}"
-
     local _as; _as=$(check_argo)
     local _dom; _dom=$(state_get '.argo.domain')
     if [ "$(state_get '.argo.enabled')" = "true" ]; then
@@ -1720,15 +1769,12 @@ _menu_collect_status() {
             && _MENU_AD="${_as} [$(state_get '.argo.protocol'), ${_dom}]" \
             || _MENU_AD="${_as} [未配置域名]"
     else _MENU_AD="未启用"; fi
-
     local _fp _fpa; _fp=$(state_get '.ff.protocol'); _fpa=$(state_get '.ff.path')
     [ "$(state_get '.ff.enabled')" = "true" ] && [ "${_fp}" != "none" ] \
         && _MENU_FD="${_fp} (path=${_fpa})" || _MENU_FD="未启用"
-
     [ "$(state_get '.reality.enabled')" = "true" ] \
         && _MENU_RD="已启用 (port=$(state_get '.reality.port'), $(state_get '.reality.network'), sni=$(state_get '.reality.sni'))" \
         || _MENU_RD="未启用"
-
     [ "$(state_get '.vltcp.enabled')" = "true" ] \
         && _MENU_VD="已启用 (port=$(state_get '.vltcp.port'), listen=$(state_get '.vltcp.listen'))" \
         || _MENU_VD="未启用"
@@ -1737,7 +1783,7 @@ _menu_collect_status() {
 _menu_render() {
     clear; echo ""
     printf "${C_BOLD}${C_PUR}  ╔══════════════════════════════════════════╗${C_RST}\n"
-    printf "${C_BOLD}${C_PUR}  ║           Xray-2go  v7.1  SSOT/AC        ║${C_RST}\n"
+    printf "${C_BOLD}${C_PUR}  ║           Xray-2go  v7.2  SSOT/AC        ║${C_RST}\n"
     printf "${C_BOLD}${C_PUR}  ╠══════════════════════════════════════════╣${C_RST}\n"
     printf "${C_BOLD}${C_PUR}  ║${C_RST}  Xray     : ${_MENU_XC}%-29s${C_RST}${C_PUR} ${C_RST}\n"  "${_MENU_XS}"
     printf "${C_BOLD}${C_PUR}  ║${C_RST}  Argo     : %-29s${C_PUR} ${C_RST}\n"  "${_MENU_AD}"
@@ -1764,6 +1810,9 @@ _menu_do_install() {
         log_warn "Xray-2go 已安装，如需重装请先卸载 (选项 2)"; return
     fi
 
+    # 事务保护：所有 ask_* 修改均在快照内，安装失败可完整回滚
+    state_begin_txn
+
     ask_argo_mode
     [ "$(state_get '.argo.enabled')" = "true" ] && ask_argo_protocol
     ask_freeflow_mode
@@ -1786,21 +1835,29 @@ _menu_do_install() {
         log_warn "VLESS-TCP 端口 $(state_get '.vltcp.port') 已被占用，可安装后修改"
 
     check_bbr
-    exec_install_core || { log_error "安装失败"; _pause; return; }
+
+    if ! exec_install_core; then
+        log_error "安装失败"
+        state_rollback_txn   # 恢复 _STATE 至安装向导启动前
+        _pause
+        return
+    fi
+
+    state_commit_txn   # 持久化
+
     [ "$(state_get '.argo.enabled')" = "true" ] && \
-        { apply_fixed_tunnel || log_error "固定隧道配置失败，请从 [3. Argo 管理] 重新配置"; }
+        { apply_fixed_tunnel || \
+          log_error "固定隧道配置失败，请从 [3. Argo 管理] 重新配置"; }
     print_nodes
 }
 
 menu() {
     local _MENU_XS="" _MENU_XC="" _MENU_CX=1
     local _MENU_AD="" _MENU_FD="" _MENU_RD="" _MENU_VD=""
-
     while true; do
         _menu_collect_status
         _menu_render
         local _c; prompt "请输入选择 (0-9/s): " _c; echo ""
-
         case "${_c:-}" in
             1) _menu_do_install ;;
             2) exec_uninstall ;;
