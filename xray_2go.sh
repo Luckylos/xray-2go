@@ -352,19 +352,23 @@ firewall_sync() {
 # §5b CORE — 隔离运行辅助函数
 # ==============================================================================
 
-# 仅检测系统是否存在 xray，返回 1 表示存在，0 表示干净
-# 不做任何修改，仅供提示使用
+# 仅检测系统是否存在 xray（非本脚本），不做任何修改，仅供提示使用
+# 返回 0（真）= 检测到已有 xray；返回 1（假）= 系统干净
+# 原 bug：_found=0 时 return 0 → bash if 判定为真 → 永远触发警告
 _detect_existing_xray() {
-    local _found=0
+    # systemd 服务（排除本脚本的 xray2go）
     if command -v systemctl >/dev/null 2>&1; then
         systemctl list-unit-files 2>/dev/null \
-            | grep -qiE '^xray[^2]' && _found=1
+            | grep -qiE '^xray[^2]' && return 0
     fi
-    [ -f /etc/init.d/xray ] && _found=1
+    # OpenRC 服务
+    [ -f /etc/init.d/xray ] && return 0
+    # PATH 中存在 xray 可执行文件（排除本脚本路径）
     local _wx; _wx=$(command -v xray 2>/dev/null || true)
-    [ -n "${_wx:-}" ] && _found=1
-    pgrep -x xray >/dev/null 2>&1 && _found=1
-    return "${_found}"
+    [ -n "${_wx:-}" ] && [ "${_wx}" != "${XRAY_BIN}" ] && return 0
+    # 正在运行的 xray 进程
+    pgrep -x xray >/dev/null 2>&1 && return 0
+    return 1
 }
 
 # 三重验证：文件存在 + 可执行 + version 通过 + -test 最小配置通过
@@ -1006,8 +1010,9 @@ _tpl_xray_systemd() {
 }
 
 _tpl_tunnel_systemd() {
-    printf '[Unit]\nDescription=Cloudflare Tunnel2go\nAfter=network.target\n\n[Service]\nType=simple\nNoNewPrivileges=yes\nTimeoutStartSec=0\nExecStart=/bin/sh -c '"'"'%s >> %s 2>&1'"'"'\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n' \
-        "$1" "${ARGO_LOG}"
+    # Cloudflare 官方推荐：直接 ExecStart，用 systemd 原生 append 重定向替代 shell 包装
+    printf '[Unit]\nDescription=Cloudflare Tunnel2go\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nNoNewPrivileges=yes\nTimeoutStartSec=0\nExecStart=%s\nRestart=on-failure\nRestartSec=5\nStandardOutput=append:%s\nStandardError=append:%s\n\n[Install]\nWantedBy=multi-user.target\n' \
+        "$1" "${ARGO_LOG}" "${ARGO_LOG}"
 }
 
 _tpl_xray_openrc() {
@@ -1046,11 +1051,15 @@ apply_tunnel_service() {
 # §17 RUNTIME — Argo 隧道命令与配置文件
 # ==============================================================================
 _build_tunnel_cmd() {
+    # 与 Cloudflare Zero Trust 控制台给出的命令保持一致
+    # Token 模式：cloudflared tunnel --no-autoupdate run --token TOKEN
+    # 命名隧道：cloudflared tunnel --no-autoupdate run --config /path/yml
+    # 均不指定 --protocol（默认 auto，优先 QUIC，不通则回退 HTTP/2）
     if [ -f "${WORK_DIR}/tunnel.yml" ]; then
-        printf '%s tunnel --edge-ip-version auto --config %s run' \
+        printf '%s tunnel --no-autoupdate run --config %s' \
             "${ARGO_BIN}" "${WORK_DIR}/tunnel.yml"
     else
-        printf '%s tunnel --edge-ip-version auto --no-autoupdate --protocol quic run --token %s' \
+        printf '%s tunnel --no-autoupdate run --token %s' \
             "${ARGO_BIN}" "$(state_get '.argo.token')"
     fi
 }
@@ -1058,10 +1067,24 @@ _build_tunnel_cmd() {
 _gen_argo_config() {
     local _domain="$1" _tid="$2" _cred="$3"
     local _port; _port=$(state_get '.argo.port')
-    printf 'tunnel: %s\ncredentials-file: %s\nprotocol: quic\n\ningress:\n  - hostname: %s\n    service: http://localhost:%s\n    originRequest:\n      noTLSVerify: true\n  - service: http_status:404\n' \
-        "${_tid}" "${_cred}" "${_domain}" "${_port}" > "${WORK_DIR}/tunnel.yml" \
-        || { log_error "tunnel.yml 写入失败"; return 1; }
-    log_ok "tunnel.yml 已生成 (${_domain} → localhost:${_port}, protocol=quic)"
+    # Cloudflare 官方推荐的 tunnel.yml 格式：
+    #   - 不在 YAML 顶层写 protocol（由命令行 --no-autoupdate auto 协商）
+    #   - originRequest 仅设置必要项，connectTimeout 防止本地服务无响应时卡死
+    #   - noTLSVerify 仅在回源为 HTTP 时设置，避免证书误报
+    #   - 末尾 http_status:404 为 Cloudflare 要求的 catch-all 规则
+    {
+        printf 'tunnel: %s\n' "${_tid}"
+        printf 'credentials-file: %s\n' "${_cred}"
+        printf '\n'
+        printf 'ingress:\n'
+        printf '  - hostname: %s\n' "${_domain}"
+        printf '    service: http://localhost:%s\n' "${_port}"
+        printf '    originRequest:\n'
+        printf '      connectTimeout: 30s\n'
+        printf '      noTLSVerify: true\n'
+        printf '  - service: http_status:404\n'
+    } > "${WORK_DIR}/tunnel.yml" || { log_error "tunnel.yml 写入失败"; return 1; }
+    log_ok "tunnel.yml 已生成 (${_domain} → localhost:${_port})"
 }
 
 # ==============================================================================
@@ -1948,6 +1971,7 @@ _menu_render() {
     clear; echo ""
     printf "${C_BOLD}${C_PUR}  ╔══════════════════════════════════════════╗${C_RST}\n"
     printf "${C_BOLD}${C_PUR}  ║        Xray-2go  v8.0  隔离运行模型      ║${C_RST}\n"
+    printf "${C_BOLD}${C_PUR}  ║        工作目录: /etc/xray2go             ║${C_RST}\n"
     printf "${C_BOLD}${C_PUR}  ╠══════════════════════════════════════════╣${C_RST}\n"
     printf "${C_BOLD}${C_PUR}  ║${C_RST}  Xray     : ${_MENU_XC}%-29s${C_RST}${C_PUR} ${C_RST}\n"  "${_MENU_XS}"
     printf "${C_BOLD}${C_PUR}  ║${C_RST}  Argo     : %-29s${C_PUR} ${C_RST}\n"  "${_MENU_AD}"
