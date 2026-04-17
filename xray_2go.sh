@@ -1,24 +1,24 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# xray-2go v8.1  — 海外 VPS 纯入站代理
+# xray-2go v8.2  — 海外 VPS 纯入站代理极致性能版
 # 协议支持：Argo 固定隧道(WS/XHTTP) · FreeFlow(WS/HTTPUpgrade/XHTTP)
 #           Reality(TCP/XHTTP) · VLESS-TCP 明文落地
 # 平台支持：Debian/Ubuntu (systemd) · Alpine (OpenRC)
 # 架构分层：core → state → protocol → config → runtime → cli
 #
-# v8.1 变更（相对 v8.0）：性能重构
-#   [性能] config_synthesize: 日志全关(loglevel=none/access=none/error=none)
-#   [性能] config_synthesize: 使用系统DNS（无dns块，Go默认/etc/resolv.conf）
-#   [性能] config_synthesize: freedom outbound domainStrategy=AsIs（无额外解析）
-#   [性能] config_synthesize: 添加 policy 连接超时精简配置降低内存占用
-#   [性能] systemd service:   StandardOutput/Error=null，OOMScoreAdjust=-500
-#   [性能] systemd service:   LimitNPROC=infinity，TasksMax=infinity
-#   [性能] OpenRC service:    output/error_log=/dev/null
-#   [性能] tunnel service:    输出重定向 /dev/null，不写磁盘
-#   [新增] _check_memory:     检测 RAM+SWAP，总和 < 2G 时提示并引导扩展
-#   [新增] _setup_swap:       fallocate/dd 创建 swapfile，自动写 /etc/fstab
-#   [新增] _tune_network:     sysctl 套接字缓冲/TCP BBR/队列/端口范围一键调优
-#   [新增] /etc/security/limits.d/xray2go.conf：全局 nofile=1048576
+# v8.2 变更（相对 v8.1）：VLTCP 端口防护 + 移除 BBR
+#   [新增] §5f _vltcp_ensure_iptables: 自动安装 iptables/iptables-persistent
+#   [新增] §5f _vltcp_write_protect_script: 生成可独立运行的防护恢复脚本
+#   [新增] §5f _vltcp_apply_protect: 创建专属 iptables chain，外部直连→tcp-reset
+#   [新增] §5f _vltcp_flush_chains: 幂等清空 chain（内部调用）
+#   [新增] §5f _vltcp_cleanup_protect: 完整清理 chain + 文件
+#   [机制] mangle PREROUTING 对外部 TCP(非lo)打 mark 233
+#   [机制] INPUT chain 对 mark 233 执行 REJECT --reject-with tcp-reset
+#   [机制] loopback 豁免：Argo/Reality 等隧道落地流量不受影响
+#   [持久] ExecStartPost(systemd) / start_post(OpenRC) 开机自动恢复规则
+#   [联动] manage_vltcp: 启用/禁用/换端口/卸载均自动同步防护规则
+#   [联动] exec_install_core: 安装时若 vltcp 启用则自动配置防护
+#   [删除] check_bbr 及相关调用（BBR 由专用脚本负责）
 # ==============================================================================
 set -uo pipefail
 
@@ -43,6 +43,10 @@ readonly _SVC_TUNNEL="tunnel2go"
 # 系统调优配置文件路径
 readonly _SYSCTL_CONF="/etc/sysctl.d/88-xray2go-net.conf"
 readonly _LIMITS_CONF="/etc/security/limits.d/xray2go.conf"
+# VLTCP iptables 端口防护
+readonly _VLTCP_MARK=233                                        # 专属 packet mark，避免与系统其他规则冲突
+readonly _VLTCP_PROTECT_PORT_FILE="${WORK_DIR}/.vltcp_protect_port"   # 记录当前受保护端口
+readonly _VLTCP_PROTECT_SCRIPT="${WORK_DIR}/vltcp_protect.sh"         # 开机恢复脚本（ExecStartPost 调用）
 
 readonly _XRAY_MIRRORS=(
     "https://github.com/XTLS/Xray-core/releases/download"
@@ -664,29 +668,124 @@ LIMITS_EOF
 }
 
 # ==============================================================================
-# §6  CORE — 环境自愈
+# §5f CORE — VLTCP iptables 端口防护  【v8.2 新增】
+#
+# 防护原理：
+#   外部 TCP → mangle PREROUTING(! -i lo) → MARK 233
+#           → INPUT XRAY2GO_VLTCP_INPUT → REJECT --reject-with tcp-reset
+#
+# 豁免逻辑（loopback 不打 mark）：
+#   Argo cloudflared   → 127.0.0.1:port → lo 接口 → 无 mark → 正常进 xray
+#   Reality 直连       → 独立端口，本函数不涉及
+#   FreeFlow           → 端口 8080，本函数不涉及
+#
+# 持久化机制：
+#   vltcp_protect.sh 写入 WORK_DIR，由 systemd ExecStartPost / OpenRC start_post
+#   在每次服务启动时自动重新应用规则，无需 iptables-persistent。
 # ==============================================================================
-check_bbr() {
-    local _a; _a=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || printf 'unknown')
-    [ "${_a}" = "bbr" ] && { log_ok "TCP BBR 已启用"; return 0; }
-    log_warn "当前拥塞控制: ${_a}（推荐 BBR）"
-    _kernel_ge 4 9 || { log_warn "内核 < 4.9，不支持 BBR"; return 0; }
-    is_systemd || return 0
-    local _ans; prompt "是否启用 BBR？(y/N): " _ans
-    case "${_ans:-n}" in y|Y)
-        modprobe tcp_bbr 2>/dev/null || true
-        mkdir -p /etc/modules-load.d /etc/sysctl.d
-        printf 'tcp_bbr\n' > /etc/modules-load.d/xray2go-bbr.conf
-        # BBR+fq 写入独立文件，与性能调优文件分离，避免冲突
-        printf 'net.core.default_qdisc = fq\nnet.ipv4.tcp_congestion_control = bbr\n' \
-            > /etc/sysctl.d/89-xray2go-bbr.conf
-        sysctl -p /etc/sysctl.d/89-xray2go-bbr.conf >/dev/null 2>&1
-        log_ok "BBR 已启用"
-    ;; esac
+
+# 确保 iptables 可用，必要时自动安装
+_vltcp_ensure_iptables() {
+    command -v iptables >/dev/null 2>&1 && return 0
+    log_step "安装 iptables..."
+    if command -v apt-get >/dev/null 2>&1; then
+        # 预设 iptables-persistent 静默安装，避免交互提示
+        printf 'iptables-persistent iptables-persistent/autosave_v4 boolean true\n' \
+            | debconf-set-selections 2>/dev/null || true
+        printf 'iptables-persistent iptables-persistent/autosave_v6 boolean true\n' \
+            | debconf-set-selections 2>/dev/null || true
+        DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            iptables iptables-persistent >/dev/null 2>&1 || true
+    elif command -v dnf >/dev/null 2>&1; then
+        dnf install -y iptables iptables-services >/dev/null 2>&1 || true
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -y iptables iptables-services >/dev/null 2>&1 || true
+    elif command -v apk >/dev/null 2>&1; then
+        apk add iptables ip6tables >/dev/null 2>&1 || true
+    fi
+    command -v iptables >/dev/null 2>&1 || { log_error "iptables 安装失败"; return 1; }
+    log_ok "iptables 已就绪"
 }
 
+# 生成开机恢复脚本（ExecStartPost / start_post 调用）
+# 使用专属 chain 确保幂等：先 flush chain 再填充规则
+_vltcp_write_protect_script() {
+    mkdir -p "${WORK_DIR}"
+    # 注意：heredoc 中 \$ 在脚本内保持为 $（运行时求值），${VAR} 在写入时展开
+    cat > "${_VLTCP_PROTECT_SCRIPT}" << PROTECT_EOF
+#!/bin/sh
+# xray2go VLTCP 端口防护恢复脚本 — 由 xray2go 自动管理，请勿手动修改
+# 防护逻辑：外部 TCP 直连 → mark ${_VLTCP_MARK} → REJECT tcp-reset；loopback 豁免
+_PORT=\$(cat ${_VLTCP_PROTECT_PORT_FILE} 2>/dev/null)
+[ -z "\$_PORT" ] && exit 0
+_MARK=${_VLTCP_MARK}
+for _ipt in iptables ip6tables; do
+    command -v "\$_ipt" >/dev/null 2>&1 || continue
+    # ── mangle chain：对非 loopback 外部 TCP 打 mark ──────────────────────
+    \$_ipt -t mangle -N XRAY2GO_VLTCP 2>/dev/null || \
+        \$_ipt -t mangle -F XRAY2GO_VLTCP 2>/dev/null || true
+    \$_ipt -t mangle -C PREROUTING -j XRAY2GO_VLTCP 2>/dev/null || \
+        \$_ipt -t mangle -A PREROUTING -j XRAY2GO_VLTCP 2>/dev/null || true
+    \$_ipt -t mangle -A XRAY2GO_VLTCP \
+        -p tcp --dport "\$_PORT" ! -i lo -j MARK --set-mark "\$_MARK" 2>/dev/null || true
+    # ── input chain：有 mark 的包立即 tcp-reset ────────────────────────────
+    \$_ipt -N XRAY2GO_VLTCP_INPUT 2>/dev/null || \
+        \$_ipt -F XRAY2GO_VLTCP_INPUT 2>/dev/null || true
+    \$_ipt -C INPUT -j XRAY2GO_VLTCP_INPUT 2>/dev/null || \
+        \$_ipt -A INPUT -j XRAY2GO_VLTCP_INPUT 2>/dev/null || true
+    \$_ipt -A XRAY2GO_VLTCP_INPUT \
+        -m mark --mark "\$_MARK" -j REJECT --reject-with tcp-reset 2>/dev/null || true
+done
+PROTECT_EOF
+    chmod +x "${_VLTCP_PROTECT_SCRIPT}"
+}
+
+# 幂等清空专属 chain（不打日志，供内部调用）
+_vltcp_flush_chains() {
+    local _ipt
+    for _ipt in iptables ip6tables; do
+        command -v "${_ipt}" >/dev/null 2>&1 || continue
+        ${_ipt} -t mangle -D PREROUTING -j XRAY2GO_VLTCP 2>/dev/null || true
+        ${_ipt} -t mangle -F XRAY2GO_VLTCP 2>/dev/null || true
+        ${_ipt} -t mangle -X XRAY2GO_VLTCP 2>/dev/null || true
+        ${_ipt} -D INPUT -j XRAY2GO_VLTCP_INPUT 2>/dev/null || true
+        ${_ipt} -F XRAY2GO_VLTCP_INPUT 2>/dev/null || true
+        ${_ipt} -X XRAY2GO_VLTCP_INPUT 2>/dev/null || true
+    done
+}
+
+# 应用防护规则：安装 iptables → 刷旧规则 → 写恢复脚本 → 即时生效
+_vltcp_apply_protect() {
+    local _port="$1"
+    log_step "配置 VLTCP 端口防护 (端口: ${_port})..."
+    _vltcp_ensure_iptables || { log_warn "iptables 不可用，跳过端口防护"; return 1; }
+    _vltcp_flush_chains
+    _vltcp_write_protect_script || { log_error "防护脚本写入失败"; return 1; }
+    printf '%s\n' "${_port}" > "${_VLTCP_PROTECT_PORT_FILE}" \
+        || { log_error "端口记录写入失败"; return 1; }
+    sh "${_VLTCP_PROTECT_SCRIPT}" \
+        || { log_warn "iptables 规则即时生效失败（重启服务后由 ExecStartPost 恢复）"; }
+    # 更新 service 使 ExecStartPost 指向最新脚本
+    apply_xray_service
+    exec_svc_reload
+    log_ok "VLTCP 端口防护已启用 — 外部直连 → tcp-reset，隧道流量 → 正常转发"
+}
+
+# 完整清理：移除 chain + 删除文件 + 更新 service
+_vltcp_cleanup_protect() {
+    log_step "清理 VLTCP iptables 防护规则..."
+    _vltcp_flush_chains
+    rm -f "${_VLTCP_PROTECT_PORT_FILE}" "${_VLTCP_PROTECT_SCRIPT}" 2>/dev/null || true
+    # 刷新 service（ExecStartPost 指向已不存在的脚本也无影响，但清理更干净）
+    apply_xray_service 2>/dev/null || true
+    exec_svc_reload 2>/dev/null || true
+    log_ok "VLTCP 防护规则已清除"
+}
+
+# ==============================================================================
+# §6  CORE — 环境自愈
+# ==============================================================================
 fix_time_sync() {
-    [ -f /etc/redhat-release ] || [ -f /etc/centos-release ] || return 0
     local _pm; command -v dnf >/dev/null 2>&1 && _pm="dnf" || _pm="yum"
     log_step "RHEL 系：修正时间同步..."
     ${_pm} install -y chrony >/dev/null 2>&1 || true
@@ -1198,9 +1297,10 @@ _svc_write() {
 # OOMScoreAdjust=-500：降低被 OOM Killer 选中的概率
 # LimitNPROC=infinity / TasksMax=infinity：不限制线程数
 # LimitNOFILE=1048576：支持百万级并发连接
+# ExecStartPost：服务启动后自动恢复 VLTCP iptables 防护规则（若存在）
 _tpl_xray_systemd() {
-    printf '[Unit]\nDescription=Xray2go Service\nDocumentation=https://github.com/XTLS/Xray-core\nAfter=network.target nss-lookup.target\nWants=network-online.target\n\n[Service]\nType=simple\nNoNewPrivileges=yes\nExecStart=%s run -c %s\nRestart=always\nRestartSec=3\nRestartPreventExitStatus=23\nLimitNOFILE=1048576\nLimitNPROC=infinity\nTasksMax=infinity\nOOMScoreAdjust=-500\nStandardOutput=null\nStandardError=null\n\n[Install]\nWantedBy=multi-user.target\n' \
-        "${XRAY_BIN}" "${CONFIG_FILE}"
+    printf '[Unit]\nDescription=Xray2go Service\nDocumentation=https://github.com/XTLS/Xray-core\nAfter=network.target nss-lookup.target\nWants=network-online.target\n\n[Service]\nType=simple\nNoNewPrivileges=yes\nExecStart=%s run -c %s\nExecStartPost=-%s\nRestart=always\nRestartSec=3\nRestartPreventExitStatus=23\nLimitNOFILE=1048576\nLimitNPROC=infinity\nTasksMax=infinity\nOOMScoreAdjust=-500\nStandardOutput=null\nStandardError=null\n\n[Install]\nWantedBy=multi-user.target\n' \
+        "${XRAY_BIN}" "${CONFIG_FILE}" "${_VLTCP_PROTECT_SCRIPT}"
 }
 
 # ── Cloudflare tunnel2go systemd service  ────────────────────────────────────
@@ -1212,9 +1312,10 @@ _tpl_tunnel_systemd() {
 
 # ── Xray2go OpenRC service  ──────────────────────────────────────────────────
 # output_log/error_log=/dev/null：OpenRC 模式同样禁止落盘
+# start_post：服务启动后自动恢复 VLTCP iptables 防护规则（若存在）
 _tpl_xray_openrc() {
-    printf '#!/sbin/openrc-run\ndescription="Xray2go service"\ncommand="%s"\ncommand_args="run -c %s"\ncommand_background=true\noutput_log="/dev/null"\nerror_log="/dev/null"\npidfile="/var/run/xray2go.pid"\n' \
-        "${XRAY_BIN}" "${CONFIG_FILE}"
+    printf '#!/sbin/openrc-run\ndescription="Xray2go service"\ncommand="%s"\ncommand_args="run -c %s"\ncommand_background=true\noutput_log="/dev/null"\nerror_log="/dev/null"\npidfile="/var/run/xray2go.pid"\n\nstart_post() {\n    [ -x "%s" ] && "%s" >/dev/null 2>&1 || return 0\n}\n' \
+        "${XRAY_BIN}" "${CONFIG_FILE}" "${_VLTCP_PROTECT_SCRIPT}" "${_VLTCP_PROTECT_SCRIPT}"
 }
 
 # ── Cloudflare tunnel2go OpenRC service  ─────────────────────────────────────
@@ -1430,7 +1531,7 @@ _exec_install_cleanup() {
 }
 
 exec_install_core() {
-    clear; log_title "══════════ 安装 Xray-2go v8.1 ══════════"
+    clear; log_title "══════════ 安装 Xray-2go v8.2 ══════════"
     preflight_check
     mkdir -p "${WORK_DIR}" && chmod 750 "${WORK_DIR}"
 
@@ -2341,7 +2442,7 @@ _menu_collect_status() {
 _menu_render() {
     clear; echo ""
     printf "${C_BOLD}${C_PUR}  ╔══════════════════════════════════════════╗${C_RST}\n"
-    printf "${C_BOLD}${C_PUR}  ║                Xray-2go  v8.1            ║${C_RST}\n"
+    printf "${C_BOLD}${C_PUR}  ║           Xray-2go  v8.1  极致性能版     ║${C_RST}\n"
     printf "${C_BOLD}${C_PUR}  ╠══════════════════════════════════════════╣${C_RST}\n"
     printf "${C_BOLD}${C_PUR}  ║${C_RST}  Xray     : ${_MENU_XC}%-29s${C_RST}${C_PUR} ${C_RST}\n"  "${_MENU_XS}"
     printf "${C_BOLD}${C_PUR}  ║${C_RST}  Argo     : %-29s${C_PUR} ${C_RST}\n"  "${_MENU_AD}"
