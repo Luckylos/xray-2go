@@ -1,23 +1,24 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# xray-2go v8.0
+# xray-2go v8.1  — 海外 VPS 纯入站代理
 # 协议支持：Argo 固定隧道(WS/XHTTP) · FreeFlow(WS/HTTPUpgrade/XHTTP)
 #           Reality(TCP/XHTTP) · VLESS-TCP 明文落地
 # 平台支持：Debian/Ubuntu (systemd) · Alpine (OpenRC)
 # 架构分层：core → state → protocol → config → runtime → cli
 #
-# v8.0 变更（相对 v7.2）：隔离运行模型重构
-#   [架构] 所有资源重命名至 xray2go 命名空间，与系统 xray 完全隔离
-#   [架构] 删除接管逻辑、遗留清理逻辑、state 事务快照
-#   [新增] _xray_health_check: 三重验证（存在+可执行+version+-test）
-#   [新增] _detect_existing_xray: 仅提示，不干预
-#   [新增] _check_port_conflicts: 冲突时自动随机分配新端口
-#   [新增] _verify_service_health: 启动后轮询验证+自动打印失败日志
-#   [新增] _force_cleanup_firewall: 仅清理本脚本托管端口
-#   [新增] _cleanup_processes: 仅清理本脚本 pid 文件
-#   [修改] exec_uninstall: 只删除本脚本资源，不触碰系统 xray
-#   [修改] download_xray: 使用 _xray_health_check 替代简单 version 判断
-#   [修改] exec_install_core: 移除接管逻辑，冲突仅提示后隔离启动
+# v8.1 变更（相对 v8.0）：性能重构
+#   [性能] config_synthesize: 日志全关(loglevel=none/access=none/error=none)
+#   [性能] config_synthesize: 使用系统DNS（无dns块，Go默认/etc/resolv.conf）
+#   [性能] config_synthesize: freedom outbound domainStrategy=AsIs（无额外解析）
+#   [性能] config_synthesize: 添加 policy 连接超时精简配置降低内存占用
+#   [性能] systemd service:   StandardOutput/Error=null，OOMScoreAdjust=-500
+#   [性能] systemd service:   LimitNPROC=infinity，TasksMax=infinity
+#   [性能] OpenRC service:    output/error_log=/dev/null
+#   [性能] tunnel service:    输出重定向 /dev/null，不写磁盘
+#   [新增] _check_memory:     检测 RAM+SWAP，总和 < 2G 时提示并引导扩展
+#   [新增] _setup_swap:       fallocate/dd 创建 swapfile，自动写 /etc/fstab
+#   [新增] _tune_network:     sysctl 套接字缓冲/TCP BBR/队列/端口范围一键调优
+#   [新增] /etc/security/limits.d/xray2go.conf：全局 nofile=1048576
 # ==============================================================================
 set -uo pipefail
 
@@ -32,7 +33,6 @@ readonly XRAY_BIN="${WORK_DIR}/xray"
 readonly ARGO_BIN="${WORK_DIR}/argo"
 readonly CONFIG_FILE="${WORK_DIR}/config.json"
 readonly STATE_FILE="${WORK_DIR}/state.json"
-readonly ARGO_LOG="${WORK_DIR}/argo.log"
 readonly SHORTCUT="/usr/local/bin/s"
 readonly SELF_DEST="/usr/local/bin/xray2go"
 readonly UPSTREAM_URL="https://raw.githubusercontent.com/Luckylos/xray-2go/refs/heads/main/xray_2go.sh"
@@ -40,8 +40,10 @@ readonly _STATE_SCHEMA_VERSION=2
 readonly _FW_PORTS_FILE="${WORK_DIR}/.fw_ports"
 readonly _SVC_XRAY="xray2go"
 readonly _SVC_TUNNEL="tunnel2go"
+# 系统调优配置文件路径
+readonly _SYSCTL_CONF="/etc/sysctl.d/88-xray2go-net.conf"
+readonly _LIMITS_CONF="/etc/security/limits.d/xray2go.conf"
 
-# 可按需增减镜像（顺序即优先级）
 readonly _XRAY_MIRRORS=(
     "https://github.com/XTLS/Xray-core/releases/download"
     "https://ghfast.top/https://github.com/XTLS/Xray-core/releases/download"
@@ -254,7 +256,6 @@ _kernel_ge() {
 
 # ==============================================================================
 # §5a CORE — 防火墙模块
-# 仅管理本脚本托管的端口，记录于 ${_FW_PORTS_FILE}
 # ==============================================================================
 _fw_read_managed() {
     grep -E '^[0-9]+$' "${_FW_PORTS_FILE}" 2>/dev/null | sort -un || true
@@ -351,27 +352,18 @@ firewall_sync() {
 # ==============================================================================
 # §5b CORE — 隔离运行辅助函数
 # ==============================================================================
-
-# 仅检测系统是否存在 xray（非本脚本），不做任何修改，仅供提示使用
-# 返回 0（真）= 检测到已有 xray；返回 1（假）= 系统干净
-# 原 bug：_found=0 时 return 0 → bash if 判定为真 → 永远触发警告
 _detect_existing_xray() {
-    # systemd 服务（排除本脚本的 xray2go）
     if command -v systemctl >/dev/null 2>&1; then
         systemctl list-unit-files 2>/dev/null \
             | grep -qiE '^xray[^2]' && return 0
     fi
-    # OpenRC 服务
     [ -f /etc/init.d/xray ] && return 0
-    # PATH 中存在 xray 可执行文件（排除本脚本路径）
     local _wx; _wx=$(command -v xray 2>/dev/null || true)
     [ -n "${_wx:-}" ] && [ "${_wx}" != "${XRAY_BIN}" ] && return 0
-    # 正在运行的 xray 进程
     pgrep -x xray >/dev/null 2>&1 && return 0
     return 1
 }
 
-# 三重验证：文件存在 + 可执行 + version 通过 + -test 最小配置通过
 _xray_health_check() {
     local _bin="${1:-${XRAY_BIN}}"
     [ -f "${_bin}" ]  || { log_warn "xray 文件不存在: ${_bin}";          return 1; }
@@ -388,7 +380,6 @@ _xray_health_check() {
     return 0
 }
 
-# 安装前端口冲突检测，冲突时自动随机分配（幂等）
 _check_port_conflicts() {
     log_step "检测端口冲突..."
 
@@ -426,14 +417,12 @@ _check_port_conflicts() {
     return 0
 }
 
-# 仅清理本脚本生成的 pid 文件，不杀任何进程
 _cleanup_processes() {
     rm -f "${WORK_DIR}/xray.pid" \
           /var/run/xray2go.pid   \
           /var/run/tunnel2go.pid 2>/dev/null || true
 }
 
-# 仅清理本脚本托管的防火墙端口，来源：.fw_ports + state.json
 _force_cleanup_firewall() {
     log_step "清理 xray2go 托管防火墙规则..."
     local _ports="" _p
@@ -458,7 +447,6 @@ _force_cleanup_firewall() {
     log_ok "防火墙规则清理完成"
 }
 
-# 启动后轮询验证服务真实就绪，失败时自动输出日志
 _verify_service_health() {
     local _svc="${1:-${_SVC_XRAY}}" _max="${2:-8}"
     log_step "验证服务 ${_svc} 就绪（最长 ${_max}s）..."
@@ -476,11 +464,7 @@ _verify_service_health() {
         log_error "── systemctl status ──"
         systemctl status "${_svc}" --no-pager -l 2>/dev/null >&2 || true
     else
-        local _errlog="${WORK_DIR}/log/error.log"
-        [ -f "${_errlog}" ] && {
-            log_error "── ${_errlog} 最近 20 行 ──"
-            tail -n 20 "${_errlog}" >&2
-        }
+        log_error "OpenRC 模式下请手动执行: rc-service ${_svc} status"
     fi
     return 1
 }
@@ -510,6 +494,176 @@ check_argo_health() {
 }
 
 # ==============================================================================
+# §5d CORE — 内存检测与 SWAP 管理  【v8.1 新增】
+# ==============================================================================
+
+# 检测 RAM+SWAP 总量，< 2G 时提示并引导扩展
+# 返回 0 = 内存充足（或用户确认跳过）
+_check_memory() {
+    local _mem_total _swap_total _total_kb _total_mb
+    _mem_total=$(awk '/^MemTotal:/{print $2}' /proc/meminfo 2>/dev/null || printf '0')
+    _swap_total=$(awk '/^SwapTotal:/{print $2}' /proc/meminfo 2>/dev/null || printf '0')
+    _total_kb=$(( _mem_total + _swap_total ))
+    _total_mb=$(( _total_kb / 1024 ))
+
+    log_info "内存状态: RAM=$(( _mem_total / 1024 ))MB  SWAP=$(( _swap_total / 1024 ))MB  合计=${_total_mb}MB"
+
+    if [ "${_total_mb}" -lt 2048 ]; then
+        echo ""
+        log_warn "RAM+SWAP 合计 ${_total_mb}MB，低于建议最低值 2048MB"
+        log_warn "内存不足可能导致 xray 在高并发时被 OOM Killer 终止"
+        echo ""
+        local _a
+        prompt "是否立即扩展 SWAP？(Y/n): " _a
+        case "${_a:-y}" in
+            n|N)
+                log_warn "已跳过 SWAP 扩展，继续安装（高负载时存在 OOM 风险）"
+                return 0
+                ;;
+        esac
+        _setup_swap || log_warn "SWAP 扩展失败，继续安装"
+    else
+        log_ok "内存充足（RAM+SWAP = ${_total_mb}MB ≥ 2048MB）"
+    fi
+    return 0
+}
+
+# 创建并激活 swapfile，写入 /etc/fstab 实现持久化
+_setup_swap() {
+    local _swap_gb _swap_file="/swapfile"
+
+    # 已有同路径 swap 则跳过
+    if swapon --show 2>/dev/null | grep -qF "${_swap_file}"; then
+        log_info "swap 文件 ${_swap_file} 已激活，跳过创建"
+        return 0
+    fi
+
+    echo ""
+    log_info "当前可选 SWAP 大小建议：低负载 1G / 中负载 2G / 高并发 4G"
+    prompt "请输入 SWAP 容量（单位 G，整数，1-32）: " _swap_gb
+
+    # 输入验证
+    case "${_swap_gb:-}" in
+        ''|*[!0-9]*) log_error "输入无效，须为正整数"; return 1 ;;
+    esac
+    if [ "${_swap_gb}" -lt 1 ] || [ "${_swap_gb}" -gt 32 ]; then
+        log_error "SWAP 大小须在 1-32G 之间"; return 1
+    fi
+
+    # 磁盘空间检查（保留 512MB 余量）
+    local _need_kb _avail_kb
+    _need_kb=$(( _swap_gb * 1024 * 1024 ))
+    _avail_kb=$(df / --output=avail 2>/dev/null | tail -1 | tr -d ' ') || _avail_kb=0
+    if [ "$(( _avail_kb - _need_kb ))" -lt 524288 ]; then
+        log_error "磁盘空间不足：需要 ${_swap_gb}G + 512MB 余量，" \
+                  "当前 / 可用 $(( _avail_kb / 1024 ))MB"
+        return 1
+    fi
+
+    log_step "创建 ${_swap_gb}G swap 文件 → ${_swap_file} ..."
+    rm -f "${_swap_file}" 2>/dev/null || true
+
+    # 优先 fallocate（瞬间完成），fallback dd（兼容不支持预分配的文件系统）
+    if command -v fallocate >/dev/null 2>&1; then
+        fallocate -l "${_swap_gb}G" "${_swap_file}" 2>/dev/null \
+            || dd if=/dev/zero of="${_swap_file}" bs=1M \
+                   count=$(( _swap_gb * 1024 )) status=progress 2>/dev/null
+    else
+        dd if=/dev/zero of="${_swap_file}" bs=1M \
+           count=$(( _swap_gb * 1024 )) status=progress 2>/dev/null
+    fi
+
+    # 安全权限（防止普通用户读取 swap 数据）
+    chmod 600 "${_swap_file}" || { log_error "chmod 600 失败"; rm -f "${_swap_file}"; return 1; }
+
+    mkswap "${_swap_file}" >/dev/null 2>&1 \
+        || { log_error "mkswap 失败"; rm -f "${_swap_file}"; return 1; }
+    swapon  "${_swap_file}" \
+        || { log_error "swapon 失败"; rm -f "${_swap_file}"; return 1; }
+
+    # 持久化到 fstab
+    grep -qF "${_swap_file}" /etc/fstab 2>/dev/null \
+        || printf '%s none swap sw 0 0\n' "${_swap_file}" >> /etc/fstab
+
+    # 代理场景：降低 swappiness，尽量保留内存给连接缓冲
+    sysctl -w vm.swappiness=10 >/dev/null 2>&1 || true
+
+    log_ok "SWAP ${_swap_gb}G 已创建并激活（${_swap_file}，已写入 /etc/fstab）"
+
+    # 汇报新的内存总量
+    local _new_swap _new_total
+    _new_swap=$(awk '/^SwapTotal:/{print $2}' /proc/meminfo 2>/dev/null || printf '0')
+    _mem_total=$(awk '/^MemTotal:/{print $2}' /proc/meminfo 2>/dev/null || printf '0')
+    _new_total=$(( ( _mem_total + _new_swap ) / 1024 ))
+    log_info "当前 RAM+SWAP 合计: ${_new_total}MB"
+}
+
+# ==============================================================================
+# §5e CORE — 网络性能调优  【v8.1 新增】
+# 目标：最大化 TCP 吞吐、降低延迟、减少连接建立开销
+# 仅写入 xray2go 专属 sysctl 文件，不修改系统其他配置
+# ==============================================================================
+_tune_network() {
+    log_step "应用网络性能调优参数..."
+
+    # sysctl — 套接字缓冲 / TCP 队列 / 快速打开 / 连接复用
+    cat > "${_SYSCTL_CONF}" << 'SYSCTL_EOF'
+# ── xray2go 网络性能调优（v8.1）──────────────────────────────────────────────
+# 套接字接收/发送缓冲上限（64MB），适配高带宽长延迟线路（BDP 优化）
+net.core.rmem_max          = 67108864
+net.core.wmem_max          = 67108864
+net.core.rmem_default      = 1048576
+net.core.wmem_default      = 1048576
+# TCP 自动调节缓冲范围：最小 4KB / 初始 1MB / 最大 64MB
+net.ipv4.tcp_rmem          = 4096 1048576 67108864
+net.ipv4.tcp_wmem          = 4096 1048576 67108864
+# 每 CPU 接收队列深度
+net.core.netdev_max_backlog = 250000
+# TCP SYN 半连接队列 + accept 全连接队列
+net.ipv4.tcp_max_syn_backlog = 16384
+net.core.somaxconn           = 32768
+# TCP Fast Open：客户端+服务端同时开启（减少 1 RTT 握手）
+net.ipv4.tcp_fastopen      = 3
+# MTU 探测：在发生黑洞时自动调整 MSS
+net.ipv4.tcp_mtu_probing   = 1
+# 禁止空闲后重置慢启动（保持已探测带宽）
+net.ipv4.tcp_slow_start_after_idle = 0
+# TIME_WAIT 端口复用（四元组不冲突时快速复用）
+net.ipv4.tcp_tw_reuse      = 1
+# 加速 FIN_WAIT2 回收（代理短连接较多）
+net.ipv4.tcp_fin_timeout   = 15
+# Keepalive：300s 开始探测，间隔 30s，3 次无响应断开
+net.ipv4.tcp_keepalive_time   = 300
+net.ipv4.tcp_keepalive_intvl  = 30
+net.ipv4.tcp_keepalive_probes = 3
+# 发送缓冲未发送阈值（降低小包延迟）
+net.ipv4.tcp_notsent_lowat = 131072
+# 本地端口范围（为高并发代理提供充足临时端口）
+net.ipv4.ip_local_port_range = 1024 65535
+# swappiness：代理场景优先使用内存而非 swap
+vm.swappiness              = 10
+SYSCTL_EOF
+
+    sysctl -p "${_SYSCTL_CONF}" >/dev/null 2>&1 \
+        || log_warn "部分 sysctl 参数应用失败（内核版本可能不支持），不影响运行"
+
+    # 文件描述符限制（代理高并发每连接占用 2 个 fd）
+    mkdir -p /etc/security/limits.d
+    cat > "${_LIMITS_CONF}" << 'LIMITS_EOF'
+# xray2go 文件描述符限制
+*    soft nofile 1048576
+*    hard nofile 1048576
+root soft nofile 1048576
+root hard nofile 1048576
+LIMITS_EOF
+
+    # 当前会话立即生效
+    ulimit -n 1048576 2>/dev/null || true
+
+    log_ok "网络调优已应用（${_SYSCTL_CONF}）"
+}
+
+# ==============================================================================
 # §6  CORE — 环境自愈
 # ==============================================================================
 check_bbr() {
@@ -523,9 +677,10 @@ check_bbr() {
         modprobe tcp_bbr 2>/dev/null || true
         mkdir -p /etc/modules-load.d /etc/sysctl.d
         printf 'tcp_bbr\n' > /etc/modules-load.d/xray2go-bbr.conf
+        # BBR+fq 写入独立文件，与性能调优文件分离，避免冲突
         printf 'net.core.default_qdisc = fq\nnet.ipv4.tcp_congestion_control = bbr\n' \
-            > /etc/sysctl.d/88-xray2go-bbr.conf
-        sysctl -p /etc/sysctl.d/88-xray2go-bbr.conf >/dev/null 2>&1
+            > /etc/sysctl.d/89-xray2go-bbr.conf
+        sysctl -p /etc/sysctl.d/89-xray2go-bbr.conf >/dev/null 2>&1
         log_ok "BBR 已启用"
     ;; esac
 }
@@ -542,7 +697,7 @@ fix_time_sync() {
 }
 
 # ==============================================================================
-# §7  STATE — 核心操作（无事务快照）
+# §7  STATE — 核心操作
 # ==============================================================================
 _STATE=""
 
@@ -614,7 +769,6 @@ state_version() {
 
 # ==============================================================================
 # §9  STATE — 初始化与遗留文件迁移
-# 迁移仅读取 WORK_DIR（/etc/xray2go）内的历史文件，不读取系统 /etc/xray
 # ==============================================================================
 _state_migrate_legacy() {
     local _r
@@ -905,7 +1059,13 @@ link_vltcp() {
 }
 
 # ==============================================================================
-# §14 CONFIG — 配置合成（端口+listen 冲突检测）
+# §14 CONFIG — 配置合成  【v8.1 重构】
+#
+# 性能优化点：
+#   1. log 全关（loglevel=none, access=none, error=none）— 消除磁盘 I/O
+#   2. 无 dns 块 — 使用系统 DNS（/etc/resolv.conf，Go 默认解析器）
+#   3. outbound freedom + domainStrategy=AsIs — 无额外 DNS 查询，最低延迟
+#   4. policy.levels[0] — 精简连接超时，加速资源回收降低内存占用
 # ==============================================================================
 config_synthesize() {
     local _ibs="[]" _ib _name _fn _used_keys=""
@@ -934,10 +1094,40 @@ config_synthesize() {
     [ "$(printf '%s' "${_ibs}" | jq 'length')" -eq 0 ] && \
         log_warn "所有入站均已禁用，xray 将以零入站模式运行"
 
+    # ── 极致性能配置 ────────────────────────────────────────────────────────
+    # log:     全关，消除文件 I/O 热路径
+    # dns:     不配置，使用系统 /etc/resolv.conf（Go net 默认行为）
+    # outbound freedom + domainStrategy AsIs：不触发 xray 内部 DNS，
+    #          domain 直接传给 OS 网络栈解析，RTT 最低
+    # policy:  connIdle=300s 空闲超时，uplinkOnly/downlinkOnly=1s 半关闭回收
+    #          statsUser* = false：关闭统计计数器，减少原子操作开销
+    # ────────────────────────────────────────────────────────────────────────
     jq -n --argjson inbounds "${_ibs}" '{
-        log:      {loglevel:"warning"},
+        log: {
+            loglevel: "none",
+            access:   "none",
+            error:    "none"
+        },
         inbounds: $inbounds,
-        outbounds:[{protocol:"freedom"}]
+        outbounds: [{
+            protocol: "freedom",
+            settings: { domainStrategy: "AsIs" }
+        }],
+        policy: {
+            levels: {
+                "0": {
+                    connIdle:          300,
+                    uplinkOnly:        1,
+                    downlinkOnly:      1,
+                    statsUserUplink:   false,
+                    statsUserDownlink: false
+                }
+            },
+            system: {
+                statsInboundUplink:   false,
+                statsInboundDownlink: false
+            }
+        }
     }' || { log_error "config JSON 合成失败"; return 1; }
 }
 
@@ -966,7 +1156,7 @@ print_nodes() {
 }
 
 # ==============================================================================
-# §16 RUNTIME — 服务管理（使用 _SVC_XRAY / _SVC_TUNNEL 命名空间）
+# §16 RUNTIME — 服务管理  【v8.1 重构：全面禁止日志输出】
 # ==============================================================================
 _SYSD_DIRTY=0
 
@@ -1003,27 +1193,34 @@ _svc_write() {
     printf '%s' "${_content}" > "${_dest}"; return 1
 }
 
-# Service 模板 — 均使用 xray2go 命名
+# ── Xray2go systemd service  ─────────────────────────────────────────────────
+# StandardOutput/Error=null：进程输出直接丢弃，无任何磁盘 I/O
+# OOMScoreAdjust=-500：降低被 OOM Killer 选中的概率
+# LimitNPROC=infinity / TasksMax=infinity：不限制线程数
+# LimitNOFILE=1048576：支持百万级并发连接
 _tpl_xray_systemd() {
-    printf '[Unit]\nDescription=Xray2go Service\nDocumentation=https://github.com/XTLS/Xray-core\nAfter=network.target nss-lookup.target\nWants=network-online.target\n\n[Service]\nType=simple\nNoNewPrivileges=yes\nExecStart=%s run -c %s\nRestart=always\nRestartSec=3\nRestartPreventExitStatus=23\nLimitNOFILE=1048576\n\n[Install]\nWantedBy=multi-user.target\n' \
+    printf '[Unit]\nDescription=Xray2go Service\nDocumentation=https://github.com/XTLS/Xray-core\nAfter=network.target nss-lookup.target\nWants=network-online.target\n\n[Service]\nType=simple\nNoNewPrivileges=yes\nExecStart=%s run -c %s\nRestart=always\nRestartSec=3\nRestartPreventExitStatus=23\nLimitNOFILE=1048576\nLimitNPROC=infinity\nTasksMax=infinity\nOOMScoreAdjust=-500\nStandardOutput=null\nStandardError=null\n\n[Install]\nWantedBy=multi-user.target\n' \
         "${XRAY_BIN}" "${CONFIG_FILE}"
 }
 
+# ── Cloudflare tunnel2go systemd service  ────────────────────────────────────
+# StandardOutput/Error=null：彻底禁止 cloudflared 日志落盘
 _tpl_tunnel_systemd() {
-    # Cloudflare 官方推荐：直接 ExecStart，用 systemd 原生 append 重定向替代 shell 包装
-    printf '[Unit]\nDescription=Cloudflare Tunnel2go\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nNoNewPrivileges=yes\nTimeoutStartSec=0\nExecStart=%s\nRestart=on-failure\nRestartSec=5\nStandardOutput=append:%s\nStandardError=append:%s\n\n[Install]\nWantedBy=multi-user.target\n' \
-        "$1" "${ARGO_LOG}" "${ARGO_LOG}"
+    printf '[Unit]\nDescription=Cloudflare Tunnel2go\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nNoNewPrivileges=yes\nTimeoutStartSec=0\nExecStart=%s\nRestart=on-failure\nRestartSec=5\nStandardOutput=null\nStandardError=null\n\n[Install]\nWantedBy=multi-user.target\n' \
+        "$1"
 }
 
+# ── Xray2go OpenRC service  ──────────────────────────────────────────────────
+# output_log/error_log=/dev/null：OpenRC 模式同样禁止落盘
 _tpl_xray_openrc() {
-    mkdir -p "${WORK_DIR}/log" 2>/dev/null || true
-    printf '#!/sbin/openrc-run\ndescription="Xray2go service"\ncommand="%s"\ncommand_args="run -c %s"\ncommand_background=true\noutput_log="%s/log/xray.log"\nerror_log="%s/log/error.log"\npidfile="/var/run/xray2go.pid"\n' \
-        "${XRAY_BIN}" "${CONFIG_FILE}" "${WORK_DIR}" "${WORK_DIR}"
+    printf '#!/sbin/openrc-run\ndescription="Xray2go service"\ncommand="%s"\ncommand_args="run -c %s"\ncommand_background=true\noutput_log="/dev/null"\nerror_log="/dev/null"\npidfile="/var/run/xray2go.pid"\n' \
+        "${XRAY_BIN}" "${CONFIG_FILE}"
 }
 
+# ── Cloudflare tunnel2go OpenRC service  ─────────────────────────────────────
 _tpl_tunnel_openrc() {
-    printf '#!/sbin/openrc-run\ndescription="Cloudflare Tunnel2go"\ncommand="/bin/sh"\ncommand_args="-c '"'"'%s >> %s 2>&1'"'"'"\ncommand_background=true\npidfile="/var/run/tunnel2go.pid"\n' \
-        "$1" "${ARGO_LOG}"
+    printf '#!/sbin/openrc-run\ndescription="Cloudflare Tunnel2go"\ncommand="/bin/sh"\ncommand_args="-c '"'"'%s >/dev/null 2>&1'"'"'"\ncommand_background=true\npidfile="/var/run/tunnel2go.pid"\n' \
+        "$1"
 }
 
 apply_xray_service() {
@@ -1051,10 +1248,6 @@ apply_tunnel_service() {
 # §17 RUNTIME — Argo 隧道命令与配置文件
 # ==============================================================================
 _build_tunnel_cmd() {
-    # 与 Cloudflare Zero Trust 控制台给出的命令保持一致
-    # Token 模式：cloudflared tunnel --no-autoupdate run --token TOKEN
-    # 命名隧道：cloudflared tunnel --no-autoupdate run --config /path/yml
-    # 均不指定 --protocol（默认 auto，优先 QUIC，不通则回退 HTTP/2）
     if [ -f "${WORK_DIR}/tunnel.yml" ]; then
         printf '%s tunnel --no-autoupdate run --config %s' \
             "${ARGO_BIN}" "${WORK_DIR}/tunnel.yml"
@@ -1067,11 +1260,6 @@ _build_tunnel_cmd() {
 _gen_argo_config() {
     local _domain="$1" _tid="$2" _cred="$3"
     local _port; _port=$(state_get '.argo.port')
-    # Cloudflare 官方推荐的 tunnel.yml 格式：
-    #   - 不在 YAML 顶层写 protocol（由命令行 --no-autoupdate auto 协商）
-    #   - originRequest 仅设置必要项，connectTimeout 防止本地服务无响应时卡死
-    #   - noTLSVerify 仅在回源为 HTTP 时设置，避免证书误报
-    #   - 末尾 http_status:404 为 Cloudflare 要求的 catch-all 规则
     {
         printf 'tunnel: %s\n' "${_tid}"
         printf 'credentials-file: %s\n' "${_cred}"
@@ -1118,7 +1306,6 @@ _download_with_fallback() {
 download_xray() {
     detect_arch
 
-    # 三重健康检查：通过则跳过下载
     if _xray_health_check "${XRAY_BIN}" 2>/dev/null; then
         local _cur
         _cur=$("${XRAY_BIN}" version 2>/dev/null | head -1 | \
@@ -1163,7 +1350,6 @@ download_xray() {
     [ -f "${XRAY_BIN}" ] || { log_error "解压后未找到 xray 二进制"; return 1; }
     chmod +x "${XRAY_BIN}"
 
-    # 安装后再次完整健康检查，拦截"假正常二进制"
     _xray_health_check "${XRAY_BIN}" \
         || { log_error "新下载的 xray 健康检查失败，已清除"; rm -f "${XRAY_BIN}"; return 1; }
 
@@ -1223,12 +1409,11 @@ apply_config() {
 }
 
 # ==============================================================================
-# §20 RUNTIME — 安装与卸载
+# §20 RUNTIME — 安装与卸载  【v8.1：新增内存检测 + 网络调优调用】
 # ==============================================================================
 _INSTALL_XRAY_WAS_PRESENT=0
 _INSTALL_ARGO_WAS_PRESENT=0
 
-# 安装失败时的文件级回滚（不干预系统 xray）
 _exec_install_cleanup() {
     log_warn "安装中断，回滚本次新建文件..."
     [ "${_INSTALL_XRAY_WAS_PRESENT}" -eq 0 ] && rm -f "${XRAY_BIN}"  2>/dev/null || true
@@ -1245,7 +1430,7 @@ _exec_install_cleanup() {
 }
 
 exec_install_core() {
-    clear; log_title "══════════ 安装 Xray-2go v8.0 ══════════"
+    clear; log_title "══════════ 安装 Xray-2go v8.1 ══════════"
     preflight_check
     mkdir -p "${WORK_DIR}" && chmod 750 "${WORK_DIR}"
 
@@ -1255,7 +1440,10 @@ exec_install_core() {
         log_warn "本脚本将以完全隔离模式运行（服务名: ${_SVC_XRAY}，目录: ${WORK_DIR}）"
     fi
 
-    # 端口冲突自动随机分配，不修改已有端口
+    # ── 内存检测（v8.1 新增）────────────────────────────────────────────────
+    _check_memory
+
+    # 端口冲突自动随机分配
     _check_port_conflicts || { log_error "端口冲突无法解决，安装中止"; return 1; }
 
     [ -f "${XRAY_BIN}" ] && [ -x "${XRAY_BIN}" ] && \
@@ -1286,6 +1474,10 @@ exec_install_core() {
     }
 
     fix_time_sync
+
+    # ── 网络性能调优（v8.1 新增）───────────────────────────────────────────
+    _tune_network
+
     firewall_sync
 
     log_step "启动服务..."
@@ -1293,7 +1485,6 @@ exec_install_core() {
     exec_svc start  "${_SVC_XRAY}" \
         || { log_error "启动命令失败"; _exec_install_cleanup; return 1; }
 
-    # 轮询验证，失败自动打印日志并回滚
     if ! _verify_service_health "${_SVC_XRAY}" 8; then
         log_error "${_SVC_XRAY} 未正常运行，安装回滚"
         exec_svc stop "${_SVC_XRAY}" 2>/dev/null || true
@@ -1312,28 +1503,20 @@ exec_install_core() {
     log_ok "══ 安装完成 ══"
 }
 
-# 卸载：只删除本脚本资源，绝不触碰系统 xray
 exec_uninstall() {
     local _a; prompt "确定要卸载 xray2go？(y/N): " _a
     case "${_a:-n}" in y|Y) :;; *) log_info "已取消"; return;; esac
     log_step "卸载中（仅清理 xray2go 自身资源）..."
 
-    # 停止并禁用本脚本的服务
     for _s in "${_SVC_XRAY}" "${_SVC_TUNNEL}"; do
         exec_svc stop    "${_s}" 2>/dev/null || true
         exec_svc disable "${_s}" 2>/dev/null || true
     done
 
-    # 清理本脚本托管的防火墙端口（在删目录前执行）
     _force_cleanup_firewall
-
-    # 清理 cron（仅清理本脚本标记的条目）
     exec_remove_auto_restart
-
-    # 清理本脚本的 pid 文件
     _cleanup_processes
 
-    # 删除本脚本的 service 文件
     if is_systemd; then
         rm -f /etc/systemd/system/${_SVC_XRAY}.service   2>/dev/null || true
         rm -f /etc/systemd/system/${_SVC_TUNNEL}.service 2>/dev/null || true
@@ -1343,7 +1526,12 @@ exec_uninstall() {
         rm -f /etc/init.d/${_SVC_TUNNEL} 2>/dev/null || true
     fi
 
-    # 删除工作目录（含所有配置/状态/二进制）
+    # 移除性能调优配置文件
+    rm -f "${_SYSCTL_CONF}" "${_LIMITS_CONF}" \
+          /etc/sysctl.d/89-xray2go-bbr.conf \
+          /etc/modules-load.d/xray2go-bbr.conf 2>/dev/null || true
+    sysctl --system >/dev/null 2>&1 || true
+
     if [ -d "${WORK_DIR}" ]; then
         rm -rf "${WORK_DIR}" 2>/dev/null || true
         [ -d "${WORK_DIR}" ] && \
@@ -1351,9 +1539,7 @@ exec_uninstall() {
             log_ok "${WORK_DIR} 已清除"
     fi
 
-    # 删除快捷方式与脚本本体
     rm -f "${SHORTCUT}" "${SELF_DEST}" "${SELF_DEST}.bak" 2>/dev/null || true
-
     log_ok "xray2go 卸载完成，系统无残留"
 }
 
@@ -1447,7 +1633,7 @@ exec_update_argo_port() {
 }
 
 # ==============================================================================
-# §23 RUNTIME — Cron 自动重启（标记改为 #xray2go-restart）
+# §23 RUNTIME — Cron 自动重启
 # ==============================================================================
 _cron_available() {
     command -v crontab >/dev/null 2>&1 || return 1
@@ -1651,14 +1837,7 @@ ask_vltcp_mode() {
 
 # ==============================================================================
 # §27 CLI — 管理子菜单
-#
-# 每个代理模块均提供：启用 / 禁用 / 重启 / 卸载 四项基础操作
-#   - 重启 xray 系列（FF/Reality/VLTCP）：重启 xray2go 服务
-#   - 重启 Argo：重启 tunnel2go 服务
-#   - 卸载某模块：禁用 → apply_config → firewall_sync → （Argo 额外停服务+删文件）
 # ==============================================================================
-
-# ── 公共辅助 ────────────────────────────────────────────────────────────────
 
 _input_port() {
     local _jq_path="$1" _p
@@ -1676,7 +1855,6 @@ _input_port() {
     printf '%s' "${_p}"
 }
 
-# 重启 xray2go 主进程（FreeFlow / Reality / VLESS-TCP 共用）
 _restart_xray_svc() {
     [ -f "${CONFIG_FILE}" ] || { log_error "配置文件不存在，请先完成安装"; return 1; }
     exec_svc restart "${_SVC_XRAY}" \
@@ -1684,7 +1862,6 @@ _restart_xray_svc() {
         || { log_error "${_SVC_XRAY} 重启失败"; return 1; }
 }
 
-# 确认卸载某模块
 _confirm_uninstall() {
     local _name="$1" _a
     prompt "确定要卸载 ${_name}？此操作将关闭该协议入站 (y/N): " _a
@@ -1729,7 +1906,7 @@ manage_argo() {
         printf "  ${C_PUR}0.${C_RST} 返回\n"; _hr
         local _c; prompt "请输入选择: " _c
         case "${_c:-}" in
-            1) # 启用
+            1)
                 if [ "${_en}" = "true" ]; then
                     log_info "Argo 已处于启用状态"; _pause; continue
                 fi
@@ -1745,7 +1922,7 @@ manage_argo() {
                     && log_ok "Argo 已启用并启动" \
                     || log_warn "Argo 启用成功，但服务启动失败，请检查域名配置"
                 state_persist || log_warn "state.json 写入失败" ;;
-            2) # 禁用
+            2)
                 if [ "${_en}" != "true" ]; then
                     log_info "Argo 已处于禁用状态"; _pause; continue
                 fi
@@ -1755,7 +1932,7 @@ manage_argo() {
                 apply_config  || { _pause; continue; }
                 state_persist || log_warn "state.json 写入失败"
                 log_ok "Argo 已禁用（配置和文件保留，可随时重新启用）" ;;
-            3) # 重启
+            3)
                 if [ "${_en}" != "true" ]; then
                     log_warn "Argo 未启用，请先选项 1 启用"; _pause; continue
                 fi
@@ -1763,7 +1940,7 @@ manage_argo() {
                     && { log_ok "${_SVC_TUNNEL} 已重启"
                          _verify_service_health "${_SVC_TUNNEL}" 6; } \
                     || log_error "${_SVC_TUNNEL} 重启失败" ;;
-            9) # 卸载
+            9)
                 _confirm_uninstall "Argo" || { _pause; continue; }
                 exec_svc stop    "${_SVC_TUNNEL}" 2>/dev/null || true
                 exec_svc disable "${_SVC_TUNNEL}" 2>/dev/null || true
@@ -1776,14 +1953,13 @@ manage_argo() {
                 rm -f "${ARGO_BIN}"               2>/dev/null || true
                 rm -f "${WORK_DIR}/tunnel.yml"     2>/dev/null || true
                 rm -f "${WORK_DIR}/tunnel.json"    2>/dev/null || true
-                rm -f "${ARGO_LOG}"               2>/dev/null || true
                 state_set '.argo.enabled = false | .argo.domain = null | .argo.token = null | .argo.mode = "fixed"' \
                     || true
                 apply_config  || { _pause; continue; }
                 state_persist || log_warn "state.json 写入失败"
-                log_ok "Argo 已完全卸载（state 中协议/端口配置保留，重新启用时可复用）"
+                log_ok "Argo 已完全卸载"
                 _pause; return ;;
-            4) # 配置固定隧道
+            4)
                 if [ "${_en}" != "true" ]; then
                     log_warn "请先选项 1 启用 Argo"; _pause; continue
                 fi
@@ -1796,7 +1972,7 @@ manage_argo() {
                     1) state_set '.argo.protocol = "ws"';;
                 esac
                 apply_fixed_tunnel && print_nodes || log_error "固定隧道配置失败" ;;
-            5) # 切换协议
+            5)
                 if [ "${_en}" != "true" ]; then
                     log_warn "请先选项 1 启用 Argo"; _pause; continue
                 fi
@@ -1828,7 +2004,6 @@ manage_freeflow() {
         _proto=$(state_get '.ff.protocol')
         _path=$(state_get '.ff.path')
 
-        # xray2go 服务真实运行状态
         local _xstat
         exec_svc status "${_SVC_XRAY}" >/dev/null 2>&1 && _xstat="running" || _xstat="stopped"
 
@@ -1851,7 +2026,7 @@ manage_freeflow() {
         printf "  ${C_PUR}0.${C_RST} 返回\n"; _hr
         local _c; prompt "请输入选择: " _c
         case "${_c:-}" in
-            1) # 启用
+            1)
                 if [ "${_en}" = "true" ] && [ "${_proto}" != "none" ]; then
                     log_info "FreeFlow 已处于启用状态"; _pause; continue
                 fi
@@ -1861,7 +2036,7 @@ manage_freeflow() {
                 state_persist || log_warn "state.json 写入失败"
                 firewall_sync
                 log_ok "FreeFlow 已启用"; print_nodes ;;
-            2) # 禁用
+            2)
                 if [ "${_en}" != "true" ] || [ "${_proto}" = "none" ]; then
                     log_info "FreeFlow 已处于禁用状态"; _pause; continue
                 fi
@@ -1870,9 +2045,8 @@ manage_freeflow() {
                 state_persist || log_warn "state.json 写入失败"
                 firewall_sync
                 log_ok "FreeFlow 已禁用（path 配置保留）" ;;
-            3) # 重启
-                _restart_xray_svc || true ;;
-            9) # 卸载
+            3) _restart_xray_svc || true ;;
+            9)
                 _confirm_uninstall "FreeFlow" || { _pause; continue; }
                 state_set '.ff.enabled = false | .ff.protocol = "none" | .ff.path = "/"' \
                     || { _pause; continue; }
@@ -1881,14 +2055,14 @@ manage_freeflow() {
                 firewall_sync
                 log_ok "FreeFlow 已卸载（配置已重置）"
                 _pause; return ;;
-            4) # 变更协议
+            4)
                 ask_freeflow_mode
                 [ "$(state_get '.ff.enabled')" = "true" ] || { _pause; continue; }
                 apply_config  || { _pause; continue; }
                 state_persist || log_warn "state.json 写入失败"
                 firewall_sync
                 log_ok "FreeFlow 协议已变更"; print_nodes ;;
-            5) # 修改 path
+            5)
                 if [ "${_en}" != "true" ] || [ "${_proto}" = "none" ]; then
                     log_warn "请先选项 1 启用 FreeFlow"; _pause; continue
                 fi
@@ -1952,7 +2126,7 @@ manage_reality() {
         printf "  ${C_PUR}0.${C_RST} 返回\n"; _hr
         local _c; prompt "请输入选择: " _c
         case "${_c:-}" in
-            1) # 启用
+            1)
                 if [ "${_en}" = "true" ]; then
                     log_info "Reality 已处于启用状态"; _pause; continue
                 fi
@@ -1967,7 +2141,7 @@ manage_reality() {
                 state_persist || log_warn "state.json 写入失败"
                 firewall_sync
                 log_ok "Reality 已启用"; print_nodes ;;
-            2) # 禁用
+            2)
                 if [ "${_en}" != "true" ]; then
                     log_info "Reality 已处于禁用状态"; _pause; continue
                 fi
@@ -1976,9 +2150,8 @@ manage_reality() {
                 state_persist || log_warn "state.json 写入失败"
                 firewall_sync
                 log_ok "Reality 已禁用（端口/SNI/密钥配置保留）" ;;
-            3) # 重启
-                _restart_xray_svc || true ;;
-            9) # 卸载
+            3) _restart_xray_svc || true ;;
+            9)
                 _confirm_uninstall "Reality" || { _pause; continue; }
                 state_set '.reality.enabled = false | .reality.pbk = null | .reality.pvk = null | .reality.sid = null' \
                     || { _pause; continue; }
@@ -1987,14 +2160,14 @@ manage_reality() {
                 firewall_sync
                 log_ok "Reality 已卸载（端口/SNI 配置保留，密钥已清除）"
                 _pause; return ;;
-            4) # 修改端口
+            4)
                 local _np; _np=$(_input_port '.reality.port') || { _pause; continue; }
                 [ "${_en}" = "true" ] && { apply_config || { _pause; continue; }; }
                 state_persist || log_warn "state.json 写入失败"
                 firewall_sync
                 log_ok "端口已更新: ${_np}"
                 [ "${_en}" = "true" ] && print_nodes ;;
-            5) # 修改 SNI
+            5)
                 log_info "建议：addons.mozilla.org / www.microsoft.com / www.apple.com"
                 local _s; prompt "新 SNI（回车保持 ${_sni}）: " _s
                 if [ -n "${_s:-}" ]; then
@@ -2006,14 +2179,14 @@ manage_reality() {
                     log_ok "SNI 已更新: ${_s}"
                     [ "${_en}" = "true" ] && print_nodes
                 fi ;;
-            6) # 切换传输
+            6)
                 local _nn; [ "${_net}" = "tcp" ] && _nn="xhttp" || _nn="tcp"
                 state_set '.reality.network = $n' --arg n "${_nn}" || { _pause; continue; }
                 [ "${_en}" = "true" ] && { apply_config || { _pause; continue; }; }
                 state_persist || log_warn "state.json 写入失败"
                 log_ok "传输方式已切换: ${_nn}"
                 [ "${_en}" = "true" ] && print_nodes ;;
-            7) # 重新生成密钥对
+            7)
                 [ -x "${XRAY_BIN}" ] || { log_error "xray 未就绪"; _pause; continue; }
                 _gen_reality_keypair || { _pause; continue; }
                 state_set '.reality.sid = $s' --arg s "$(_gen_reality_sid)" || { _pause; continue; }
@@ -2061,7 +2234,7 @@ manage_vltcp() {
         printf "  ${C_PUR}0.${C_RST} 返回\n"; _hr
         local _c; prompt "请输入选择: " _c
         case "${_c:-}" in
-            1) # 启用
+            1)
                 if [ "${_en}" = "true" ]; then
                     log_info "VLESS-TCP 已处于启用状态"; _pause; continue
                 fi
@@ -2070,7 +2243,7 @@ manage_vltcp() {
                 state_persist || log_warn "state.json 写入失败"
                 firewall_sync
                 log_ok "VLESS-TCP 已启用 (端口: ${_port})"; print_nodes ;;
-            2) # 禁用
+            2)
                 if [ "${_en}" != "true" ]; then
                     log_info "VLESS-TCP 已处于禁用状态"; _pause; continue
                 fi
@@ -2079,9 +2252,8 @@ manage_vltcp() {
                 state_persist || log_warn "state.json 写入失败"
                 firewall_sync
                 log_ok "VLESS-TCP 已禁用（端口/监听配置保留）" ;;
-            3) # 重启
-                _restart_xray_svc || true ;;
-            9) # 卸载
+            3) _restart_xray_svc || true ;;
+            9)
                 _confirm_uninstall "VLESS-TCP" || { _pause; continue; }
                 state_set '.vltcp.enabled = false | .vltcp.port = 1234 | .vltcp.listen = "0.0.0.0"' \
                     || { _pause; continue; }
@@ -2090,14 +2262,14 @@ manage_vltcp() {
                 firewall_sync
                 log_ok "VLESS-TCP 已卸载（端口已重置为默认值）"
                 _pause; return ;;
-            4) # 修改端口
+            4)
                 local _np; _np=$(_input_port '.vltcp.port') || { _pause; continue; }
                 [ "${_en}" = "true" ] && { apply_config || { _pause; continue; }; }
                 state_persist || log_warn "state.json 写入失败"
                 firewall_sync
                 log_ok "端口已更新: ${_np}"
                 [ "${_en}" = "true" ] && print_nodes ;;
-            5) # 修改监听地址
+            5)
                 local _l; prompt "新监听地址（0.0.0.0=所有，127.0.0.1=仅本地）: " _l
                 if [ -n "${_l:-}" ]; then
                     state_set '.vltcp.listen = $l' --arg l "${_l}" || { _pause; continue; }
@@ -2169,7 +2341,7 @@ _menu_collect_status() {
 _menu_render() {
     clear; echo ""
     printf "${C_BOLD}${C_PUR}  ╔══════════════════════════════════════════╗${C_RST}\n"
-    printf "${C_BOLD}${C_PUR}  ║               Xray-2go  v8.0             ║${C_RST}\n"
+    printf "${C_BOLD}${C_PUR}  ║                Xray-2go  v8.1            ║${C_RST}\n"
     printf "${C_BOLD}${C_PUR}  ╠══════════════════════════════════════════╣${C_RST}\n"
     printf "${C_BOLD}${C_PUR}  ║${C_RST}  Xray     : ${_MENU_XC}%-29s${C_RST}${C_PUR} ${C_RST}\n"  "${_MENU_XS}"
     printf "${C_BOLD}${C_PUR}  ║${C_RST}  Argo     : %-29s${C_PUR} ${C_RST}\n"  "${_MENU_AD}"
@@ -2196,13 +2368,15 @@ _menu_do_install() {
         log_warn "Xray-2go 已安装并运行，如需重装请先卸载 (选项 2)"; return
     fi
 
+    # ── 内存检测（安装向导入口提前检测，给用户选择机会）──────────────────
+    _check_memory
+
     ask_argo_mode
     [ "$(state_get '.argo.enabled')" = "true" ] && ask_argo_protocol
     ask_freeflow_mode
     ask_reality_mode
     ask_vltcp_mode
 
-    # 端口重叠预警（实际冲突由 _check_port_conflicts 处理）
     if [ "$(state_get '.reality.enabled')" = "true" ]; then
         local _rp _ap
         _rp=$(state_get '.reality.port'); _ap=$(state_get '.argo.port')
