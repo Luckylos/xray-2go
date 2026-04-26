@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# xray-2go v8.2  — Xray 落地代理管理脚本
+# xray-2go v8.3  — Xray 落地代理管理脚本
 # 协议支持：Argo 固定隧道(WS/XHTTP) · FreeFlow(WS/HTTPUpgrade/XHTTP/TCP-HTTP)
 #           Reality(TCP/XHTTP) · VLESS-TCP 明文落地
 # 平台支持：Debian/Ubuntu (systemd) · Alpine (OpenRC)
@@ -70,7 +70,12 @@ log_warn()  { printf "${C_YLW}[WARN]${C_RST} %s\n"     "$*" >&2; }
 log_error() { printf "${C_RED}[ERR ]${C_RST} %s\n"     "$*" >&2; }
 log_step()  { printf "${C_PUR}[....] %s${C_RST}\n"     "$*"; }
 log_title() { printf "\n${C_BOLD}${C_PUR}%s${C_RST}\n" "$*"; }
-die()       { log_error "$1"; exit "${2:-1}"; }
+die() { log_error "$1"; exit "${2:-1}"; }
+
+# xPadding 常量 — xhttp 混淆配置（5处共用）
+readonly _XPAD_JSON='{"xPaddingObfsMode":true,"xPaddingMethod":"tokenish","xPaddingPlacement":"queryInHeader","xPaddingHeader":"X-Cache","xPaddingKey":"_Luckylos"}'
+readonly _XPAD_QS='%22xPaddingObfsMode%22%3Atrue%2C%22xPaddingMethod%22%3A%22tokenish%22%2C%22xPaddingPlacement%22%3A%22queryInHeader%22%2C%22xPaddingHeader%22%3A%22X-Cache%22%2C%22xPaddingKey%22%3A%22_Luckylos%22'
+_xpad_jq() { printf '%s' "$_XPAD_JSON" | jq -c .; }
 
 prompt() {
     printf "${C_RED}%s${C_RST}" "$1" >&2
@@ -503,6 +508,12 @@ state_persist() {
     mv "${_t}" "${STATE_FILE}"
 }
 
+# 封装 state_persist + firewall_sync 组合（出现15+次）
+_apply_and_persist() {
+	state_persist || log_warn "state.json 写入失败"
+	firewall_sync
+}
+
 # ==============================================================================
 # §8  STATE — 默认值补全
 # ==============================================================================
@@ -592,11 +603,11 @@ protocol_argo() {
     _uuid=$(state_get '.uuid')
     case "${_proto}" in
         xhttp)
-            jq -n --argjson port "${_port}" --arg uuid "${_uuid}" '{
+            jq -n --argjson port "${_port}" --arg uuid "${_uuid}" --argjson x "$(_xpad_jq)" '{
                 port:$port, listen:"127.0.0.1", protocol:"vless",
                 settings:{clients:[{id:$uuid}], decryption:"none"},
                 streamSettings:{network:"xhttp",
-                    xhttpSettings:{path:"/argo", mode:"auto", xPaddingObfsMode: true, xPaddingMethod: "tokenish", xPaddingPlacement: "queryInHeader", xPaddingHeader: "X-Cache", xPaddingKey: "_Luckylos"}}}' ;;
+                    xhttpSettings:({path:"/argo", mode:"auto"} + $x)}}' ;;
         *)
             jq -n --argjson port "${_port}" --arg uuid "${_uuid}" '{
                 port:$port, listen:"127.0.0.1", protocol:"vless",
@@ -625,11 +636,11 @@ protocol_ff() {
                 streamSettings:{network:"httpupgrade",
                     httpupgradeSettings:{path:$path}}}' ;;
         xhttp)
-            jq -n --arg uuid "${_uuid}" --arg path "${_path}" '{
+            jq -n --arg uuid "${_uuid}" --arg path "${_path}" --argjson x "$(_xpad_jq)" '{
                 port:8080, listen:"::", protocol:"vless",
                 settings:{clients:[{id:$uuid}], decryption:"none"},
                 streamSettings:{network:"xhttp",
-                    xhttpSettings:{path:$path, mode:"stream-one", xPaddingObfsMode: true, xPaddingMethod: "tokenish", xPaddingPlacement: "queryInHeader", xPaddingHeader: "X-Cache", xPaddingKey: "_Luckylos"}}}' ;;
+                    xhttpSettings:({path:$path, mode:"stream-one"} + $x)}}' ;;
         tcphttp)
             local _host; _host=$(state_get '.ff.host')
             jq -n --arg uuid "${_uuid}" --arg host "${_host}" '{
@@ -666,15 +677,15 @@ protocol_reality() {
     _sid=$(state_get  '.reality.sid');  _net=$(state_get '.reality.network')
     _net="${_net:-tcp}";                _uuid=$(state_get '.uuid')
     case "${_net}" in
-        xhttp)
-            jq -n --argjson port "${_port}" --arg uuid "${_uuid}" \
-                   --arg sni "${_sni}" --arg pvk "${_pvk}" --arg sid "${_sid}" '{
-                port:$port, listen:"::", protocol:"vless",
-                settings:{clients:[{id:$uuid}], decryption:"none"},
-                streamSettings:{network:"xhttp", security:"reality",
-                    realitySettings:{dest:($sni+":443"),
-                        serverNames:[$sni], privateKey:$pvk, shortIds:[$sid]},
-                    xhttpSettings:{path:"/", mode:"auto", xPaddingObfsMode: true, xPaddingMethod: "tokenish", xPaddingPlacement: "queryInHeader", xPaddingHeader: "X-Cache", xPaddingKey: "_Luckylos"}}}' ;;
+	xhttp)
+		jq -n --argjson port "${_port}" --arg uuid "${_uuid}" \
+			--arg sni "${_sni}" --arg pvk "${_pvk}" --arg sid "${_sid}" --argjson x "$(_xpad_jq)" '{
+			port:$port, listen:"::", protocol:"vless",
+			settings:{clients:[{id:$uuid}], decryption:"none"},
+			streamSettings:{network:"xhttp", security:"reality",
+			realitySettings:{dest:($sni+":443"),
+			serverNames:[$sni], privateKey:$pvk, shortIds:[$sid]},
+			xhttpSettings:({path:"/", mode:"auto"} + $x)}}' ;;
         *)
             jq -n --argjson port "${_port}" --arg uuid "${_uuid}" \
                    --arg sni "${_sni}" --arg pvk "${_pvk}" --arg sid "${_sid}" '{
@@ -708,8 +719,8 @@ link_argo() {
     [ -n "${_domain:-}" ] && [ "${_domain}" != "null" ] || return 0
     case "${_proto}" in
         xhttp)
-            printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=firefox&type=xhttp&host=%s&path=%%2Fargo&mode=auto&extra=%%7B%%22xPaddingObfsMode%%22%%3Atrue%%2C%%22xPaddingMethod%%22%%3A%%22tokenish%%22%%2C%%22xPaddingPlacement%%22%%3A%%22queryInHeader%%22%%2C%%22xPaddingHeader%%22%%3A%%22X-Cache%%22%%2C%%22xPaddingKey%%22%%3A%%22_Luckylos%%22%%7D#Argo-XHTTP\n' \
-                "${_uuid}" "${_cfip}" "${_cfport}" "${_domain}" "${_domain}" ;;
+            printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=firefox&type=xhttp&host=%s&path=%%2Fargo&mode=auto&extra=%%7B%s%%7D#Argo-XHTTP\n' \
+                "${_uuid}" "${_cfip}" "${_cfport}" "${_domain}" "${_domain}" "${_XPAD_QS}" ;;
         *)
             printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=firefox&type=ws&host=%s&path=%%2Fargo%%3Fed%%3D2560#Argo-WS\n' \
                 "${_uuid}" "${_cfip}" "${_cfport}" "${_domain}" "${_domain}" ;;
@@ -729,8 +740,8 @@ link_ff() {
                          "${_uuid}" "${_ip}" "${_ip}" "${_penc}" ;;
         httpupgrade) printf 'vless://%s@%s:8080?encryption=none&security=none&type=httpupgrade&host=%s&path=%s#FreeFlow-HTTPUpgrade\n' \
                          "${_uuid}" "${_ip}" "${_ip}" "${_penc}" ;;
-        xhttp)       printf 'vless://%s@%s:8080?encryption=none&security=none&type=xhttp&host=%s&path=%s&mode=stream-one&extra=%%7B%%22xPaddingObfsMode%%22%%3Atrue%%2C%%22xPaddingMethod%%22%%3A%%22tokenish%%22%%2C%%22xPaddingPlacement%%22%%3A%%22queryInHeader%%22%%2C%%22xPaddingHeader%%22%%3A%%22X-Cache%%22%%2C%%22xPaddingKey%%22%%3A%%22_Luckylos%%22%%7D#FreeFlow-XHTTP\n' \
-                         "${_uuid}" "${_ip}" "${_ip}" "${_penc}" ;;
+        xhttp)       printf 'vless://%s@%s:8080?encryption=none&security=none&type=xhttp&host=%s&path=%s&mode=stream-one&extra=%%7B%s%%7D#FreeFlow-XHTTP\n' \
+                         "${_uuid}" "${_ip}" "${_ip}" "${_penc}" "${_XPAD_QS}" ;;
         tcphttp)
             local _henc _host
             _host=$(state_get '.ff.host')
@@ -749,9 +760,9 @@ link_reality() {
     local _rnet _uuid
     _rnet=$(state_get '.reality.network'); _rnet="${_rnet:-tcp}"; _uuid=$(state_get '.uuid')
     case "${_rnet}" in
-        xhttp) printf 'vless://%s@%s:%s?encryption=none&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=xhttp&path=%%2F&mode=stream-one&extra=%%7B%%22xPaddingObfsMode%%22%%3Atrue%%2C%%22xPaddingMethod%%22%%3A%%22tokenish%%22%%2C%%22xPaddingPlacement%%22%%3A%%22queryInHeader%%22%%2C%%22xPaddingHeader%%22%%3A%%22X-Cache%%22%%2C%%22xPaddingKey%%22%%3A%%22_Luckylos%%22%%7D#Reality-XHTTP\n' \
+        xhttp) printf 'vless://%s@%s:%s?encryption=none&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=xhttp&path=%%2F&mode=stream-one&extra=%%7B%s%%7D#Reality-XHTTP\n' \
                    "${_uuid}" "${_ip}" "$(state_get '.reality.port')" \
-                   "$(state_get '.reality.sni')" "${_rpbk}" "$(state_get '.reality.sid')" ;;
+                   "$(state_get '.reality.sni')" "${_rpbk}" "$(state_get '.reality.sid')" "${_XPAD_QS}" ;;
         *)     printf 'vless://%s@%s:%s?encryption=none&flow=xtls-rprx-vision&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=tcp&headerType=none#Reality-Vision\n' \
                    "${_uuid}" "${_ip}" "$(state_get '.reality.port')" \
                    "$(state_get '.reality.sni')" "${_rpbk}" "$(state_get '.reality.sid')" ;;
@@ -1081,7 +1092,7 @@ _exec_install_cleanup() {
 }
 
 exec_install_core() {
-    clear; log_title "══════════ 安装 Xray-2go v8.2 ══════════"
+    clear; log_title "══════════ 安装 Xray-2go v8.3 ══════════"
     preflight_check
     mkdir -p "${WORK_DIR}" && chmod 750 "${WORK_DIR}"
 
@@ -1260,24 +1271,14 @@ exec_update_uuid() {
 }
 
 exec_update_argo_port() {
-    local _p; prompt "新回源端口（回车随机）: " _p
-    [ -z "${_p:-}" ] && _p=$(shuf -i 2000-65000 -n 1 2>/dev/null || \
-                              awk 'BEGIN{srand();print int(rand()*63000)+2000}')
-    case "${_p:-}" in ''|*[!0-9]*) log_error "无效端口"; return 1;; esac
-    { [ "${_p}" -ge 1 ] && [ "${_p}" -le 65535 ]; } \
-        || { log_error "端口须在 1-65535 之间"; return 1; }
-    if port_in_use "${_p}"; then
-        log_warn "端口 ${_p} 已被占用"
-        local _a; prompt "仍然继续？(y/N): " _a
-        case "${_a:-n}" in y|Y) :;; *) return 1;; esac
-    fi
-    state_set '.argo.port = ($p|tonumber)' --arg p "${_p}" || return 1
-    apply_config || return 1
-    apply_tunnel_service; exec_svc_reload
-    exec_svc restart "${_SVC_TUNNEL}" || log_warn "tunnel 重启失败，请手动重启"
-    state_persist || log_warn "state.json 写入失败"
-    log_ok "回源端口已更新: ${_p}"; print_nodes
+	local _p; _p=$(_input_port '.argo.port') || return 1
+	apply_config || return 1
+	apply_tunnel_service; exec_svc_reload
+	exec_svc restart "${_SVC_TUNNEL}" || log_warn "tunnel 重启失败，请手动重启"
+	_apply_and_persist
+	log_ok "回源端口已更新: ${_p}"; print_nodes
 }
+
 
 # ==============================================================================
 # §24 RUNTIME — 快捷方式与脚本更新
@@ -1649,8 +1650,7 @@ manage_freeflow() {
                 ask_freeflow_mode
                 [ "$(state_get '.ff.enabled')" = "true" ] || { _pause; continue; }
                 apply_config  || { _pause; continue; }
-                state_persist || log_warn "state.json 写入失败"
-                firewall_sync
+                _apply_and_persist
                 log_ok "FreeFlow 已启用"; print_nodes ;;
             2)
                 if [ "${_en}" != "true" ] || [ "${_proto}" = "none" ]; then
@@ -1658,8 +1658,7 @@ manage_freeflow() {
                 fi
                 state_set '.ff.enabled = false | .ff.protocol = "none"' || { _pause; continue; }
                 apply_config  || { _pause; continue; }
-                state_persist || log_warn "state.json 写入失败"
-                firewall_sync
+                _apply_and_persist
                 log_ok "FreeFlow 已禁用（配置保留）" ;;
             3) _restart_xray_svc || true ;;
             9)
@@ -1667,16 +1666,14 @@ manage_freeflow() {
                 state_set '.ff.enabled = false | .ff.protocol = "none" | .ff.path = "/" | .ff.host = ""' \
                     || { _pause; continue; }
                 apply_config  || { _pause; continue; }
-                state_persist || log_warn "state.json 写入失败"
-                firewall_sync
+                _apply_and_persist
                 log_ok "FreeFlow 已卸载（配置已重置）"
                 _pause; return ;;
             4)
                 ask_freeflow_mode
                 [ "$(state_get '.ff.enabled')" = "true" ] || { _pause; continue; }
                 apply_config  || { _pause; continue; }
-                state_persist || log_warn "state.json 写入失败"
-                firewall_sync
+                _apply_and_persist
                 log_ok "FreeFlow 协议已变更"; print_nodes ;;
             5)
                 if [ "${_en}" != "true" ] || [ "${_proto}" = "none" ]; then
@@ -1764,8 +1761,7 @@ manage_reality() {
                 fi
                 state_set '.reality.enabled = true' || { _pause; continue; }
                 apply_config  || { state_set '.reality.enabled = false'; _pause; continue; }
-                state_persist || log_warn "state.json 写入失败"
-                firewall_sync
+                _apply_and_persist
                 log_ok "Reality 已启用"; print_nodes ;;
             2)
                 if [ "${_en}" != "true" ]; then
@@ -1773,8 +1769,7 @@ manage_reality() {
                 fi
                 state_set '.reality.enabled = false' || { _pause; continue; }
                 apply_config  || { _pause; continue; }
-                state_persist || log_warn "state.json 写入失败"
-                firewall_sync
+                _apply_and_persist
                 log_ok "Reality 已禁用（端口/SNI/密钥配置保留）" ;;
             3) _restart_xray_svc || true ;;
             9)
@@ -1782,15 +1777,13 @@ manage_reality() {
                 state_set '.reality.enabled = false | .reality.pbk = null | .reality.pvk = null | .reality.sid = null' \
                     || { _pause; continue; }
                 apply_config  || { _pause; continue; }
-                state_persist || log_warn "state.json 写入失败"
-                firewall_sync
+                _apply_and_persist
                 log_ok "Reality 已卸载（端口/SNI 配置保留，密钥已清除）"
                 _pause; return ;;
             4)
                 local _np; _np=$(_input_port '.reality.port') || { _pause; continue; }
                 [ "${_en}" = "true" ] && { apply_config || { _pause; continue; }; }
-                state_persist || log_warn "state.json 写入失败"
-                firewall_sync
+                _apply_and_persist
                 log_ok "端口已更新: ${_np}"
                 [ "${_en}" = "true" ] && print_nodes ;;
             5)
@@ -1866,8 +1859,7 @@ manage_vltcp() {
                 fi
                 state_set '.vltcp.enabled = true' || { _pause; continue; }
                 apply_config  || { state_set '.vltcp.enabled = false'; _pause; continue; }
-                state_persist || log_warn "state.json 写入失败"
-                firewall_sync
+                _apply_and_persist
                 log_ok "VLESS-TCP 已启用 (端口: ${_port})"; print_nodes ;;
             2)
                 if [ "${_en}" != "true" ]; then
@@ -1875,8 +1867,7 @@ manage_vltcp() {
                 fi
                 state_set '.vltcp.enabled = false' || { _pause; continue; }
                 apply_config  || { _pause; continue; }
-                state_persist || log_warn "state.json 写入失败"
-                firewall_sync
+                _apply_and_persist
                 log_ok "VLESS-TCP 已禁用（端口/监听配置保留）" ;;
             3) _restart_xray_svc || true ;;
             9)
@@ -1884,15 +1875,13 @@ manage_vltcp() {
                 state_set '.vltcp.enabled = false | .vltcp.port = 1234 | .vltcp.listen = "0.0.0.0"' \
                     || { _pause; continue; }
                 apply_config  || { _pause; continue; }
-                state_persist || log_warn "state.json 写入失败"
-                firewall_sync
+                _apply_and_persist
                 log_ok "VLESS-TCP 已卸载（端口已重置为默认值）"
                 _pause; return ;;
             4)
                 local _np; _np=$(_input_port '.vltcp.port') || { _pause; continue; }
                 [ "${_en}" = "true" ] && { apply_config || { _pause; continue; }; }
-                state_persist || log_warn "state.json 写入失败"
-                firewall_sync
+                _apply_and_persist
                 log_ok "端口已更新: ${_np}"
                 [ "${_en}" = "true" ] && print_nodes ;;
             5)
@@ -1924,7 +1913,7 @@ _menu_collect_status() {
     local _dom; _dom=$(state_get '.argo.domain')
     if [ "$(state_get '.argo.enabled')" = "true" ]; then
         [ -n "${_dom:-}" ] && [ "${_dom}" != "null" ] \
-            && _MENU_AD="${_as} [$(state_get '.argo.protocol'), ${_dom}]" \
+            && _MENU_AD="${_as} [$(state_get '.argo.protocol'), ${_dom}, port=$(state_get '.argo.port')]" \
             || _MENU_AD="${_as} [未配置域名]"
     else _MENU_AD="未启用"; fi
     local _fp _fpa _ffhost
@@ -1951,7 +1940,7 @@ _menu_collect_status() {
 _menu_render() {
     clear; echo ""
     printf "${C_BOLD}${C_PUR}  ╔══════════════════════════════════════════╗${C_RST}\n"
-    printf "${C_BOLD}${C_PUR}  ║                Xray-2go  v8.2            ║${C_RST}\n"
+ printf "${C_BOLD}${C_PUR} ║ Xray-2go v8.3 ║${C_RST}\n"
     printf "${C_BOLD}${C_PUR}  ╠══════════════════════════════════════════╣${C_RST}\n"
     printf "${C_BOLD}${C_PUR}  ║${C_RST}  Xray     : ${_MENU_XC}%-29s${C_RST}${C_PUR} ${C_RST}\n"  "${_MENU_XS}"
     printf "${C_BOLD}${C_PUR}  ║${C_RST}  Argo     : %-29s${C_PUR} ${C_RST}\n"  "${_MENU_AD}"
