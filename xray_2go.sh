@@ -665,17 +665,17 @@ cfcdn_write_cert() {
     printf '%s' "${_key}"  > "${CFCDN_KEY}"  || { log_error "私钥写入失败"; return 1; }
     chmod 600 "${CFCDN_CRT}" "${CFCDN_KEY}"
 
-    # 用 openssl 验证证书与私钥是否匹配（如果 openssl 可用）
-    if command -v openssl >/dev/null 2>&1; then
-        local _cert_mod _key_mod
-        _cert_mod=$(openssl x509 -noout -modulus -in "${CFCDN_CRT}" 2>/dev/null | md5sum 2>/dev/null || true)
-        _key_mod=$(openssl rsa  -noout -modulus -in "${CFCDN_KEY}"  2>/dev/null | md5sum 2>/dev/null || \
-                   openssl ec   -noout           -in "${CFCDN_KEY}"  2>/dev/null | md5sum 2>/dev/null || true)
-        if [ -n "${_cert_mod:-}" ] && [ -n "${_key_mod:-}" ] && \
-           [ "${_cert_mod}" != "${_key_mod}" ]; then
-            log_warn "证书与私钥 modulus 不匹配，请确认粘贴内容正确"
-        fi
+  # 用 openssl 验证证书与私钥是否匹配（如果 openssl 可用）
+  # 使用公钥比较而非 modulus，对 RSA / EC 证书均通用
+  if command -v openssl >/dev/null 2>&1; then
+    local _cert_pub _key_pub
+    _cert_pub=$(openssl x509 -pubkey -noout -in "${CFCDN_CRT}" 2>/dev/null | md5sum 2>/dev/null || true)
+    _key_pub=$(openssl pkey -pubout -in "${CFCDN_KEY}" 2>/dev/null | md5sum 2>/dev/null || true)
+    if [ -n "${_cert_pub:-}" ] && [ -n "${_key_pub:-}" ] && \
+    [ "${_cert_pub}" != "${_key_pub}" ]; then
+      log_warn "证书与私钥公钥不匹配，请确认粘贴内容正确"
     fi
+  fi
 
     log_ok "TLS 证书已保存: ${CFCDN_CRT}"
 }
@@ -1428,8 +1428,12 @@ exec_update_argo_port() {
         local _a; prompt "仍然继续？(y/N): " _a
         case "${_a:-n}" in y|Y) :;; *) return 1;; esac
     fi
-    state_set '.argo.port = ($p|tonumber)' --arg p "${_p}" || return 1
-    apply_config || return 1
+ state_set '.argo.port = ($p|tonumber)' --arg p "${_p}" || return 1
+ # 同步更新 tunnel.yml 中的端口（如果文件存在）
+ if [ -f "${WORK_DIR}/tunnel.yml" ]; then
+ sed -i "s|service: http://localhost:[0-9]*|service: http://localhost:${_p}|" "${WORK_DIR}/tunnel.yml"
+ fi
+ apply_config || return 1
     apply_tunnel_service; exec_svc_reload
     exec_svc restart "${_SVC_TUNNEL}" || log_warn "tunnel 重启失败，请手动重启"
     state_persist || log_warn "state.json 写入失败"
@@ -2252,7 +2256,7 @@ _menu_collect_status() {
     _as=$(check_argo); _dom=$(state_get '.argo.domain')
     if [ "$(state_get '.argo.enabled')" = "true" ]; then
         [ -n "${_dom:-}" ] && [ "${_dom}" != "null" ] \
-            && _MENU_AD="${_as} [$(state_get '.argo.protocol'), ${_dom}]" \
+            && _MENU_AD="${_as} [$(state_get '.argo.protocol'):$(state_get '.argo.port'), ${_dom}]" \
             || _MENU_AD="${_as} [未配置域名]"
     else _MENU_AD="未启用"; fi
 
