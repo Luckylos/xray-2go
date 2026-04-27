@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# xray-2go v8.3  — Xray 落地代理管理脚本（工程级重构版）
+# xray-2go v8.3  — Xray 落地代理管理脚本（结构级重构版）
 # 协议支持：Argo 固定隧道(WS/XHTTP) · FreeFlow(WS/HTTPUpgrade/XHTTP/TCP-HTTP)
 #           Reality(TCP/XHTTP) · VLESS-TCP 明文落地
 # 平台支持：Debian/Ubuntu (systemd) · Alpine (OpenRC)
@@ -10,13 +10,7 @@ set -uo pipefail
     || { printf '\033[1;91m[ERR ] 需要 bash 4.0 或更高版本\033[0m\n' >&2; exit 1; }
 
 # ==============================================================================
-# §L0  Shell 安全基线
-# ==============================================================================
-# 所有函数：0 = 成功；非 0 = 失败（可恢复错误用 return 1，不可恢复用 die）
-# 全局副作用变量统一以 _G_ 前缀，模块内变量以 局部 local 声明
-
-# ==============================================================================
-# §L1  全局常量
+# §L1  全局常量（只读，零副作用）
 # ==============================================================================
 readonly WORK_DIR="/etc/xray2go"
 readonly XRAY_BIN="${WORK_DIR}/xray"
@@ -26,7 +20,15 @@ readonly STATE_FILE="${WORK_DIR}/state.json"
 readonly SHORTCUT="/usr/local/bin/s"
 readonly SELF_DEST="/usr/local/bin/xray2go"
 readonly UPSTREAM_URL="https://raw.githubusercontent.com/Luckylos/xray-2go/refs/heads/main/xray_2go.sh"
+
+# 内部路径
+readonly _LOCK_FILE="${WORK_DIR}/.lock"
 readonly _FW_PORTS_FILE="${WORK_DIR}/.fw_ports"
+readonly _SYSCTL_FILE="/etc/sysctl.d/99-xray2go.conf"
+readonly _HOSTS_BAK="${WORK_DIR}/.hosts.bak"
+# Argo token env file（避免 shell 拼接注入）
+readonly _ARGO_ENV_FILE="${WORK_DIR}/.argo_env"
+
 readonly _SVC_XRAY="xray2go"
 readonly _SVC_TUNNEL="tunnel2go"
 
@@ -36,7 +38,6 @@ readonly _XRAY_MIRRORS=(
     "https://hub.fastgit.xyz/XTLS/Xray-core/releases/download"
 )
 
-# xPadding 混淆常量（xhttp 协议共用）
 readonly _XPAD_JSON='{"xPaddingObfsMode":true,"xPaddingMethod":"tokenish","xPaddingPlacement":"queryInHeader","xPaddingHeader":"X-Cache","xPaddingKey":"_Luckylos"}'
 readonly _XPAD_QS='%22xPaddingObfsMode%22%3Atrue%2C%22xPaddingMethod%22%3A%22tokenish%22%2C%22xPaddingPlacement%22%3A%22queryInHeader%22%2C%22xPaddingHeader%22%3A%22X-Cache%22%2C%22xPaddingKey%22%3A%22_Luckylos%22'
 
@@ -46,6 +47,9 @@ readonly _PROTO_REGISTRY=( argo ff reality vltcp )
 # ==============================================================================
 # §L2  临时文件沙箱
 # ==============================================================================
+# 所有临时文件强制在 WORK_DIR/.tmp_* ，保证与目标文件同一文件系统
+# 从而使 mv 保持原子性（rename syscall）
+
 _G_TMP_DIR=""
 
 trap '_trap_exit' EXIT
@@ -62,45 +66,55 @@ _trap_int() {
     exit 130
 }
 
-# 创建临时文件，返回路径
-tmp_file() {
+# 确保 WORK_DIR 存在，创建同 FS 临时目录
+_ensure_tmp_dir() {
     if [ -z "${_G_TMP_DIR:-}" ]; then
-        _G_TMP_DIR=$(mktemp -d /tmp/xray2go_XXXXXX) \
-            || die "无法创建临时目录"
+        mkdir -p "${WORK_DIR}" 2>/dev/null || true
+        _G_TMP_DIR=$(mktemp -d "${WORK_DIR}/.tmp_XXXXXX") \
+            || { printf '\033[1;91m[ERR ] 无法在 %s 创建临时目录\033[0m\n' "${WORK_DIR}" >&2; exit 1; }
     fi
+}
+
+tmp_file() {
+    _ensure_tmp_dir
     mktemp "${_G_TMP_DIR}/${1:-tmp_XXXXXX}"
 }
 
 # ==============================================================================
-# §L3  Utils — 日志、提示、字符串
+# §L3  Utils — 日志、安全输出、字符串工具
 # ==============================================================================
 readonly C_RST=$'\033[0m'  C_BOLD=$'\033[1m'
 readonly C_RED=$'\033[1;91m'  C_GRN=$'\033[1;32m'  C_YLW=$'\033[1;33m'
 readonly C_PUR=$'\033[1;35m'  C_CYN=$'\033[1;36m'
 
-log_info()  { printf "${C_CYN}[INFO]${C_RST} %s\n"     "$*"; }
-log_ok()    { printf "${C_GRN}[ OK ]${C_RST} %s\n"     "$*"; }
-log_warn()  { printf "${C_YLW}[WARN]${C_RST} %s\n"     "$*" >&2; }
-log_error() { printf "${C_RED}[ERR ]${C_RST} %s\n"     "$*" >&2; }
-log_step()  { printf "${C_PUR}[....] %s${C_RST}\n"     "$*"; }
-log_title() { printf "\n${C_BOLD}${C_PUR}%s${C_RST}\n" "$*"; }
+log_info()  { printf '%s[INFO]%s %s\n'     "${C_CYN}" "${C_RST}" "$*"; }
+log_ok()    { printf '%s[ OK ]%s %s\n'     "${C_GRN}" "${C_RST}" "$*"; }
+log_warn()  { printf '%s[WARN]%s %s\n'     "${C_YLW}" "${C_RST}" "$*" >&2; }
+log_error() { printf '%s[ERR ]%s %s\n'     "${C_RED}" "${C_RST}" "$*" >&2; }
+log_step()  { printf '%s[....] %s%s\n'     "${C_PUR}" "$*" "${C_RST}"; }
+log_title() { printf '\n%s%s%s\n'          "${C_BOLD}${C_PUR}" "$*" "${C_RST}"; }
 
-# 不可恢复错误：打印并退出
 die() { log_error "$1"; exit "${2:-1}"; }
 
-# 交互提示（强制从 /dev/tty 读取）
 prompt() {
-    printf "${C_RED}%s${C_RST}" "$1" >&2
+    # 格式串固定，避免用户数据污染格式
+    printf '%s%s%s' "${C_RED}" "$1" "${C_RST}" >&2
     read -r "$2" </dev/tty
 }
 
 _pause() {
     local _d
-    printf "${C_RED}按回车键继续...${C_RST}" >&2
+    printf '%s按回车键继续...%s' "${C_RED}" "${C_RST}" >&2
     read -r _d </dev/tty || true
 }
 
-_hr() { printf "${C_PUR}  ──────────────────────────────────${C_RST}\n"; }
+_hr() { printf '%s  ──────────────────────────────────%s\n' "${C_PUR}" "${C_RST}"; }
+
+# 安全打印节点链接（B5 修复：格式串固定，颜色作参数）
+_print_link() {
+    local _link="$1"
+    [ -n "${_link:-}" ] && printf '%s%s%s\n' "${C_CYN}" "${_link}" "${C_RST}"
+}
 
 # URL 路径编码
 urlencode_path() {
@@ -112,14 +126,13 @@ urlencode_path() {
 }
 
 # ==============================================================================
-# §L4  Platform — init 检测、架构检测、包管理
+# §L4  Platform — 检测、包管理、网络
 # ==============================================================================
 _G_INIT_SYS=""
 _G_ARCH_CF=""
 _G_ARCH_XRAY=""
 _G_CACHED_REALIP=""
 
-# 检测并设置 _G_INIT_SYS
 platform_detect_init() {
     if [ -f /.dockerenv ] || \
        grep -qE 'docker|lxc|containerd' /proc/1/cgroup 2>/dev/null; then
@@ -139,7 +152,6 @@ platform_detect_init() {
 is_systemd() { [ "${_G_INIT_SYS}" = "systemd" ]; }
 is_openrc()  { [ "${_G_INIT_SYS}" = "openrc"  ]; }
 
-# 检测并设置 _G_ARCH_CF / _G_ARCH_XRAY
 platform_detect_arch() {
     [ -n "${_G_ARCH_XRAY:-}" ] && return 0
     case "$(uname -m)" in
@@ -152,7 +164,6 @@ platform_detect_arch() {
     esac
 }
 
-# 安装单个包（幂等）
 platform_pkg_require() {
     local _pkg="$1" _bin="${2:-$1}"
     command -v "${_bin}" >/dev/null 2>&1 && return 0
@@ -162,8 +173,7 @@ platform_pkg_require() {
         if ! find /var/cache/apt/pkgcache.bin -mtime -1 >/dev/null 2>&1; then
             DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1 || true
         fi
-        DEBIAN_FRONTEND=noninteractive apt-get install -y "${_pkg}" >/dev/null 2>&1
-        _rc=$?
+        DEBIAN_FRONTEND=noninteractive apt-get install -y "${_pkg}" >/dev/null 2>&1; _rc=$?
     elif command -v dnf  >/dev/null 2>&1; then dnf install -y "${_pkg}" >/dev/null 2>&1; _rc=$?
     elif command -v yum  >/dev/null 2>&1; then yum install -y "${_pkg}" >/dev/null 2>&1; _rc=$?
     elif command -v apk  >/dev/null 2>&1; then apk add       "${_pkg}" >/dev/null 2>&1; _rc=$?
@@ -175,12 +185,12 @@ platform_pkg_require() {
     log_ok "${_pkg} 已就绪"
 }
 
-# 预检所有必要依赖
 platform_preflight() {
     log_step "依赖预检..."
     for _d in curl unzip jq; do platform_pkg_require "${_d}"; done
-    command -v xxd >/dev/null 2>&1 || platform_pkg_require "xxd" "xxd" 2>/dev/null || \
-        log_info "xxd 未安装 — Reality shortId 将 fallback 到 openssl/od"
+    command -v xxd >/dev/null 2>&1 \
+        || platform_pkg_require "xxd" "xxd" 2>/dev/null \
+        || log_info "xxd 未安装 — Reality shortId 将 fallback 到 openssl/od"
     command -v openssl >/dev/null 2>&1 \
         || log_info "openssl 未安装 — Reality shortId 将由 /dev/urandom 生成"
     if [ -f "${XRAY_BIN}" ]; then
@@ -192,21 +202,6 @@ platform_preflight() {
     log_ok "依赖预检通过"
 }
 
-# 检测端口是否已被占用
-platform_port_in_use() {
-    local _p="$1"
-    if command -v ss >/dev/null 2>&1; then
-        ss -tlnH 2>/dev/null | awk -v p=":${_p}" '$4~p"$"||$4~p" "{f=1}END{exit !f}'; return
-    fi
-    if command -v netstat >/dev/null 2>&1; then
-        netstat -tlnp 2>/dev/null | awk -v p=":${_p}" '$4~p"$"||$4~p" "{f=1}END{exit !f}'; return
-    fi
-    local _h; _h=$(printf '%04X' "${_p}")
-    awk -v h="${_h}" 'NR>1&&substr($2,index($2,":")+1,4)==h{f=1}END{exit !f}' \
-        /proc/net/tcp /proc/net/tcp6 2>/dev/null
-}
-
-# 获取真实 IP（缓存，优先 IPv4，Cloudflare 节点 fallback IPv6）
 platform_get_realip() {
     [ -n "${_G_CACHED_REALIP:-}" ] && { printf '%s' "${_G_CACHED_REALIP}"; return 0; }
     local _ip _org _v6 _result=""
@@ -227,19 +222,6 @@ platform_get_realip() {
     printf '%s' "${_G_CACHED_REALIP}"
 }
 
-# 随机选取空闲端口
-platform_random_port() {
-    local _i=0 _p
-    while true; do
-        _p=$(shuf -i 10000-60000 -n 1 2>/dev/null \
-             || awk 'BEGIN{srand();print int(rand()*50000)+10000}')
-        _i=$(( _i + 1 ))
-        platform_port_in_use "${_p}" || { printf '%s' "${_p}"; return 0; }
-        [ "${_i}" -gt 30 ] && { log_error "无法在 10000-60000 中找到空闲端口"; return 1; }
-    done
-}
-
-# 修正 RHEL 系时间同步
 platform_fix_time_sync() {
     [ -f /etc/redhat-release ] || [ -f /etc/centos-release ] || return 0
     local _pm; command -v dnf >/dev/null 2>&1 && _pm="dnf" || _pm="yum"
@@ -254,7 +236,60 @@ platform_fix_time_sync() {
 check_root() { [ "${EUID:-$(id -u)}" -eq 0 ] || die "请在 root 下运行脚本"; }
 
 # ==============================================================================
-# §L5  State — 读/写/持久化/默认值/初始化
+# §L_PORT  Port Manager — 精确端口检测（唯一入口）
+# ==============================================================================
+# 所有端口占用检查必须经过此模块，禁止在其他地方直接调用 ss/netstat/proc
+
+# 精确检测端口是否被监听（B10 修复：精确匹配，无前缀误报）
+port_mgr_in_use() {
+    local _p="$1"
+    # 方法1：ss 精确匹配（`:PORT ` 或 `:PORT$`）
+    if command -v ss >/dev/null 2>&1; then
+        ss -tlnH 2>/dev/null \
+            | awk -v p="${_p}" \
+                'BEGIN{r=0} {
+                    # 提取第4列地址:端口，精确比较端口部分
+                    split($4, a, ":");
+                    if (a[length(a)] == p) { r=1; exit }
+                } END{exit !r}'
+        return $?
+    fi
+    # 方法2：netstat 精确匹配
+    if command -v netstat >/dev/null 2>&1; then
+        netstat -tlnp 2>/dev/null \
+            | awk -v p="${_p}" \
+                'BEGIN{r=0} {
+                    split($4, a, ":");
+                    if (a[length(a)] == p) { r=1; exit }
+                } END{exit !r}'
+        return $?
+    fi
+    # 方法3：/proc/net/tcp 精确 hex 匹配（B10 修复：hex 精确匹配）
+    local _hex
+    _hex=$(printf '%04X' "${_p}")
+    awk -v h="${_hex}" \
+        'NR>1 {
+            # 第2列格式 local_addr:local_port（hex），精确匹配端口部分
+            n = split($2, a, ":");
+            if (a[n] == h) { found=1; exit }
+        } END{exit !found}' \
+        /proc/net/tcp /proc/net/tcp6 2>/dev/null
+}
+
+# 随机选取空闲端口
+port_mgr_random() {
+    local _i=0 _p
+    while true; do
+        _p=$(shuf -i 10000-60000 -n 1 2>/dev/null \
+             || awk 'BEGIN{srand();print int(rand()*50000)+10000}')
+        _i=$(( _i + 1 ))
+        port_mgr_in_use "${_p}" || { printf '%s' "${_p}"; return 0; }
+        [ "${_i}" -gt 30 ] && { log_error "无法在 10000-60000 中找到空闲端口"; return 1; }
+    done
+}
+
+# ==============================================================================
+# §L5  State — 读/写/持久化（with_lock + atomic_write）
 # ==============================================================================
 _G_STATE=""
 
@@ -271,14 +306,58 @@ readonly _STATE_DEFAULT='{
   "cfport":  "443"
 }'
 
-# 读取 state 字段；字段不存在时返回空字符串
+# ── 原子写入（B4 修复：同 FS tmp → rename）─────────────────────────────────
+# 用法：atomic_write <目标文件> <内容>
+# 所有写文件操作必须经过此函数
+atomic_write() {
+    local _dest="$1" _content="$2"
+    local _dir; _dir=$(dirname "${_dest}")
+    mkdir -p "${_dir}" 2>/dev/null || true
+    local _t; _t=$(tmp_file "aw_XXXXXX") || return 1
+    printf '%s' "${_content}" > "${_t}" || { rm -f "${_t}"; return 1; }
+    mv "${_t}" "${_dest}" || { rm -f "${_t}"; return 1; }
+}
+
+# 原子写入 + 保留 N 份备份（B6 修复：保留 3 份）
+atomic_write_with_backup() {
+    local _dest="$1" _content="$2" _keep="${3:-3}"
+    if [ -f "${_dest}" ]; then
+        local _ts; _ts=$(date +%Y%m%d_%H%M%S 2>/dev/null || printf 'bak')
+        cp -f "${_dest}" "${_dest}.${_ts}.bak" 2>/dev/null || true
+        # 保留最新 _keep 份，删除其余
+        ls -t "${_dest}".*.bak 2>/dev/null \
+            | tail -n "+$(( _keep + 1 ))" \
+            | xargs rm -f 2>/dev/null || true
+    fi
+    atomic_write "${_dest}" "${_content}"
+}
+
+# ── 文件锁（S5 修复：串行化所有 read-modify-write）───────────────────────────
+# 用法：with_lock <函数名> [参数...]
+# 需要 flock（util-linux，Debian/Alpine 均默认安装）
+with_lock() {
+    local _fn="$1"; shift
+    mkdir -p "${WORK_DIR}" 2>/dev/null || true
+    if command -v flock >/dev/null 2>&1; then
+        (
+            flock -x 9 || { log_error "获取文件锁失败"; exit 1; }
+            "${_fn}" "$@"
+        ) 9>"${_LOCK_FILE}"
+    else
+        # flock 不可用时降级（无锁，仅 warn）
+        log_warn "flock 不可用，并发写入无保护"
+        "${_fn}" "$@"
+    fi
+}
+
+# ── State 读/写 ───────────────────────────────────────────────────────────────
+
 st_get() {
     local _v
     _v=$(printf '%s' "${_G_STATE}" | jq -r "${1} // empty" 2>/dev/null) || true
     printf '%s' "${_v}"
 }
 
-# 写入 state 字段；失败返回 1
 st_set() {
     local _f="$1"; shift
     local _n
@@ -288,21 +367,19 @@ st_set() {
         || { log_error "st_set 返回空 JSON"; return 1; }
 }
 
-# 持久化到磁盘（带备份，保留最近 1 份）
-st_persist() {
-    mkdir -p "${WORK_DIR}"
-    if [ -f "${STATE_FILE}" ]; then
-        local _ts; _ts=$(date +%Y%m%d_%H%M%S 2>/dev/null || printf 'bak')
-        cp -f "${STATE_FILE}" "${STATE_FILE}.${_ts}.bak" 2>/dev/null || true
-        ls -t "${STATE_FILE}".*.bak 2>/dev/null | tail -n +2 | xargs rm -f 2>/dev/null || true
-    fi
-    local _t; _t=$(tmp_file "state_XXXXXX.json") || return 1
-    printf '%s\n' "${_G_STATE}" | jq . > "${_t}" \
+# 内部：实际持久化逻辑（由 with_lock 包裹）
+_st_persist_inner() {
+    local _json
+    _json=$(printf '%s\n' "${_G_STATE}" | jq . 2>/dev/null) \
         || { log_error "state 序列化失败"; return 1; }
-    mv "${_t}" "${STATE_FILE}"
+    atomic_write_with_backup "${STATE_FILE}" "${_json}" 3
 }
 
-# 补全旧版 state.json 中缺失的字段（升级兼容）
+# 公开接口：带锁持久化
+st_persist() {
+    with_lock _st_persist_inner
+}
+
 _st_merge_defaults() {
     local _c
 
@@ -326,7 +403,6 @@ _st_merge_defaults() {
     { [ -z "${_c:-}" ] || [ "${_c}" = "null" ]; } && st_set '.xpad.enabled = true'
 }
 
-# 初始化 state（从磁盘加载或使用默认值）
 st_init() {
     if [ -f "${STATE_FILE}" ]; then
         local _raw; _raw=$(cat "${STATE_FILE}" 2>/dev/null || true)
@@ -347,17 +423,15 @@ st_init() {
 }
 
 # ==============================================================================
-# §L6  Firewall — 声明式端口管理
+# §L6  Firewall — 声明式 reconcile（S1/S2 修复）
 # ==============================================================================
 
-# 读取当前由本脚本管理的端口集合
-_fw_read_managed() {
-    grep -E '^[0-9]+$' "${_FW_PORTS_FILE}" 2>/dev/null | sort -un || true
-}
-
-# 根据 state 计算期望开放的端口集合
-_fw_expected_ports() {
+# 根据 state 计算「期望开放」端口集合（S1 修复：加入 argo.port）
+fw_desired_ports() {
     local _out=""
+    # Argo 回源端口（S1 修复：原来遗漏）
+    [ "$(st_get '.argo.enabled')" = "true" ] && \
+        _out="${_out}$(st_get '.argo.port')\n"
     [ "$(st_get '.reality.enabled')" = "true" ] && \
         _out="${_out}$(st_get '.reality.port')\n"
     [ "$(st_get '.vltcp.enabled')" = "true" ] && \
@@ -368,77 +442,139 @@ _fw_expected_ports() {
     printf '%b' "${_out}" | grep -E '^[0-9]+$' | sort -un
 }
 
-# 在防火墙中开放一个端口
+# 读取已管理的端口集合
+_fw_read_managed() {
+    grep -E '^[0-9]+$' "${_FW_PORTS_FILE}" 2>/dev/null | sort -un || true
+}
+
+# 检测 nftables 是否可用（S2 修复）
+_fw_has_nftables() {
+    command -v nft >/dev/null 2>&1 && nft list ruleset >/dev/null 2>&1
+}
+
+# 检测 nftables 是否已有 xray2go 专用 table
+_fw_nft_table_exists() {
+    nft list table inet xray2go >/dev/null 2>&1
+}
+
+_fw_nft_ensure_table() {
+    _fw_nft_table_exists && return 0
+    nft add table inet xray2go 2>/dev/null || return 1
+    nft add chain inet xray2go input '{ type filter hook input priority 0; policy accept; }' \
+        2>/dev/null || return 1
+}
+
+# 开放单个端口（S2 修复：优先 nftables）
 _fw_open_port() {
-    local _port="$1" _proto="${2:-tcp}" _any=0
+    local _port="$1" _proto="${2:-tcp}"
+    local _any=0
+
+    # nftables（优先，S2 修复）
+    if _fw_has_nftables; then
+        _fw_nft_ensure_table 2>/dev/null || true
+        if ! nft list chain inet xray2go input 2>/dev/null \
+             | grep -q "tcp dport ${_port} accept"; then
+            nft add rule inet xray2go input \
+                "${_proto}" dport "${_port}" accept 2>/dev/null && _any=1
+        fi
+    fi
+
+    # ufw
     if command -v ufw >/dev/null 2>&1 && \
        ufw status 2>/dev/null | grep -q '^Status: active'; then
-        if ! ufw status numbered 2>/dev/null | grep -qE "^[[:space:]]*[0-9]+.*${_port}/${_proto}"; then
+        if ! ufw status numbered 2>/dev/null \
+             | grep -qE "^[[:space:]]*[0-9]+.*${_port}/${_proto}"; then
             ufw allow "${_port}/${_proto}" >/dev/null 2>&1 && _any=1
         fi
     fi
+
+    # firewalld
     if command -v firewall-cmd >/dev/null 2>&1 && \
        firewall-cmd --state >/dev/null 2>&1; then
-        if ! firewall-cmd --query-port="${_port}/${_proto}" --permanent >/dev/null 2>&1; then
+        if ! firewall-cmd --query-port="${_port}/${_proto}" \
+             --permanent >/dev/null 2>&1; then
             firewall-cmd --permanent --add-port="${_port}/${_proto}" >/dev/null 2>&1 && \
                 firewall-cmd --reload >/dev/null 2>&1 && _any=1
         fi
     fi
+
+    # iptables
     if command -v iptables >/dev/null 2>&1; then
         iptables -C INPUT -p "${_proto}" --dport "${_port}" -j ACCEPT 2>/dev/null || {
             iptables -I INPUT -p "${_proto}" --dport "${_port}" -j ACCEPT 2>/dev/null
             _any=1
         }
         ip6tables -C INPUT -p "${_proto}" --dport "${_port}" -j ACCEPT 2>/dev/null || {
-            ip6tables -I INPUT -p "${_proto}" --dport "${_port}" -j ACCEPT 2>/dev/null || true
+            ip6tables -I INPUT -p "${_proto}" --dport "${_port}" -j ACCEPT 2>/dev/null \
+                || true
         }
     fi
+
     [ "${_any}" -eq 1 ] \
         && log_ok  "防火墙已开放: ${_port}/${_proto}" \
         || log_info "防火墙端口已存在: ${_port}/${_proto}"
 }
 
-# 在防火墙中关闭一个端口
+# 关闭单个端口（S2 修复：优先 nftables）
 _fw_close_port() {
     local _port="$1" _proto="${2:-tcp}"
+
+    # nftables（S2 修复）
+    if _fw_has_nftables && _fw_nft_table_exists; then
+        # 找到并删除匹配规则的 handle
+        local _handle
+        _handle=$(nft -a list chain inet xray2go input 2>/dev/null \
+            | grep "${_proto} dport ${_port} accept" \
+            | grep -oE 'handle [0-9]+' | awk '{print $2}' | head -1)
+        [ -n "${_handle:-}" ] && \
+            nft delete rule inet xray2go input handle "${_handle}" 2>/dev/null || true
+    fi
+
+    # ufw
     if command -v ufw >/dev/null 2>&1 && \
        ufw status 2>/dev/null | grep -q '^Status: active'; then
         ufw delete allow "${_port}/${_proto}" >/dev/null 2>&1 || true
     fi
+
+    # firewalld
     if command -v firewall-cmd >/dev/null 2>&1 && \
        firewall-cmd --state >/dev/null 2>&1; then
         firewall-cmd --permanent --remove-port="${_port}/${_proto}" >/dev/null 2>&1 && \
             firewall-cmd --reload >/dev/null 2>&1 || true
     fi
+
+    # iptables
     if command -v iptables >/dev/null 2>&1; then
         local _n=0
-        while iptables -C INPUT -p "${_proto}" --dport "${_port}" -j ACCEPT 2>/dev/null; do
-            iptables -D INPUT -p "${_proto}" --dport "${_port}" -j ACCEPT 2>/dev/null || break
+        while iptables -C INPUT -p "${_proto}" --dport "${_port}" \
+              -j ACCEPT 2>/dev/null; do
+            iptables -D INPUT -p "${_proto}" --dport "${_port}" -j ACCEPT 2>/dev/null \
+                || break
             _n=$(( _n + 1 )); [ "${_n}" -gt 20 ] && break
         done
         _n=0
-        while ip6tables -C INPUT -p "${_proto}" --dport "${_port}" -j ACCEPT 2>/dev/null; do
-            ip6tables -D INPUT -p "${_proto}" --dport "${_port}" -j ACCEPT 2>/dev/null || break
+        while ip6tables -C INPUT -p "${_proto}" --dport "${_port}" \
+              -j ACCEPT 2>/dev/null; do
+            ip6tables -D INPUT -p "${_proto}" --dport "${_port}" -j ACCEPT 2>/dev/null \
+                || break
             _n=$(( _n + 1 )); [ "${_n}" -gt 20 ] && break
         done
     fi
     log_info "防火墙已关闭: ${_port}/${_proto}"
 }
 
-# 声明式同步：diff(期望, 已管理) → open/close
-fw_sync() {
+# 声明式 reconcile：diff(期望, 已管理) → open/close
+fw_reconcile() {
     log_step "同步防火墙规则..."
     mkdir -p "${WORK_DIR}"
     local _expected _managed _p
 
-    _expected=$(_fw_expected_ports)
+    _expected=$(fw_desired_ports)
     _managed=$(_fw_read_managed)
 
-    # 关闭不再需要的端口
     for _p in ${_managed}; do
         printf '%s\n' ${_expected} | grep -qx "${_p}" || _fw_close_port "${_p}" tcp
     done
-    # 开放新增端口
     for _p in ${_expected}; do
         _fw_open_port "${_p}" tcp
     done
@@ -450,7 +586,7 @@ fw_sync() {
     fi
 }
 
-# 强制清理所有 xray2go 管理的防火墙规则（卸载时使用）
+# 强制清理所有托管端口（卸载时）
 fw_force_cleanup() {
     log_step "清理 xray2go 托管防火墙规则..."
     local _ports="" _p
@@ -471,16 +607,85 @@ fw_force_cleanup() {
     local _uniq
     _uniq=$(printf '%s\n' ${_ports} | grep -E '^[0-9]+$' | sort -un)
     for _p in ${_uniq}; do _fw_close_port "${_p}" tcp 2>/dev/null || true; done
+
+    # nftables：删除整个 xray2go table
+    if _fw_has_nftables && _fw_nft_table_exists; then
+        nft delete table inet xray2go 2>/dev/null || true
+    fi
+
     rm -f "${_FW_PORTS_FILE}" 2>/dev/null || true
     log_ok "防火墙规则清理完成"
 }
 
 # ==============================================================================
-# §L7  Svc — systemd/OpenRC 统一 Adapter
+# §L_LIFECYCLE  系统变更生命周期（B2/B3/S6 修复）
 # ==============================================================================
+# 所有系统级修改（sysctl / hosts）必须通过此模块
+# 安装时 apply，卸载时 rollback，保证可追踪、可回滚
+
+# 应用 sysctl（B2 修复：写 drop-in 文件，持久化 + 可回滚）
+lifecycle_apply_sysctl() {
+    is_openrc || return 0  # 仅 OpenRC 需要
+    log_step "持久化内核参数..."
+    local _content
+    _content="# xray2go managed - do not edit manually
+net.ipv4.ping_group_range = 0 0
+"
+    atomic_write "${_SYSCTL_FILE}" "${_content}" || {
+        log_warn "sysctl drop-in 写入失败，ping_group_range 可能重启后丢失"
+        return 0
+    }
+    sysctl -p "${_SYSCTL_FILE}" >/dev/null 2>&1 || true
+    log_ok "sysctl 已持久化: ${_SYSCTL_FILE}"
+}
+
+# 回滚 sysctl（S6/B2 修复：卸载时删除）
+lifecycle_rollback_sysctl() {
+    [ -f "${_SYSCTL_FILE}" ] || return 0
+    rm -f "${_SYSCTL_FILE}" 2>/dev/null || true
+    log_info "sysctl drop-in 已清除: ${_SYSCTL_FILE}"
+}
+
+# 应用 /etc/hosts 补丁（B3 修复：先备份，再精确修改）
+lifecycle_apply_hosts_patch() {
+    is_openrc || return 0  # 仅 OpenRC 需要
+    # 备份（幂等：若备份已存在则跳过）
+    [ -f "${_HOSTS_BAK}" ] || cp -f /etc/hosts "${_HOSTS_BAK}" 2>/dev/null || {
+        log_warn "/etc/hosts 备份失败，跳过 hosts 修补"
+        return 0
+    }
+    log_step "修补 /etc/hosts..."
+    sed -i '1s/.*/127.0.0.1   localhost/' /etc/hosts 2>/dev/null || true
+    sed -i '2s/.*/::1         localhost/'  /etc/hosts 2>/dev/null || true
+    log_ok "/etc/hosts 已修补（备份: ${_HOSTS_BAK}）"
+}
+
+# 回滚 /etc/hosts（S6/B3 修复：卸载时从备份恢复）
+lifecycle_rollback_hosts() {
+    [ -f "${_HOSTS_BAK}" ] || return 0
+    cp -f "${_HOSTS_BAK}" /etc/hosts 2>/dev/null && {
+        rm -f "${_HOSTS_BAK}" 2>/dev/null || true
+        log_ok "/etc/hosts 已从备份恢复"
+    } || log_warn "/etc/hosts 恢复失败，请手动恢复: ${_HOSTS_BAK}"
+}
+
+# 清理 cloudflared 用户目录（S6 修复）
+lifecycle_cleanup_cloudflared() {
+    local _cf_dir="${HOME}/.cloudflared"
+    [ -d "${_cf_dir}" ] && {
+        rm -rf "${_cf_dir}" 2>/dev/null || true
+        log_info "已清理 cloudflared 用户目录: ${_cf_dir}"
+    } || true
+}
+
+# ==============================================================================
+# §L7  Svc — systemd/OpenRC 统一 Adapter（S7 修复）
+# ==============================================================================
+# 所有 systemd/OpenRC 差异封装在此层，调用方零感知
+# _svc_write_file 返回值语义：始终 return 0；通过 _G_SYSD_DIRTY 标记变更
+
 _G_SYSD_DIRTY=0
 
-# 统一服务操作（enable/disable/start/stop/restart/status）
 svc_exec() {
     local _act="$1" _name="$2" _rc=0
     if is_systemd; then
@@ -501,19 +706,21 @@ svc_exec() {
     return "${_rc}"
 }
 
-# 仅 systemd 需要的 daemon-reload（脏标记优化）
 svc_reload_daemon() {
     is_systemd && [ "${_G_SYSD_DIRTY}" -eq 1 ] || return 0
     systemctl daemon-reload >/dev/null 2>&1 || true
     _G_SYSD_DIRTY=0
 }
 
-# 写入服务文件（幂等，内容不变则跳过；内容变更则标记 dirty）
+# S7 修复：函数始终 return 0；内容变更时显式设置 _G_SYSD_DIRTY=1
 _svc_write_file() {
     local _dest="$1" _content="$2"
     local _cur; _cur=$(cat "${_dest}" 2>/dev/null || printf '')
-    [ "${_cur}" = "${_content}" ] && return 0
-    printf '%s' "${_content}" > "${_dest}"; return 1
+    if [ "${_cur}" != "${_content}" ]; then
+        atomic_write "${_dest}" "${_content}" || return 0  # 写失败不致命
+        is_systemd && _G_SYSD_DIRTY=1
+    fi
+    return 0  # 始终成功，变更状态由 _G_SYSD_DIRTY 表达
 }
 
 # ── 服务单元模板 ──────────────────────────────────────────────────────────────
@@ -523,9 +730,11 @@ _svc_tpl_xray_systemd() {
         "${XRAY_BIN}" "${CONFIG_FILE}"
 }
 
+# systemd tunnel：ExecStart 直接用数组参数，不做 shell 拼接
 _svc_tpl_tunnel_systemd() {
+    local _cmd="$1"
     printf '[Unit]\nDescription=Cloudflare Tunnel2go\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nNoNewPrivileges=yes\nTimeoutStartSec=0\nExecStart=%s\nRestart=on-failure\nRestartSec=5\nStandardOutput=null\nStandardError=null\n\n[Install]\nWantedBy=multi-user.target\n' \
-        "$1"
+        "${_cmd}"
 }
 
 _svc_tpl_xray_openrc() {
@@ -533,35 +742,65 @@ _svc_tpl_xray_openrc() {
         "${XRAY_BIN}" "${CONFIG_FILE}"
 }
 
-_svc_tpl_tunnel_openrc() {
-    printf '#!/sbin/openrc-run\ndescription="Cloudflare Tunnel2go"\ncommand="/bin/sh"\ncommand_args="-c '"'"'%s >/dev/null 2>&1'"'"'"\ncommand_background=true\npidfile="/var/run/tunnel2go.pid"\n' \
-        "$1"
+# B1 修复：OpenRC tunnel 改用 EnvironmentFile 传参，不再 shell 拼接 token
+# token 写入独立 env file，避免单引号注入
+_svc_tpl_tunnel_openrc_with_envfile() {
+    # $1 = cloudflared 二进制路径
+    # token 从 _ARGO_ENV_FILE 中以 ARGO_TOKEN= 形式读取
+    printf '#!/sbin/openrc-run\ndescription="Cloudflare Tunnel2go"\ndepend() {\n    need net\n}\nstart() {\n    . %s\n    if [ -f "%s" ]; then\n        ebegin "Starting tunnel2go (config)"\n        start-stop-daemon --start --background \\\n            --make-pidfile --pidfile /var/run/tunnel2go.pid \\\n            --exec %s -- tunnel --no-autoupdate run --config %s\n        eend $?\n    else\n        ebegin "Starting tunnel2go (token)"\n        start-stop-daemon --start --background \\\n            --make-pidfile --pidfile /var/run/tunnel2go.pid \\\n            --exec %s -- tunnel --no-autoupdate run --token "${ARGO_TOKEN}"\n        eend $?\n    fi\n}\nstop() {\n    start-stop-daemon --stop --pidfile /var/run/tunnel2go.pid\n}\n' \
+        "${_ARGO_ENV_FILE}" \
+        "${WORK_DIR}/tunnel.yml" \
+        "${ARGO_BIN}" \
+        "${WORK_DIR}/tunnel.yml" \
+        "${ARGO_BIN}"
 }
 
-# 应用 xray 服务单元
+# systemd tunnel：根据模式生成正确的 ExecStart（参数列表，非拼接字符串）
+_svc_tpl_tunnel_systemd_with_envfile() {
+    if [ -f "${WORK_DIR}/tunnel.yml" ]; then
+        _svc_tpl_tunnel_systemd \
+            "${ARGO_BIN} tunnel --no-autoupdate run --config ${WORK_DIR}/tunnel.yml"
+    else
+        # systemd 支持 EnvironmentFile，token 不出现在 ExecStart 中
+        printf '[Unit]\nDescription=Cloudflare Tunnel2go\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nNoNewPrivileges=yes\nTimeoutStartSec=0\nEnvironmentFile=%s\nExecStart=%s tunnel --no-autoupdate run --token ${ARGO_TOKEN}\nRestart=on-failure\nRestartSec=5\nStandardOutput=null\nStandardError=null\n\n[Install]\nWantedBy=multi-user.target\n' \
+            "${_ARGO_ENV_FILE}" \
+            "${ARGO_BIN}"
+    fi
+}
+
+# 写入 argo env file（B1 修复核心：token 存文件，不拼 shell）
+_svc_write_argo_env() {
+    local _token; _token=$(st_get '.argo.token')
+    # 即使 token 为 null 也写文件（tunnel.yml 模式下不使用 ARGO_TOKEN）
+    local _content="ARGO_TOKEN=${_token:-}\n"
+    atomic_write "${_ARGO_ENV_FILE}" "$(printf '%b' "${_content}")"
+    chmod 600 "${_ARGO_ENV_FILE}" 2>/dev/null || true
+}
+
 svc_apply_xray() {
     if is_systemd; then
         _svc_write_file "/etc/systemd/system/${_SVC_XRAY}.service" \
-            "$(_svc_tpl_xray_systemd)" || _G_SYSD_DIRTY=1
+            "$(_svc_tpl_xray_systemd)"
     else
         local _f="/etc/init.d/${_SVC_XRAY}"
-        _svc_write_file "${_f}" "$(_svc_tpl_xray_openrc)" || chmod +x "${_f}"
+        _svc_write_file "${_f}" "$(_svc_tpl_xray_openrc)"
+        chmod +x "${_f}" 2>/dev/null || true
     fi
 }
 
-# 应用 tunnel 服务单元
 svc_apply_tunnel() {
-    local _cmd; _cmd=$(argo_build_tunnel_cmd)
+    # B1 修复：先写 env file，再写服务单元
+    _svc_write_argo_env
     if is_systemd; then
         _svc_write_file "/etc/systemd/system/${_SVC_TUNNEL}.service" \
-            "$(_svc_tpl_tunnel_systemd "${_cmd}")" || _G_SYSD_DIRTY=1
+            "$(_svc_tpl_tunnel_systemd_with_envfile)"
     else
         local _f="/etc/init.d/${_SVC_TUNNEL}"
-        _svc_write_file "${_f}" "$(_svc_tpl_tunnel_openrc "${_cmd}")" || chmod +x "${_f}"
+        _svc_write_file "${_f}" "$(_svc_tpl_tunnel_openrc_with_envfile)"
+        chmod +x "${_f}" 2>/dev/null || true
     fi
 }
 
-# 重启 xray 并验证健康
 svc_restart_xray() {
     [ -f "${CONFIG_FILE}" ] || { log_error "配置文件不存在，请先完成安装"; return 1; }
     svc_exec restart "${_SVC_XRAY}" \
@@ -569,7 +808,6 @@ svc_restart_xray() {
         || { log_error "${_SVC_XRAY} 重启失败"; return 1; }
 }
 
-# 验证服务是否在 N 秒内就绪
 svc_verify_health() {
     local _svc="${1:-${_SVC_XRAY}}" _max="${2:-8}"
     log_step "验证服务 ${_svc} 就绪（最长 ${_max}s）..."
@@ -593,7 +831,7 @@ svc_verify_health() {
 }
 
 # ==============================================================================
-# §L8  Crypto — UUID、x25519 密钥对、shortId
+# §L8  Crypto — UUID、x25519、shortId
 # ==============================================================================
 
 crypto_gen_uuid() {
@@ -604,7 +842,6 @@ crypto_gen_uuid() {
         substr("89ab",int(rand()*4)+1,1),substr(h,18,3),substr(h,21,12)}'
 }
 
-# 生成 x25519 密钥对并写入 state
 crypto_gen_reality_keypair() {
     [ -x "${XRAY_BIN}" ] || { log_error "xray 未就绪，无法生成密钥对"; return 1; }
     local _out _rc
@@ -636,10 +873,8 @@ crypto_gen_reality_sid() {
 # §L9  Protocol — 注册表 + 构建器
 # ==============================================================================
 # 命名规则：
-#   proto_inbound_<name>  → 输出单个 inbound JSON 对象（或空）
-#   proto_link_<name>     → 输出节点链接字符串（或空）
-#
-# xPadding 辅助：根据 state 返回 jq 对象 或 URL 编码查询串
+#   proto_inbound_<n>  → 输出单个 inbound JSON 对象（或空）
+#   proto_link_<n>     → 输出节点链接字符串（或空）
 
 _xpad_obj() {
     if [ "$(st_get '.xpad.enabled')" = "true" ]; then
@@ -865,7 +1100,9 @@ proto_link_vltcp() {
     _listen=$(st_get '.vltcp.listen'); _uuid=$(st_get '.uuid')
     [ "${_listen}" = "0.0.0.0" ] || [ "${_listen}" = "::" ] \
         && _vhost=$(platform_get_realip) || _vhost="${_listen}"
-    if [ -z "${_vhost:-}" ]; then log_warn "无法获取服务器 IP，VLESS-TCP 节点已跳过"; return 0; fi
+    if [ -z "${_vhost:-}" ]; then
+        log_warn "无法获取服务器 IP，VLESS-TCP 节点已跳过"; return 0
+    fi
     printf 'vless://%s@%s:%s?type=tcp&security=none#VLESS-TCP\n' \
         "${_uuid}" "${_vhost}" "$(st_get '.vltcp.port')"
 }
@@ -873,29 +1110,43 @@ proto_link_vltcp() {
 # ── 注册表遍历 ────────────────────────────────────────────────────────────────
 
 # 遍历注册表，收集所有 inbound，返回 JSON 数组
+# B8 修复：_used_keys 改用换行分隔，前置空检查，精确 grep -xF 匹配
 proto_build_inbounds() {
-    local _ibs="[]" _ib _name _used_keys=""
+    local _ibs="[]" _ib _name
+    local _used_keys=""   # 换行分隔的 "listen:port" 集合
+
     for _name in "${_PROTO_REGISTRY[@]}"; do
         _ib=$(proto_inbound_${_name}) \
             || { log_error "协议配置生成失败 (${_name})"; return 1; }
         [ -n "${_ib:-}" ] || continue
+
         local _p _l _key
         _p=$(printf '%s' "${_ib}" | jq -r '.port // empty')
         _l=$(printf '%s' "${_ib}" | jq -r '.listen // "0.0.0.0"')
         _key="${_l}:${_p}"
-        if printf '%s\n' ${_used_keys} | grep -qxF "${_key}"; then
+
+        # B8 修复：空检查 + 换行分隔精确匹配
+        if [ -n "${_used_keys:-}" ] && \
+           printf '%s\n' "${_used_keys}" | grep -qxF "${_key}"; then
             log_error "端口冲突: ${_key} 已被占用，跳过 [${_name}]"
             log_error "  请在对应管理菜单中修改端口后重新应用配置"
             continue
         fi
-        _used_keys="${_used_keys} ${_key}"
+        # 追加换行分隔（不用空格）
+        if [ -z "${_used_keys:-}" ]; then
+            _used_keys="${_key}"
+        else
+            _used_keys="${_used_keys}
+${_key}"
+        fi
+
         _ibs=$(printf '%s' "${_ibs}" | jq --argjson ib "${_ib}" '. + [$ib]') \
             || { log_error "inbounds 组装失败 (${_name})"; return 1; }
     done
     printf '%s' "${_ibs}"
 }
 
-# 遍历注册表，打印所有节点链接
+# 遍历注册表，输出所有节点链接
 proto_print_links() {
     local _name
     for _name in "${_PROTO_REGISTRY[@]}"; do
@@ -904,10 +1155,9 @@ proto_print_links() {
 }
 
 # ==============================================================================
-# §L10 Config — 配置合成 + 原子提交
+# §L10 Config — 配置合成 + 原子提交（with_lock）
 # ==============================================================================
 
-# 合成完整 xray config.json
 config_synthesize() {
     local _ibs
     _ibs=$(proto_build_inbounds) || return 1
@@ -927,8 +1177,8 @@ config_synthesize() {
     }' || { log_error "config JSON 合成失败"; return 1; }
 }
 
-# 原子提交：合成 → 验证 → 备份 → 写入 → 重启（如服务在运行）
-config_apply() {
+# 内部：实际 config 写入逻辑（由 with_lock 包裹）
+_config_apply_inner() {
     local _t; _t=$(tmp_file "xray_next_XXXXXX.json") || return 1
     log_step "合成配置..."
     config_synthesize > "${_t}" || return 1
@@ -941,17 +1191,18 @@ config_apply() {
             return 1
         fi
         log_ok "config 验证通过"
+        # B7 修复：验证成功后清理上次失败现场
+        rm -f "${WORK_DIR}/config_failed.json" 2>/dev/null || true
     else
         log_warn "xray 未就绪，跳过预检（安装阶段正常）"
     fi
 
-    mkdir -p "${WORK_DIR}"
-    if [ -f "${CONFIG_FILE}" ]; then
-        local _ts; _ts=$(date +%Y%m%d_%H%M%S 2>/dev/null || printf 'bak')
-        cp -f "${CONFIG_FILE}" "${CONFIG_FILE}.${_ts}.bak" 2>/dev/null || true
-        ls -t "${CONFIG_FILE}".*.bak 2>/dev/null | tail -n +2 | xargs rm -f 2>/dev/null || true
-    fi
-    mv "${_t}" "${CONFIG_FILE}" || { log_error "config 写入失败"; return 1; }
+    # B4/B6 修复：atomic_write_with_backup 保证原子写 + 保留 3 份备份
+    local _json; _json=$(cat "${_t}")
+    atomic_write_with_backup "${CONFIG_FILE}" "${_json}" 3 || {
+        log_error "config 写入失败"; return 1
+    }
+    rm -f "${_t}" 2>/dev/null || true
     log_ok "config.json 已原子更新"
 
     if svc_exec status "${_SVC_XRAY}" >/dev/null 2>&1; then
@@ -960,7 +1211,12 @@ config_apply() {
     fi
 }
 
-# 展示所有节点链接
+# 公开接口：带锁的配置提交
+config_apply() {
+    with_lock _config_apply_inner
+}
+
+# 展示节点链接（B5 修复：使用 _print_link 安全输出）
 config_print_nodes() {
     local _links
     _links=$(proto_print_links)
@@ -969,21 +1225,22 @@ config_print_nodes() {
         log_warn "暂无可用节点（请检查 Argo 域名或服务器 IP）"; return 1
     fi
     echo ""
+    # B5 修复：_print_link 格式串固定为 '%s%s%s\n'，颜色作参数，不拼入格式串
     printf '%s\n' "${_links}" | while IFS= read -r _l; do
-        [ -n "${_l:-}" ] && printf "${C_CYN}%s${C_RST}\n" "${_l}"
+        _print_link "${_l}"
     done
     echo ""
 }
 
-# 组合提交：config_apply + st_persist + fw_sync（高频操作封装）
+# 组合提交：config_apply + st_persist + fw_reconcile（高频操作封装）
 _commit() {
     config_apply  || return 1
     st_persist    || log_warn "state.json 写入失败"
-    fw_sync
+    fw_reconcile
 }
 
 # ==============================================================================
-# §L11 Download — xray / cloudflared 下载
+# §L11 Download — 统一下载 + 校验 + 重试（S3/S4/S8 修复）
 # ==============================================================================
 
 _xray_health_check() {
@@ -1002,10 +1259,17 @@ _xray_health_check() {
     return 0
 }
 
+# S3 修复：加 1 次重试
 _xray_latest_tag() {
-    curl -sfL --max-time 10 \
-        "https://api.github.com/repos/XTLS/Xray-core/releases/latest" \
-        2>/dev/null | jq -r '.tag_name // empty' 2>/dev/null || true
+    local _tag _i
+    for _i in 1 2; do
+        _tag=$(curl -sfL --max-time 10 \
+            "https://api.github.com/repos/XTLS/Xray-core/releases/latest" \
+            2>/dev/null | jq -r '.tag_name // empty' 2>/dev/null) || true
+        [ -n "${_tag:-}" ] && { printf '%s' "${_tag}"; return 0; }
+        [ "${_i}" -lt 2 ] && sleep 2
+    done
+    return 1
 }
 
 _xray_download_with_fallback() {
@@ -1039,7 +1303,7 @@ download_xray() {
     log_info "xray 健康检查未通过，重新下载..."
     rm -f "${XRAY_BIN}" 2>/dev/null || true
 
-    local _tag; _tag=$(_xray_latest_tag)
+    local _tag; _tag=$(_xray_latest_tag) || true
     [ -z "${_tag:-}" ] && { log_warn "无法获取版本号，使用 latest"; _tag="latest"; }
 
     local _zip_name="Xray-linux-${_G_ARCH_XRAY}.zip"
@@ -1078,6 +1342,7 @@ download_xray() {
     log_ok "Xray 安装完成 ($("${XRAY_BIN}" version 2>/dev/null | head -1 | awk '{print $2}'))"
 }
 
+# S8 修复：加文件大小下限校验
 download_cloudflared() {
     platform_detect_arch
     if [ -f "${ARGO_BIN}" ] && [ -x "${ARGO_BIN}" ]; then
@@ -1090,60 +1355,74 @@ download_cloudflared() {
     local _rc=$?
     [ "${_rc}" -ne 0 ] && { rm -f "${ARGO_BIN}"; log_error "cloudflared 下载失败"; return 1; }
     [ -s "${ARGO_BIN}" ] || { rm -f "${ARGO_BIN}"; log_error "cloudflared 文件为空"; return 1; }
+    # S8 修复：文件大小下限校验（cloudflared 正常二进制 > 10MB）
+    local _size
+    _size=$(wc -c < "${ARGO_BIN}" 2>/dev/null || printf '0')
+    if [ "${_size}" -lt 5000000 ]; then
+        log_error "cloudflared 文件大小异常 (${_size} bytes < 5MB)，可能下载不完整或被替换"
+        rm -f "${ARGO_BIN}"; return 1
+    fi
     chmod +x "${ARGO_BIN}"
+    # 验证可执行性
+    "${ARGO_BIN}" --version >/dev/null 2>&1 \
+        || { log_warn "cloudflared --version 验证失败，但文件已保留（可能是架构不匹配）"; }
     log_ok "cloudflared 下载完成"
 }
 
 # ==============================================================================
-# §L12 Install — 安装 / 卸载 / 辅助
+# §L12 Install — 安装 / 卸载（含 lifecycle 调用）
 # ==============================================================================
 
-# 检测系统中是否存在独立的 xray 实例（非 xray2go 管理的）
+# B9 修复：补充 rc-service xray status 检测
 _install_detect_existing_xray() {
     if command -v systemctl >/dev/null 2>&1; then
         systemctl list-unit-files 2>/dev/null \
             | grep -qiE '^xray[^2]' && return 0
     fi
     [ -f /etc/init.d/xray ] && return 0
+    # B9 修复：OpenRC 运行状态检测
+    command -v rc-service >/dev/null 2>&1 && \
+        rc-service xray status >/dev/null 2>&1 && return 0
+    # OpenRC 注册检测
+    command -v rc-update >/dev/null 2>&1 && \
+        rc-update show 2>/dev/null | grep -q '\bxray\b' && return 0
     local _wx; _wx=$(command -v xray 2>/dev/null || true)
     [ -n "${_wx:-}" ] && [ "${_wx}" != "${XRAY_BIN}" ] && return 0
     pgrep -x xray >/dev/null 2>&1 && return 0
     return 1
 }
 
-# 检查并自动解决端口冲突
 _install_check_port_conflicts() {
     log_step "检测端口冲突..."
-    local _path _cur _new
-
-    # 检查各协议的独立端口
-    local _chk_paths=( '.argo.port:.argo.enabled' '.reality.port:.reality.enabled' '.vltcp.port:.vltcp.enabled' )
-    for _entry in "${_chk_paths[@]}"; do
+    local _chk_entries=(
+        '.argo.port:.argo.enabled'
+        '.reality.port:.reality.enabled'
+        '.vltcp.port:.vltcp.enabled'
+    )
+    for _entry in "${_chk_entries[@]}"; do
         local _port_path="${_entry%%:*}" _flag_path="${_entry##*:}"
         [ "$(st_get "${_flag_path}")" = "true" ] || continue
-        _cur=$(st_get "${_port_path}")
-        if platform_port_in_use "${_cur}"; then
-            _new=$(platform_random_port) || return 1
+        local _cur; _cur=$(st_get "${_port_path}")
+        if port_mgr_in_use "${_cur}"; then
+            local _new; _new=$(port_mgr_random) || return 1
             st_set "${_port_path} = (\$p|tonumber)" --arg p "${_new}" || return 1
             log_ok "端口 ${_cur} 已占用，自动分配: ${_new}"
         fi
     done
-
     if [ "$(st_get '.ff.enabled')" = "true" ] && \
        [ "$(st_get '.ff.protocol')" != "none" ] && \
-       platform_port_in_use 8080; then
+       port_mgr_in_use 8080; then
         log_warn "FreeFlow 端口 8080 已被占用（固定端口），安装后该协议可能无法正常使用"
     fi
     return 0
 }
 
-# 安装失败时回滚新建文件
 _install_rollback() {
     local _xray_was="${1:-0}" _argo_was="${2:-0}"
     log_warn "安装中断，回滚本次新建文件..."
     [ "${_xray_was}" -eq 0 ] && rm -f "${XRAY_BIN}" 2>/dev/null || true
     [ "${_argo_was}" -eq 0 ] && rm -f "${ARGO_BIN}" 2>/dev/null || true
-    rm -f "${CONFIG_FILE}" 2>/dev/null || true
+    rm -f "${CONFIG_FILE}" "${_ARGO_ENV_FILE}" 2>/dev/null || true
     if is_systemd; then
         rm -f /etc/systemd/system/${_SVC_XRAY}.service   2>/dev/null || true
         rm -f /etc/systemd/system/${_SVC_TUNNEL}.service 2>/dev/null || true
@@ -1152,6 +1431,9 @@ _install_rollback() {
         rm -f /etc/init.d/${_SVC_XRAY}   2>/dev/null || true
         rm -f /etc/init.d/${_SVC_TUNNEL} 2>/dev/null || true
     fi
+    # lifecycle 回滚
+    lifecycle_rollback_sysctl
+    lifecycle_rollback_hosts
 }
 
 exec_install() {
@@ -1193,14 +1475,14 @@ exec_install() {
     [ "$(st_get '.argo.enabled')" = "true" ] && svc_apply_tunnel
     svc_reload_daemon
 
+    # B2/B3 修复：通过 lifecycle 模块处理系统变更（持久化 + 可回滚）
     is_openrc && {
-        printf '0 0\n' > /proc/sys/net/ipv4/ping_group_range 2>/dev/null || true
-        sed -i '1s/.*/127.0.0.1   localhost/' /etc/hosts 2>/dev/null || true
-        sed -i '2s/.*/::1         localhost/'  /etc/hosts 2>/dev/null || true
+        lifecycle_apply_sysctl
+        lifecycle_apply_hosts_patch
     }
 
     platform_fix_time_sync
-    fw_sync
+    fw_reconcile
 
     log_step "启动服务..."
     svc_exec enable "${_SVC_XRAY}"
@@ -1221,14 +1503,28 @@ exec_install() {
         log_ok "${_SVC_TUNNEL} 已启动"
     fi
 
-    # 网络性能调优
+    # S4 修复：网络调优脚本先 bash -n 语法检查再执行
     log_step "网络性能调优"
     printf "是否立即运行 Eric86777 的网络调优脚本？(推荐 Y) [Y/n]: "
     read -r _tune_choice </dev/tty
     case "${_tune_choice:-y}" in
         [yY])
-            log_info "下载并执行 net-tcp-tune.sh ..."
-            bash <(curl -fsSL "https://raw.githubusercontent.com/Eric86777/vps-tcp-tune/main/net-tcp-tune.sh?$(date +%s)")
+            log_info "下载并校验 net-tcp-tune.sh ..."
+            local _tune_t; _tune_t=$(tmp_file "tune_XXXXXX.sh") || true
+            if [ -n "${_tune_t:-}" ] && \
+               curl -fsSL --max-time 30 \
+                   "https://raw.githubusercontent.com/Eric86777/vps-tcp-tune/main/net-tcp-tune.sh?$(date +%s)" \
+                   -o "${_tune_t}" 2>/dev/null; then
+                # S4 修复：语法检查
+                if bash -n "${_tune_t}" 2>/dev/null; then
+                    bash "${_tune_t}"
+                else
+                    log_warn "调优脚本语法检查失败，已跳过"
+                fi
+                rm -f "${_tune_t}" 2>/dev/null || true
+            else
+                log_warn "调优脚本下载失败，已跳过"
+            fi
             ;;
         *)
             log_info "已跳过网络调优，可后续手动执行"
@@ -1260,6 +1556,11 @@ exec_uninstall() {
         rm -f /etc/init.d/${_SVC_XRAY}   2>/dev/null || true
         rm -f /etc/init.d/${_SVC_TUNNEL} 2>/dev/null || true
     fi
+
+    # S6/B2/B3 修复：完整 lifecycle 回滚
+    lifecycle_rollback_sysctl
+    lifecycle_rollback_hosts
+    lifecycle_cleanup_cloudflared
 
     if [ -d "${WORK_DIR}" ]; then
         rm -rf "${WORK_DIR}" 2>/dev/null || true
@@ -1303,37 +1604,28 @@ exec_update_uuid() {
 # §L13 Argo — 隧道配置 / 健康检查
 # ==============================================================================
 
-# 构建 cloudflared 启动命令
+# 构建 cloudflared 启动命令（仅 systemd config 模式使用明文路径，token 走 env file）
 argo_build_tunnel_cmd() {
     if [ -f "${WORK_DIR}/tunnel.yml" ]; then
         printf '%s tunnel --no-autoupdate run --config %s' \
             "${ARGO_BIN}" "${WORK_DIR}/tunnel.yml"
     else
-        printf '%s tunnel --no-autoupdate run --token %s' \
-            "${ARGO_BIN}" "$(st_get '.argo.token')"
+        # token 模式：命令中不包含 token 明文，由 EnvironmentFile 注入
+        printf '%s tunnel --no-autoupdate run --token ${ARGO_TOKEN}' "${ARGO_BIN}"
     fi
 }
 
-# 生成 tunnel.yml（JSON 凭证模式）
 _argo_gen_config_yml() {
     local _domain="$1" _tid="$2" _cred="$3"
     local _port; _port=$(st_get '.argo.port')
-    {
-        printf 'tunnel: %s\n'                  "${_tid}"
-        printf 'credentials-file: %s\n'        "${_cred}"
-        printf '\n'
-        printf 'ingress:\n'
-        printf '  - hostname: %s\n'             "${_domain}"
-        printf '    service: http://localhost:%s\n' "${_port}"
-        printf '    originRequest:\n'
-        printf '      connectTimeout: 30s\n'
-        printf '      noTLSVerify: true\n'
-        printf '  - service: http_status:404\n'
-    } > "${WORK_DIR}/tunnel.yml" || { log_error "tunnel.yml 写入失败"; return 1; }
+    local _content
+    _content=$(printf 'tunnel: %s\ncredentials-file: %s\n\ningress:\n  - hostname: %s\n    service: http://localhost:%s\n    originRequest:\n      connectTimeout: 30s\n      noTLSVerify: true\n  - service: http_status:404\n' \
+        "${_tid}" "${_cred}" "${_domain}" "${_port}")
+    atomic_write "${WORK_DIR}/tunnel.yml" "${_content}" \
+        || { log_error "tunnel.yml 写入失败"; return 1; }
     log_ok "tunnel.yml 已生成 (${_domain} → localhost:${_port})"
 }
 
-# 若 tunnel.yml 存在，用最新 state 中的端口同步重生成
 _argo_regen_tunnel_yml() {
     [ -f "${WORK_DIR}/tunnel.yml" ] || return 0
     local _domain _tid
@@ -1346,7 +1638,6 @@ _argo_regen_tunnel_yml() {
         || log_warn "tunnel.yml 端口同步跳过：缺少 domain/tid"
 }
 
-# 配置固定隧道（交互式，支持 token 和 JSON 凭证两种模式）
 argo_apply_fixed_tunnel() {
     log_info "固定隧道 — 协议: $(st_get '.argo.protocol')  回源端口: $(st_get '.argo.port')"
     local _domain _auth
@@ -1360,7 +1651,6 @@ argo_apply_fixed_tunnel() {
     [ -z "${_auth:-}" ] && { log_error "密钥不能为空"; return 1; }
 
     if printf '%s' "${_auth}" | grep -q "TunnelSecret"; then
-        # JSON 凭证模式
         printf '%s' "${_auth}" | jq . >/dev/null 2>&1 \
             || { log_error "JSON 凭证格式不合法"; return 1; }
         local _tid
@@ -1372,12 +1662,11 @@ argo_apply_fixed_tunnel() {
         case "${_tid}" in *$'\n'*|*'"'*|*"'"*|*':'*)
             log_error "TunnelID 含非法字符，拒绝写入"; return 1;; esac
         local _cred="${WORK_DIR}/tunnel.json"
-        printf '%s' "${_auth}" > "${_cred}"
+        atomic_write "${_cred}" "${_auth}" || { log_error "凭证写入失败"; return 1; }
         _argo_gen_config_yml "${_domain}" "${_tid}" "${_cred}" || return 1
         st_set '.argo.token = null | .argo.domain = $d | .argo.mode = "fixed"' \
             --arg d "${_domain}" || return 1
     elif printf '%s' "${_auth}" | grep -qE '^[A-Za-z0-9=_-]{120,250}$'; then
-        # Token 模式
         st_set '.argo.token = $t | .argo.domain = $d | .argo.mode = "fixed"' \
             --arg t "${_auth}" --arg d "${_domain}" || return 1
         rm -f "${WORK_DIR}/tunnel.yml" "${WORK_DIR}/tunnel.json"
@@ -1385,6 +1674,9 @@ argo_apply_fixed_tunnel() {
         log_error "密钥格式无法识别（JSON 需含 TunnelSecret；Token 为 120-250 位字母数字串）"
         return 1
     fi
+
+    # B1 修复：更新 env file
+    _svc_write_argo_env
 
     svc_apply_tunnel
     svc_reload_daemon
@@ -1396,7 +1688,6 @@ argo_apply_fixed_tunnel() {
     argo_check_health || true
 }
 
-# Argo 隧道连通性健康检查
 argo_check_health() {
     local _domain; _domain=$(st_get '.argo.domain')
     [ -n "${_domain:-}" ] && [ "${_domain}" != "null" ] || return 0
@@ -1418,7 +1709,6 @@ argo_check_health() {
     return 1
 }
 
-# 更新 Argo 回源端口
 exec_update_argo_port() {
     local _p; _p=$(_menu_input_port '.argo.port') || return 1
     _argo_regen_tunnel_yml
@@ -1426,7 +1716,7 @@ exec_update_argo_port() {
     svc_apply_tunnel; svc_reload_daemon
     svc_exec restart "${_SVC_TUNNEL}" || log_warn "tunnel 重启失败，请手动重启"
     st_persist || log_warn "state.json 写入失败"
-    fw_sync
+    fw_reconcile
     log_ok "回源端口已更新: ${_p}"; config_print_nodes
 }
 
@@ -1434,7 +1724,7 @@ exec_update_argo_port() {
 # §L14 Menu — 安装向导 + 管理子菜单 + 主菜单
 # ==============================================================================
 
-# ── 安装向导 ask_* ────────────────────────────────────────────────────────────
+# ── 安装向导 ──────────────────────────────────────────────────────────────────
 
 ask_argo_mode() {
     echo ""; log_title "Argo 固定隧道"
@@ -1484,7 +1774,7 @@ ask_freeflow_mode() {
         *) st_set '.ff.enabled = false | .ff.protocol = "none"'
            log_info "不启用 FreeFlow"; echo ""; return 0;;
     esac
-    platform_port_in_use 8080 && log_warn "端口 8080 已被占用，FreeFlow 可能无法启动"
+    port_mgr_in_use 8080 && log_warn "端口 8080 已被占用，FreeFlow 可能无法启动"
     local _p; prompt "FreeFlow path（回车默认 /）: " _p
     case "${_p:-/}" in /*) :;; *) _p="/${_p}";; esac
     st_set '.ff.path = $p' --arg p "${_p:-/}"
@@ -1511,7 +1801,7 @@ ask_reality_mode() {
                else log_warn "端口超范围，使用默认值 ${_dp}"; fi;;
         esac
     fi
-    platform_port_in_use "$(st_get '.reality.port')" && \
+    port_mgr_in_use "$(st_get '.reality.port')" && \
         log_warn "端口 $(st_get '.reality.port') 已被占用，安装时将自动更换"
 
     local _ds; _ds=$(st_get '.reality.sni')
@@ -1555,7 +1845,7 @@ ask_vltcp_mode() {
                else log_warn "端口超范围，使用默认值 ${_dp}"; fi;;
         esac
     fi
-    platform_port_in_use "$(st_get '.vltcp.port')" && \
+    port_mgr_in_use "$(st_get '.vltcp.port')" && \
         log_warn "端口 $(st_get '.vltcp.port') 已被占用，安装时将自动更换"
 
     local _dl; _dl=$(st_get '.vltcp.listen')
@@ -1579,7 +1869,6 @@ ask_xpad_mode() {
 
 # ── 管理子菜单辅助 ────────────────────────────────────────────────────────────
 
-# 交互式输入端口（写入 state）；返回端口值
 _menu_input_port() {
     local _jq_path="$1" _p
     prompt "新端口（回车随机）: " _p
@@ -1587,7 +1876,7 @@ _menu_input_port() {
                               awk 'BEGIN{srand();print int(rand()*63976)+1024}')
     case "${_p:-}" in ''|*[!0-9]*) log_error "无效端口"; return 1;; esac
     { [ "${_p}" -ge 1 ] && [ "${_p}" -le 65535 ]; } || { log_error "端口超范围"; return 1; }
-    if platform_port_in_use "${_p}"; then
+    if port_mgr_in_use "${_p}"; then
         log_warn "端口 ${_p} 已被占用"
         local _a; prompt "仍然继续？(y/N): " _a
         case "${_a:-n}" in y|Y) :;; *) return 1;; esac
@@ -1602,7 +1891,6 @@ _menu_confirm_uninstall() {
     case "${_a:-n}" in y|Y) return 0;; *) return 1;; esac
 }
 
-# 切换布尔字段并提交
 _menu_toggle_xpad() {
     local _nxp
     [ "$(st_get '.xpad.enabled')" = "true" ] && _nxp="false" || _nxp="true"
@@ -1612,7 +1900,7 @@ _menu_toggle_xpad() {
     log_ok "xPadding 已${_nxp}"; config_print_nodes
 }
 
-# ── 状态收集（主菜单渲染前调用）────────────────────────────────────────────--
+# ── 状态收集 ──────────────────────────────────────────────────────────────────
 
 check_xray() {
     [ -f "${XRAY_BIN}" ] || { printf 'not installed'; return 2; }
@@ -1629,7 +1917,7 @@ check_argo() {
         || { printf 'stopped'; return 1; }
 }
 
-# ── 管理子菜单 ────────────────────────────────────────────────────────────────
+# ── Argo 管理 ─────────────────────────────────────────────────────────────────
 
 manage_argo() {
     [ -f "${CONFIG_FILE}" ] || { log_warn "请先完成 Xray-2go 安装"; sleep 1; return; }
@@ -1714,9 +2002,10 @@ manage_argo() {
                 else
                     rm -f "/etc/init.d/${_SVC_TUNNEL}" 2>/dev/null || true
                 fi
-                rm -f "${ARGO_BIN}"            2>/dev/null || true
+                rm -f "${ARGO_BIN}"             2>/dev/null || true
                 rm -f "${WORK_DIR}/tunnel.yml"  2>/dev/null || true
                 rm -f "${WORK_DIR}/tunnel.json" 2>/dev/null || true
+                rm -f "${_ARGO_ENV_FILE}"       2>/dev/null || true
                 st_set '.argo.enabled = false | .argo.domain = null | .argo.token = null | .argo.mode = "fixed"' \
                     || true
                 config_apply  || { _pause; continue; }
@@ -1759,6 +2048,8 @@ manage_argo() {
         _pause
     done
 }
+
+# ── FreeFlow 管理 ─────────────────────────────────────────────────────────────
 
 manage_freeflow() {
     [ -f "${CONFIG_FILE}" ] || { log_warn "请先完成 Xray-2go 安装"; sleep 1; return; }
@@ -1858,6 +2149,8 @@ manage_freeflow() {
     done
 }
 
+# ── Reality 管理 ──────────────────────────────────────────────────────────────
+
 manage_reality() {
     [ -f "${CONFIG_FILE}" ] || { log_warn "请先完成 Xray-2go 安装"; sleep 1; return; }
     while true; do
@@ -1914,7 +2207,7 @@ manage_reality() {
                 config_apply \
                     || { st_set '.reality.enabled = false'; _pause; continue; }
                 st_persist || log_warn "state.json 写入失败"
-                fw_sync
+                fw_reconcile
                 log_ok "Reality 已启用"; config_print_nodes ;;
             2)
                 if [ "${_en}" != "true" ]; then
@@ -1935,7 +2228,7 @@ manage_reality() {
                 local _np; _np=$(_menu_input_port '.reality.port') || { _pause; continue; }
                 [ "${_en}" = "true" ] && { config_apply || { _pause; continue; }; }
                 st_persist || log_warn "state.json 写入失败"
-                fw_sync
+                fw_reconcile
                 log_ok "端口已更新: ${_np}"
                 [ "${_en}" = "true" ] && config_print_nodes ;;
             5)
@@ -1975,6 +2268,8 @@ manage_reality() {
     done
 }
 
+# ── VLESS-TCP 管理 ────────────────────────────────────────────────────────────
+
 manage_vltcp() {
     [ -f "${CONFIG_FILE}" ] || { log_warn "请先完成 Xray-2go 安装"; sleep 1; return; }
     while true; do
@@ -2011,7 +2306,7 @@ manage_vltcp() {
                 config_apply \
                     || { st_set '.vltcp.enabled = false'; _pause; continue; }
                 st_persist || log_warn "state.json 写入失败"
-                fw_sync
+                fw_reconcile
                 log_ok "VLESS-TCP 已启用 (端口: ${_port})"; config_print_nodes ;;
             2)
                 if [ "${_en}" != "true" ]; then
@@ -2032,7 +2327,7 @@ manage_vltcp() {
                 local _np; _np=$(_menu_input_port '.vltcp.port') || { _pause; continue; }
                 [ "${_en}" = "true" ] && { config_apply || { _pause; continue; }; }
                 st_persist || log_warn "state.json 写入失败"
-                fw_sync
+                fw_reconcile
                 log_ok "端口已更新: ${_np}"
                 [ "${_en}" = "true" ] && config_print_nodes ;;
             5)
@@ -2073,11 +2368,9 @@ _menu_collect_status() {
     local _fp _fpa _ffhost
     _fp=$(st_get '.ff.protocol'); _fpa=$(st_get '.ff.path'); _ffhost=$(st_get '.ff.host')
     if [ "$(st_get '.ff.enabled')" = "true" ] && [ "${_fp}" != "none" ]; then
-        if [ "${_fp}" = "tcphttp" ]; then
-            _MENU_FD="${_fp} (host=${_ffhost})"
-        else
-            _MENU_FD="${_fp} (path=${_fpa})"
-        fi
+        [ "${_fp}" = "tcphttp" ] \
+            && _MENU_FD="${_fp} (host=${_ffhost})" \
+            || _MENU_FD="${_fp} (path=${_fpa})"
     else
         _MENU_FD="未启用"
     fi
@@ -2125,7 +2418,6 @@ _menu_do_install() {
     ask_reality_mode
     ask_vltcp_mode
 
-    # 仅在选择了 xhttp 协议时才问 xPadding
     local _has_xhttp=false
     [ "$(st_get '.argo.enabled')" = "true" ] && \
         [ "$(st_get '.argo.protocol')" = "xhttp" ] && _has_xhttp=true
@@ -2155,7 +2447,6 @@ _menu_do_install() {
 }
 
 menu() {
-    # 菜单状态变量局限在本函数作用域
     local _MENU_XS="" _MENU_XC="" _MENU_CX=1
     local _MENU_AD="" _MENU_FD="" _MENU_RD="" _MENU_VD=""
     while true; do
