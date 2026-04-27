@@ -75,7 +75,18 @@ die() { log_error "$1"; exit "${2:-1}"; }
 # xPadding 常量 — xhttp 混淆配置（5处共用）
 readonly _XPAD_JSON='{"xPaddingObfsMode":true,"xPaddingMethod":"tokenish","xPaddingPlacement":"queryInHeader","xPaddingHeader":"X-Cache","xPaddingKey":"_Luckylos"}'
 readonly _XPAD_QS='%22xPaddingObfsMode%22%3Atrue%2C%22xPaddingMethod%22%3A%22tokenish%22%2C%22xPaddingPlacement%22%3A%22queryInHeader%22%2C%22xPaddingHeader%22%3A%22X-Cache%22%2C%22xPaddingKey%22%3A%22_Luckylos%22'
-_xpad_jq() { printf '%s' "$_XPAD_JSON" | jq -c .; }
+# 根据 xpad.enabled 返回完整 xPadding JSON 或空对象
+_xpad_jq() {
+ if [ "$(state_get '.xpad.enabled')" = "true" ]; then
+ printf '%s' "$_XPAD_JSON" | jq -c .
+ else
+ printf '{}'
+ fi
+}
+# 根据 xpad.enabled 返回 URL 编码的 xPadding 查询串或空串
+_xpad_qs() {
+ [ "$(state_get '.xpad.enabled')" = "true" ] && printf '%s' "$_XPAD_QS" || true
+}
 
 prompt() {
     printf "${C_RED}%s${C_RST}" "$1" >&2
@@ -477,8 +488,9 @@ readonly _STATE_DEFAULT='{
   "ff":      {"enabled":false, "protocol":"none", "path":"/", "host":""},
   "reality": {"enabled":false, "port":443, "sni":"addons.mozilla.org",
               "network":"tcp", "pbk":null, "pvk":null, "sid":null},
-  "vltcp":   {"enabled":false, "port":1234, "listen":"0.0.0.0"},
-  "cfip":    "cf.tencentapp.cn",
+ "vltcp": {"enabled":false, "port":1234, "listen":"0.0.0.0"},
+ "xpad": {"enabled":true},
+ "cfip": "cf.tencentapp.cn",
   "cfport":  "443"
 }'
 
@@ -528,9 +540,12 @@ state_merge_default() {
     { [ -z "${_c:-}" ] || [ "${_c}" = "null" ]; } && state_set '.cfip = "cf.tencentapp.cn"'
     _c=$(state_get '.cfport')
     { [ -z "${_c:-}" ] || [ "${_c}" = "null" ]; } && state_set '.cfport = "443"'
-    # 补全 ff.host 字段（兼容旧版 state.json）
-    _c=$(state_get '.ff.host')
-    { [ -z "${_c:-}" ] || [ "${_c}" = "null" ]; } && state_set '.ff.host = ""'
+ # 补全 ff.host 字段（兼容旧版 state.json）
+ _c=$(state_get '.ff.host')
+ { [ -z "${_c:-}" ] || [ "${_c}" = "null" ]; } && state_set '.ff.host = ""'
+ # 补全 xpad.enabled 字段（v8.3 新增）
+ _c=$(state_get '.xpad.enabled')
+ { [ -z "${_c:-}" ] || [ "${_c}" = "null" ]; } && state_set '.xpad.enabled = true'
 }
 
 # ==============================================================================
@@ -718,9 +733,15 @@ link_argo() {
     _cfport=$(state_get '.cfport')
     [ -n "${_domain:-}" ] && [ "${_domain}" != "null" ] || return 0
     case "${_proto}" in
-        xhttp)
-            printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=firefox&type=xhttp&host=%s&path=%%2Fargo&mode=auto&extra=%%7B%s%%7D#Argo-XHTTP\n' \
-                "${_uuid}" "${_cfip}" "${_cfport}" "${_domain}" "${_domain}" "${_XPAD_QS}" ;;
+ xhttp)
+ _xqs=$(_xpad_qs)
+ if [ -n "${_xqs}" ]; then
+ printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=firefox&type=xhttp&host=%s&path=%%2Fargo&mode=auto&extra=%%7B%s%%7D#Argo-XHTTP\n' \
+ "${_uuid}" "${_cfip}" "${_cfport}" "${_domain}" "${_domain}" "${_xqs}"
+ else
+ printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=firefox&type=xhttp&host=%s&path=%%2Fargo&mode=auto#Argo-XHTTP\n' \
+ "${_uuid}" "${_cfip}" "${_cfport}" "${_domain}" "${_domain}"
+ fi ;;
         *)
             printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=firefox&type=ws&host=%s&path=%%2Fargo%%3Fed%%3D2560#Argo-WS\n' \
                 "${_uuid}" "${_cfip}" "${_cfport}" "${_domain}" "${_domain}" ;;
@@ -740,8 +761,14 @@ link_ff() {
                          "${_uuid}" "${_ip}" "${_ip}" "${_penc}" ;;
         httpupgrade) printf 'vless://%s@%s:8080?encryption=none&security=none&type=httpupgrade&host=%s&path=%s#FreeFlow-HTTPUpgrade\n' \
                          "${_uuid}" "${_ip}" "${_ip}" "${_penc}" ;;
-        xhttp)       printf 'vless://%s@%s:8080?encryption=none&security=none&type=xhttp&host=%s&path=%s&mode=stream-one&extra=%%7B%s%%7D#FreeFlow-XHTTP\n' \
-                         "${_uuid}" "${_ip}" "${_ip}" "${_penc}" "${_XPAD_QS}" ;;
+ xhttp) _xqs=$(_xpad_qs)
+ if [ -n "${_xqs}" ]; then
+ printf 'vless://%s@%s:8080?encryption=none&security=none&type=xhttp&host=%s&path=%s&mode=stream-one&extra=%%7B%s%%7D#FreeFlow-XHTTP\n' \
+ "${_uuid}" "${_ip}" "${_ip}" "${_penc}" "${_xqs}"
+ else
+ printf 'vless://%s@%s:8080?encryption=none&security=none&type=xhttp&host=%s&path=%s&mode=stream-one#FreeFlow-XHTTP\n' \
+ "${_uuid}" "${_ip}" "${_ip}" "${_penc}"
+ fi ;;
         tcphttp)
             local _henc _host
             _host=$(state_get '.ff.host')
@@ -760,9 +787,16 @@ link_reality() {
     local _rnet _uuid
     _rnet=$(state_get '.reality.network'); _rnet="${_rnet:-tcp}"; _uuid=$(state_get '.uuid')
     case "${_rnet}" in
-        xhttp) printf 'vless://%s@%s:%s?encryption=none&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=xhttp&path=%%2F&mode=stream-one&extra=%%7B%s%%7D#Reality-XHTTP\n' \
-                   "${_uuid}" "${_ip}" "$(state_get '.reality.port')" \
-                   "$(state_get '.reality.sni')" "${_rpbk}" "$(state_get '.reality.sid')" "${_XPAD_QS}" ;;
+ xhttp) _xqs=$(_xpad_qs)
+ if [ -n "${_xqs}" ]; then
+ printf 'vless://%s@%s:%s?encryption=none&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=xhttp&path=%%2F&mode=stream-one&extra=%%7B%s%%7D#Reality-XHTTP\n' \
+ "${_uuid}" "${_ip}" "$(state_get '.reality.port')" \
+ "$(state_get '.reality.sni')" "${_rpbk}" "$(state_get '.reality.sid')" "${_xqs}"
+ else
+ printf 'vless://%s@%s:%s?encryption=none&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=xhttp&path=%%2F&mode=stream-one#Reality-XHTTP\n' \
+ "${_uuid}" "${_ip}" "$(state_get '.reality.port')" \
+ "$(state_get '.reality.sni')" "${_rpbk}" "$(state_get '.reality.sid')"
+ fi ;;
         *)     printf 'vless://%s@%s:%s?encryption=none&flow=xtls-rprx-vision&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=tcp&headerType=none#Reality-Vision\n' \
                    "${_uuid}" "${_ip}" "$(state_get '.reality.port')" \
                    "$(state_get '.reality.sni')" "${_rpbk}" "$(state_get '.reality.sid')" ;;
@@ -1451,8 +1485,20 @@ ask_vltcp_mode() {
     local _dl; _dl=$(state_get '.vltcp.listen')
     local _vl; prompt "监听地址（回车默认 ${_dl}，0.0.0.0=所有接口）: " _vl
     [ -n "${_vl:-}" ] && state_set '.vltcp.listen = $l' --arg l "${_vl}"
-    log_info "VLESS-TCP 配置完成 — 端口:$(state_get '.vltcp.port') 监听:$(state_get '.vltcp.listen')"
-    echo ""
+ log_info "VLESS-TCP 配置完成 — 端口:$(state_get '.vltcp.port') 监听:$(state_get '.vltcp.listen')"
+ echo ""
+}
+
+ask_xpad_mode() {
+ echo ""; log_title "XHTTP xPadding 混淆"
+ printf " ${C_GRN}1.${C_RST} 开启 xPadding（更强的流量伪装） ${C_YLW}[默认]${C_RST}\n"
+ printf " ${C_GRN}2.${C_RST} 关闭 xPadding（纯 XHTTP，兼容性更好）\n"
+ local _c; prompt "请选择 (1-2，回车默认1): " _c
+ case "${_c:-1}" in
+ 2) state_set '.xpad.enabled = false'; log_info "已选：关闭 xPadding";;
+ *) state_set '.xpad.enabled = true'; log_info "已选：开启 xPadding";;
+ esac
+ echo ""
 }
 
 # ==============================================================================
@@ -1512,17 +1558,19 @@ manage_argo() {
         else
             printf "  模块: ${C_YLW}未启用${C_RST}\n"
         fi
-        _hr
-        printf "  ${C_GRN}1.${C_RST} 启用 Argo\n"
-        printf "  ${C_RED}2.${C_RST} 禁用 Argo\n"
-        printf "  ${C_GRN}3.${C_RST} 重启隧道服务\n"
-        printf "  ${C_RED}9.${C_RST} 卸载 Argo（停服务 + 删文件）\n"
-        _hr
-        printf "  ${C_GRN}4.${C_RST} 配置/更新固定隧道域名\n"
-        printf "  ${C_GRN}5.${C_RST} 切换协议 (WS ↔ XHTTP)\n"
-        printf "  ${C_GRN}6.${C_RST} 修改回源端口 (当前: ${C_YLW}${_port}${C_RST})\n"
-        printf "  ${C_GRN}7.${C_RST} 查看节点链接\n"
-        printf "  ${C_GRN}8.${C_RST} 健康检查\n"
+ local _xpad; _xpad=$(state_get '.xpad.enabled')
+ _hr
+ printf " ${C_GRN}1.${C_RST} 启用 Argo\n"
+ printf " ${C_RED}2.${C_RST} 禁用 Argo\n"
+ printf " ${C_GRN}3.${C_RST} 重启隧道服务\n"
+ printf " ${C_RED}9.${C_RST} 卸载 Argo（停服务 + 删文件）\n"
+ _hr
+ printf " ${C_GRN}4.${C_RST} 配置/更新固定隧道域名\n"
+ printf " ${C_GRN}5.${C_RST} 切换协议 (WS ↔ XHTTP)\n"
+ printf " ${C_GRN}6.${C_RST} 修改回源端口 (当前: ${C_YLW}${_port}${C_RST})\n"
+ printf " ${C_GRN}7.${C_RST} 切换 xPadding (当前: ${C_YLW}${_xpad}${C_RST})\n"
+ printf " ${C_GRN}8.${C_RST} 查看节点链接\n"
+ printf " ${C_GRN}a.${C_RST} 健康检查\n"
         printf "  ${C_PUR}0.${C_RST} 返回\n"; _hr
         local _c; prompt "请输入选择: " _c
         case "${_c:-}" in
@@ -1604,10 +1652,16 @@ manage_argo() {
                     log_error "切换失败，回滚"
                     state_set '.argo.protocol = $p' --arg p "${_proto}"
                 fi ;;
-            6) exec_update_argo_port ;;
-            7) print_nodes ;;
-            8) check_argo_health || true ;;
-            0) return ;;
+ 6) exec_update_argo_port ;;
+ 7)
+ local _nxp; [ "$(state_get '.xpad.enabled')" = "true" ] && _nxp="false" || _nxp="true"
+ state_set '.xpad.enabled = $v' --arg v "${_nxp}" || { _pause; continue; }
+ apply_config || { _pause; continue; }
+ state_persist || log_warn "state.json 写入失败"
+ log_ok "xPadding 已${_nxp}"; print_nodes ;;
+ 8) print_nodes ;;
+ a) check_argo_health || true ;;
+ 0) return ;;
             *) log_error "无效选项" ;;
         esac
         _pause
@@ -1639,19 +1693,21 @@ manage_freeflow() {
         else
             printf "  模块: ${C_YLW}未启用${C_RST}\n"
         fi
-        _hr
-        printf "  ${C_GRN}1.${C_RST} 启用 FreeFlow\n"
-        printf "  ${C_RED}2.${C_RST} 禁用 FreeFlow\n"
-        printf "  ${C_GRN}3.${C_RST} 重启 xray2go 服务\n"
-        printf "  ${C_RED}9.${C_RST} 卸载 FreeFlow\n"
-        _hr
-        printf "  ${C_GRN}4.${C_RST} 变更传输协议\n"
-        if [ "${_proto}" = "tcphttp" ]; then
-            printf "  ${C_GRN}5.${C_RST} 修改免流 Host（当前: ${C_YLW}${_host}${C_RST}）\n"
-        else
-            printf "  ${C_GRN}5.${C_RST} 修改 path（当前: ${C_YLW}${_path}${C_RST}）\n"
-        fi
-        printf "  ${C_GRN}6.${C_RST} 查看节点链接\n"
+ local _xpad; _xpad=$(state_get '.xpad.enabled')
+ _hr
+ printf " ${C_GRN}1.${C_RST} 启用 FreeFlow\n"
+ printf " ${C_RED}2.${C_RST} 禁用 FreeFlow\n"
+ printf " ${C_GRN}3.${C_RST} 重启 xray2go 服务\n"
+ printf " ${C_RED}9.${C_RST} 卸载 FreeFlow\n"
+ _hr
+ printf " ${C_GRN}4.${C_RST} 变更传输协议\n"
+ if [ "${_proto}" = "tcphttp" ]; then
+ printf " ${C_GRN}5.${C_RST} 修改免流 Host（当前: ${C_YLW}${_host}${C_RST}）\n"
+ else
+ printf " ${C_GRN}5.${C_RST} 修改 path（当前: ${C_YLW}${_path}${C_RST}）\n"
+ fi
+ printf " ${C_GRN}6.${C_RST} 切换 xPadding (当前: ${C_YLW}${_xpad}${C_RST})\n"
+ printf " ${C_GRN}7.${C_RST} 查看节点链接\n"
         printf "  ${C_PUR}0.${C_RST} 返回\n"; _hr
         local _c; prompt "请输入选择: " _c
         case "${_c:-}" in
@@ -1706,11 +1762,17 @@ manage_freeflow() {
                         state_set '.ff.path = $p' --arg p "${_p}" || { _pause; continue; }
                         apply_config  || { _pause; continue; }
                         state_persist || log_warn "state.json 写入失败"
-                        log_ok "path 已更新: ${_p}"; print_nodes
-                    fi
-                fi ;;
-            6) print_nodes ;;
-            0) return ;;
+ log_ok "path 已更新: ${_p}"; print_nodes
+ fi
+ fi ;;
+ 6)
+ local _nxp; [ "$(state_get '.xpad.enabled')" = "true" ] && _nxp="false" || _nxp="true"
+ state_set '.xpad.enabled = $v' --arg v "${_nxp}" || { _pause; continue; }
+ apply_config || { _pause; continue; }
+ state_persist || log_warn "state.json 写入失败"
+ log_ok "xPadding 已${_nxp}"; print_nodes ;;
+ 7) print_nodes ;;
+ 0) return ;;
             *) log_error "无效选项" ;;
         esac
         _pause
@@ -1747,17 +1809,19 @@ manage_reality() {
         printf "  公钥: %s\n" "${_pbk_disp}"
         [ -n "${_sid:-}" ] && [ "${_sid}" != "null" ] \
             && printf "  ShortId: ${C_CYN}%s${C_RST}\n" "${_sid}"
-        _hr
-        printf "  ${C_GRN}1.${C_RST} 启用 Reality\n"
-        printf "  ${C_RED}2.${C_RST} 禁用 Reality\n"
-        printf "  ${C_GRN}3.${C_RST} 重启 xray2go 服务\n"
-        printf "  ${C_RED}9.${C_RST} 卸载 Reality（禁用 + 清除密钥）\n"
-        _hr
-        printf "  ${C_GRN}4.${C_RST} 修改端口（当前: ${C_YLW}${_port}${C_RST}）\n"
-        printf "  ${C_GRN}5.${C_RST} 修改 SNI（当前: ${C_CYN}${_sni}${C_RST}）\n"
-        printf "  ${C_GRN}6.${C_RST} 切换传输方式（当前: ${C_GRN}${_net}${C_RST}）\n"
-        printf "  ${C_GRN}7.${C_RST} 重新生成密钥对\n"
-        printf "  ${C_GRN}8.${C_RST} 查看节点链接\n"
+ local _xpad; _xpad=$(state_get '.xpad.enabled')
+ _hr
+ printf " ${C_GRN}1.${C_RST} 启用 Reality\n"
+ printf " ${C_RED}2.${C_RST} 禁用 Reality\n"
+ printf " ${C_GRN}3.${C_RST} 重启 xray2go 服务\n"
+ printf " ${C_RED}9.${C_RST} 卸载 Reality（禁用 + 清除密钥）\n"
+ _hr
+ printf " ${C_GRN}4.${C_RST} 修改端口（当前: ${C_YLW}${_port}${C_RST}）\n"
+ printf " ${C_GRN}5.${C_RST} 修改 SNI（当前: ${C_CYN}${_sni}${C_RST}）\n"
+ printf " ${C_GRN}6.${C_RST} 切换传输方式（当前: ${C_GRN}${_net}${C_RST}）\n"
+ printf " ${C_GRN}7.${C_RST} 切换 xPadding (当前: ${C_YLW}${_xpad}${C_RST})\n"
+ printf " ${C_GRN}8.${C_RST} 重新生成密钥对\n"
+ printf " ${C_GRN}a.${C_RST} 查看节点链接\n"
         printf "  ${C_PUR}0.${C_RST} 返回\n"; _hr
         local _c; prompt "请输入选择: " _c
         case "${_c:-}" in
@@ -1816,17 +1880,23 @@ manage_reality() {
                 [ "${_en}" = "true" ] && { apply_config || { _pause; continue; }; }
                 state_persist || log_warn "state.json 写入失败"
                 log_ok "传输方式已切换: ${_nn}"
-                [ "${_en}" = "true" ] && print_nodes ;;
-            7)
-                [ -x "${XRAY_BIN}" ] || { log_error "xray 未就绪"; _pause; continue; }
-                _gen_reality_keypair || { _pause; continue; }
-                state_set '.reality.sid = $s' --arg s "$(_gen_reality_sid)" || { _pause; continue; }
-                [ "${_en}" = "true" ] && { apply_config || { _pause; continue; }; }
-                state_persist || log_warn "state.json 写入失败"
-                log_ok "密钥对已更新"
-                [ "${_en}" = "true" ] && print_nodes ;;
-            8) print_nodes ;;
-            0) return ;;
+ [ "${_en}" = "true" ] && print_nodes ;;
+ 7)
+ local _nxp; [ "$(state_get '.xpad.enabled')" = "true" ] && _nxp="false" || _nxp="true"
+ state_set '.xpad.enabled = $v' --arg v "${_nxp}" || { _pause; continue; }
+ apply_config || { _pause; continue; }
+ state_persist || log_warn "state.json 写入失败"
+ log_ok "xPadding 已${_nxp}"; print_nodes ;;
+ 8)
+ [ -x "${XRAY_BIN}" ] || { log_error "xray 未就绪"; _pause; continue; }
+ _gen_reality_keypair || { _pause; continue; }
+ state_set '.reality.sid = $s' --arg s "$(_gen_reality_sid)" || { _pause; continue; }
+ [ "${_en}" = "true" ] && { apply_config || { _pause; continue; }; }
+ state_persist || log_warn "state.json 写入失败"
+ log_ok "密钥对已更新"
+ [ "${_en}" = "true" ] && print_nodes ;;
+ a) print_nodes ;;
+ 0) return ;;
             *) log_error "无效选项" ;;
         esac
         _pause
@@ -1977,11 +2047,18 @@ _menu_do_install() {
         log_warn "Xray-2go 已安装并运行，如需重装请先卸载 (选项 2)"; return
     fi
 
-    ask_argo_mode
-    [ "$(state_get '.argo.enabled')" = "true" ] && ask_argo_protocol
-    ask_freeflow_mode
-    ask_reality_mode
-    ask_vltcp_mode
+ ask_argo_mode
+ [ "$(state_get '.argo.enabled')" = "true" ] && ask_argo_protocol
+ ask_freeflow_mode
+ ask_reality_mode
+ ask_vltcp_mode
+
+ # 任一协议使用 XHTTP 时询问 xPadding 开关
+ local _has_xhttp=false
+ [ "$(state_get '.argo.enabled')" = "true" ] && [ "$(state_get '.argo.protocol')" = "xhttp" ] && _has_xhttp=true
+ [ "$(state_get '.ff.enabled')" = "true" ] && [ "$(state_get '.ff.protocol')" = "xhttp" ] && _has_xhttp=true
+ [ "$(state_get '.reality.enabled')" = "true" ] && [ "$(state_get '.reality.network')" = "xhttp" ] && _has_xhttp=true
+ [ "${_has_xhttp}" = "true" ] && ask_xpad_mode
 
     if [ "$(state_get '.reality.enabled')" = "true" ]; then
         local _rp _ap
