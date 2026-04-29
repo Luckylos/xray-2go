@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# xray-2go v9.0  — 插件化协议平台（Plugin-based Proxy Platform）
+# xray-2go v9.1  — 插件化协议平台（Plugin-based Proxy Platform）
+# 安全基线：S1-S6 注入防护 · C1-C5 并发安全 · A1-A5 架构一致性
 # 协议支持：Argo · FreeFlow · Reality · VLESS-TCP（均以插件形式加载）
 # 平台支持：Debian/Ubuntu (systemd) · Alpine (OpenRC)
 # ==============================================================================
@@ -346,11 +347,44 @@ port_of() {
     [ -n "${_v:-}" ] && [ "${_v}" != "null" ] && printf '%s' "${_v}" || printf '0'
 }
 
+# ── 统一输入校验层（S2/S3/I3 修复）──────────────────────────────────────────
+# val_port: 限制端口为纯数字 1-65535，防止 YAML/JSON 注入
+val_port() {
+    local _p="$1"
+    case "${_p}" in
+        ''|*[!0-9]*) log_error "非法端口值: ${_p}"; return 1 ;;
+    esac
+    [ "${_p}" -ge 1 ] && [ "${_p}" -le 65535 ]         || { log_error "端口超出范围: ${_p}"; return 1; }
+    printf '%s' "${_p}"
+}
+
+# val_uuid: 严格匹配 UUID v4 格式，防止 JSON 注入
+val_uuid() {
+    printf '%s' "${1:-}" | grep -qiE         '^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'         || { log_error "非法 UUID 格式: ${1:-}"; return 1; }
+    printf '%s' "${1}"
+}
+
+# val_domain: 防止域名字段注入 YAML 特殊字符
+val_domain() {
+    printf '%s' "${1:-}" | grep -qE         '^[a-zA-Z0-9]([a-zA-Z0-9._-]*[a-zA-Z0-9])?$'         || { log_error "非法域名格式: ${1:-}"; return 1; }
+    printf '%s' "${1}"
+}
+
+# val_path: 路径只允许 / 开头的 URL-safe 字符串
+val_path() {
+    local _p="${1:-/}"
+    case "${_p}" in /*) : ;; *) _p="/${_p}" ;; esac
+    printf '%s' "${_p}" | grep -qE '^[/a-zA-Z0-9_.~-]+$'         || { log_error "非法 path 格式: ${_p}"; return 1; }
+    printf '%s' "${_p}"
+}
+
 _st_persist_inner() {
     local _json
     _json=$(printf '%s\n' "${_G_STATE}" | jq . 2>/dev/null) \
         || { log_error "state 序列化失败"; return 1; }
-    atomic_write_with_backup "${STATE_FILE}" "${_json}" 3
+    atomic_write_with_backup "${STATE_FILE}" "${_json}" 3 || return 1
+    # S5: state.json 含 token 等敏感数据，严格限制权限
+    chmod 600 "${STATE_FILE}" 2>/dev/null || true
 }
 
 st_persist() { with_lock _st_persist_inner; }
@@ -984,6 +1018,25 @@ svc_reload_daemon() {
     _G_SYSD_DIRTY=0
 }
 
+# C3: svc 互斥锁——所有服务状态变更（start/stop/restart）通过此接口
+# 只读操作（status）不加锁，避免死锁
+_SVC_LOCK_FILE="${WORK_DIR}/.svc_lock"
+svc_exec_mut() {
+    # 用法同 svc_exec，但对 mutating 操作加独立锁
+    local _act="$1"
+    case "${_act}" in
+        status) svc_exec "$@"; return $? ;;  # 只读不加锁
+    esac
+    mkdir -p "${WORK_DIR}" 2>/dev/null || true
+    if command -v flock >/dev/null 2>&1; then
+        ( flock -x 9 || { log_error "获取 svc 锁失败"; exit 1; }
+          svc_exec "$@"
+        ) 9>"${_SVC_LOCK_FILE}"
+    else
+        svc_exec "$@"
+    fi
+}
+
 _svc_write_file() {
     local _dest="$1" _content="$2"
     local _cur; _cur=$(cat "${_dest}" 2>/dev/null || printf '')
@@ -1032,9 +1085,9 @@ svc_reload_xray() {
         fi
     fi
 
-    # fallback：restart
+    # fallback：restart（C3: 通过 svc_exec_mut 加锁防并发）
     log_info "热重载不可用，执行 restart..."
-    svc_exec restart "${_SVC_XRAY}" || { log_error "xray restart 失败"; return 1; }
+    svc_exec_mut restart "${_SVC_XRAY}" || { log_error "xray restart 失败"; return 1; }
     printf '%s' "${_new_hash}" > "${_CONFIG_HASH_FILE}" 2>/dev/null || true
     log_ok "xray 已重启"
 }
@@ -1054,7 +1107,7 @@ _svc_tpl_xray_openrc() {
 # tunnel 服务：两种模式统一使用 --config tunnel.yml
 # token 通过 _ARGO_ENV_FILE 注入（不出现在命令行）
 _svc_tpl_tunnel_systemd() {
-    printf '[Unit]\nDescription=Cloudflare Tunnel2go\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nNoNewPrivileges=yes\nTimeoutStartSec=0\nEnvironmentFile=-\%s\nExecStart=%s tunnel --no-autoupdate run --config %s\nRestart=on-failure\nRestartSec=5\nStandardOutput=null\nStandardError=null\n\n[Install]\nWantedBy=multi-user.target\n' \
+    printf '[Unit]\nDescription=Cloudflare Tunnel2go\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nNoNewPrivileges=yes\nTimeoutStartSec=0\nEnvironmentFile=-%s\nExecStart=%s tunnel --no-autoupdate run --config %s\nRestart=on-failure\nRestartSec=5\nStandardOutput=null\nStandardError=null\n\n[Install]\nWantedBy=multi-user.target\n' \
         "${_ARGO_ENV_FILE}" "${ARGO_BIN}" "${WORK_DIR}/tunnel.yml"
 }
 
@@ -1065,8 +1118,14 @@ _svc_tpl_tunnel_openrc() {
 
 _svc_write_argo_env() {
     local _token; _token=$(st_get '.argo.token')
-    # token 为 null 时写空值（tunnel.yml 模式下不使用）
-    atomic_write "${_ARGO_ENV_FILE}" "$(printf 'ARGO_TOKEN=%s\n' "${_token:-}")"
+    # S1: token 写入 env file 前做安全性检查
+    # tunnel.yml 模式下 token 为 null，写空值是安全的
+    # token 模式下已通过 grep -qE '^[A-Za-z0-9=_-]{20,}$' 校验过格式
+    # env file 格式：KEY=VALUE（不加引号，cloudflared 直接读）
+    # 防止 token 含换行导致 env file 解析错误
+    local _safe_token="${_token:-}"
+    _safe_token=$(printf '%s' "${_safe_token}" | tr -d '\n\r')
+    atomic_write "${_ARGO_ENV_FILE}" "$(printf 'ARGO_TOKEN=%s\n' "${_safe_token}")"
     chmod 600 "${_ARGO_ENV_FILE}" 2>/dev/null || true
 }
 
@@ -1093,9 +1152,7 @@ svc_apply_tunnel() {
 
 svc_restart_xray() {
     [ -f "${CONFIG_FILE}" ] || { log_error "配置文件不存在"; return 1; }
-    svc_exec restart "${_SVC_XRAY}" \
-        && { log_ok "${_SVC_XRAY} 已重启"; svc_verify_health "${_SVC_XRAY}" 6; } \
-        || { log_error "${_SVC_XRAY} 重启失败"; return 1; }
+    svc_exec_mut restart "${_SVC_XRAY}"         && { log_ok "${_SVC_XRAY} 已重启"; svc_verify_health "${_SVC_XRAY}" 6; }         || { log_error "${_SVC_XRAY} 重启失败"; return 1; }
 }
 
 svc_verify_health() {
@@ -1151,6 +1208,12 @@ crypto_gen_reality_sid() {
 
 # 遍历插件注册表，收集所有 inbound → JSON 数组
 config_build_inbounds() {
+    # S3: 在构建 inbound 前校验 UUID，防止注入 xray JSON 配置
+    local _uuid_check; _uuid_check=$(st_get '.uuid')
+    if ! val_uuid "${_uuid_check}" >/dev/null 2>&1; then
+        log_error "UUID 格式异常，拒绝生成配置: ${_uuid_check}"
+        return 1
+    fi
     local _ibs="[]" _ib _name _used_keys=""
     for _name in "${_PLUGIN_REGISTRY[@]}"; do
         _ib=$(plugin_call "${_name}" inbound 2>/dev/null) || {
@@ -1267,14 +1330,26 @@ argo_build_tunnel_cmd() {
 # 生成 tunnel.yml（cred 模式：含 credentials-file）
 _argo_gen_yml_cred() {
     local _domain="$1" _tid="$2" _cred="$3"
-    local _port; _port=$(port_of argo)
+    # S2: 校验所有字段，防止 YAML 注入
+    local _port; _port=$(val_port "$(port_of argo)") || return 1
+    val_domain "${_domain}" >/dev/null || return 1
+    # tid 只允许 hex UUID 或 AccountTag（字母数字连字符）
+    printf '%s' "${_tid}" | grep -qE '^[a-zA-Z0-9_-]{8,}$'         || { log_error "TunnelID 格式非法"; return 1; }
     local _new
-    _new=$(printf 'tunnel: %s\ncredentials-file: %s\n\ningress:\n  - hostname: %s\n    service: http://localhost:%s\n    originRequest:\n      connectTimeout: 30s\n      noTLSVerify: true\n  - service: http_status:404\n' \
-        "${_tid}" "${_cred}" "${_domain}" "${_port}")
+    _new=$(printf 'tunnel: %s
+credentials-file: %s
+
+ingress:
+  - hostname: %s
+    service: http://localhost:%s
+    originRequest:
+      connectTimeout: 30s
+      noTLSVerify: true
+  - service: http_status:404
+'         "${_tid}" "${_cred}" "${_domain}" "${_port}")
     local _cur; _cur=$(cat "${WORK_DIR}/tunnel.yml" 2>/dev/null || true)
     [ "${_cur}" = "${_new}" ] && return 0
-    atomic_write "${WORK_DIR}/tunnel.yml" "${_new}" \
-        || { log_error "tunnel.yml 写入失败"; return 1; }
+    atomic_write "${WORK_DIR}/tunnel.yml" "${_new}"         || { log_error "tunnel.yml 写入失败"; return 1; }
     log_ok "tunnel.yml 已更新 [cred] (${_domain} → localhost:${_port})"
 }
 
@@ -1282,14 +1357,25 @@ _argo_gen_yml_cred() {
 # cloudflared 读取本地 ingress 覆盖控制台远端配置，消除端口 desync
 _argo_gen_yml_token() {
     local _domain="$1" _token="$2"
-    local _port; _port=$(port_of argo)
+    # S2: 校验端口和域名，防止 YAML 注入
+    local _port; _port=$(val_port "$(port_of argo)") || return 1
+    val_domain "${_domain}" >/dev/null || return 1
+    # token 仅允许 base64url 字符集（cloudflared token 格式）
+    printf '%s' "${_token}" | grep -qE '^[A-Za-z0-9=_-]{20,}$'         || { log_error "token 格式非法，拒绝写入 YAML"; return 1; }
     local _new
-    _new=$(printf 'tunnel: %s\n\ningress:\n  - hostname: %s\n    service: http://localhost:%s\n    originRequest:\n      connectTimeout: 30s\n      noTLSVerify: true\n  - service: http_status:404\n' \
-        "${_token}" "${_domain}" "${_port}")
+    _new=$(printf 'tunnel: %s
+
+ingress:
+  - hostname: %s
+    service: http://localhost:%s
+    originRequest:
+      connectTimeout: 30s
+      noTLSVerify: true
+  - service: http_status:404
+'         "${_token}" "${_domain}" "${_port}")
     local _cur; _cur=$(cat "${WORK_DIR}/tunnel.yml" 2>/dev/null || true)
     [ "${_cur}" = "${_new}" ] && return 0
-    atomic_write "${WORK_DIR}/tunnel.yml" "${_new}" \
-        || { log_error "tunnel.yml 写入失败"; return 1; }
+    atomic_write "${WORK_DIR}/tunnel.yml" "${_new}"         || { log_error "tunnel.yml 写入失败"; return 1; }
     log_ok "tunnel.yml 已更新 [token] (${_domain} → localhost:${_port})"
 }
 
@@ -1343,6 +1429,8 @@ argo_apply_fixed_tunnel() {
             log_error "TunnelID 含非法字符"; return 1;; esac
         local _cred="${WORK_DIR}/tunnel.json"
         atomic_write "${_cred}" "${_auth}" || { log_error "凭证写入失败"; return 1; }
+        # S5: 凭证文件含 TunnelSecret，严格限制权限
+        chmod 600 "${_cred}" 2>/dev/null || true
         _argo_gen_yml_cred "${_domain}" "${_tid}" "${_cred}" || return 1
         st_set '.argo.token = null | .argo.domain = $d | .argo.mode = "fixed"' \
             --arg d "${_domain}" || return 1
@@ -1362,7 +1450,8 @@ argo_apply_fixed_tunnel() {
     svc_exec enable "${_SVC_TUNNEL}" 2>/dev/null || true
     config_apply  || return 1
     st_persist    || log_warn "state.json 写入失败"
-    svc_exec restart "${_SVC_TUNNEL}" || { log_error "tunnel 重启失败"; return 1; }
+    # C2/C3: tunnel restart 通过 svc_exec_mut 加锁
+    svc_exec_mut restart "${_SVC_TUNNEL}" || { log_error "tunnel 重启失败"; return 1; }
     log_ok "固定隧道已配置 (domain=${_domain})"
     argo_check_health || true
 }
@@ -1397,7 +1486,8 @@ exec_update_argo_port() {
     # 3. 更新 tunnel 服务单元（命令不变，但 env 可能变）
     svc_apply_tunnel; svc_reload_daemon
     # 4. 重启 tunnel 使新 tunnel.yml 生效
-    svc_exec restart "${_SVC_TUNNEL}" || log_warn "tunnel 重启失败，请手动重启"
+    # C2: 端口变更后 tunnel restart 通过 svc_exec_mut 加锁
+    svc_exec_mut restart "${_SVC_TUNNEL}" || log_warn "tunnel 重启失败，请手动重启"
     st_persist || log_warn "state.json 写入失败"
     fw_reconcile
     log_ok "Argo 端口已更新: ${_p}（xray inbound + tunnel ingress 均已同步）"
@@ -1563,6 +1653,10 @@ exec_install() {
     clear; log_title "══════════ 安装 Xray-2go v9.0 ══════════"
     platform_preflight
     mkdir -p "${WORK_DIR}" && chmod 750 "${WORK_DIR}"
+    # S5: 确保现有敏感文件权限正确
+    [ -f "${STATE_FILE}" ]    && chmod 600 "${STATE_FILE}"    2>/dev/null || true
+    [ -f "${_ARGO_ENV_FILE}" ] && chmod 600 "${_ARGO_ENV_FILE}" 2>/dev/null || true
+    [ -f "${WORK_DIR}/tunnel.json" ] && chmod 600 "${WORK_DIR}/tunnel.json" 2>/dev/null || true
 
     # 安装内置插件文件
     plugin_install_builtins
@@ -1695,8 +1789,8 @@ exec_update_uuid() {
         _v=$(crypto_gen_uuid) || { log_error "UUID 生成失败"; return 1; }
         log_info "已生成 UUID: ${_v}"
     fi
-    printf '%s' "${_v}" | grep -qiE '^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$' \
-        || { log_error "UUID 格式不合法"; return 1; }
+    # S3: 通过 val_uuid 统一校验，防止 JSON 注入
+    val_uuid "${_v}" >/dev/null || return 1
     st_set '.uuid = $u' --arg u "${_v}" || return 1
     _commit || return 1
     log_ok "UUID 已更新: ${_v}"; config_print_nodes
@@ -1757,9 +1851,15 @@ ask_freeflow_mode() {
            log_info "不启用 FreeFlow"; echo ""; return 0;;
     esac
     port_mgr_in_use "$(port_of ff)" && log_warn "端口 $(port_of ff) 已被占用"
-    local _p; prompt "FreeFlow path（回车默认 /）: " _p
+    local _p _vp; prompt "FreeFlow path（回车默认 /）: " _p
     case "${_p:-/}" in /*) :;; *) _p="/${_p}";; esac
-    st_set '.ff.path = $p' --arg p "${_p:-/}"
+    # I3: path 通过 val_path 校验，防止注入
+    if _vp=$(val_path "${_p:-/}" 2>/dev/null); then
+        st_set '.ff.path = $p' --arg p "${_vp}"
+    else
+        log_warn "path 格式不合法，使用默认值 /"
+        st_set '.ff.path = $p' --arg p "/"
+    fi
     log_info "已选: $(st_get '.ff.protocol')（path=${_p:-/}）"; echo ""
 }
 
@@ -1776,12 +1876,11 @@ ask_reality_mode() {
     local _dp; _dp=$(port_of reality)
     local _rp; prompt "监听端口（回车默认 ${_dp}）: " _rp
     if [ -n "${_rp:-}" ]; then
-        case "${_rp}" in
-            *[!0-9]*) log_warn "端口无效，使用默认值 ${_dp}";;
-            *) if [ "${_rp}" -ge 1 ] && [ "${_rp}" -le 65535 ]; then
-                   st_set '.ports.reality = ($p|tonumber)' --arg p "${_rp}"
-               else log_warn "端口超范围，使用默认值 ${_dp}"; fi;;
-        esac
+        if val_port "${_rp}" >/dev/null 2>&1; then
+            st_set '.ports.reality = ($p|tonumber)' --arg p "${_rp}"
+        else
+            log_warn "端口无效，使用默认值 ${_dp}"
+        fi
     fi
     port_mgr_in_use "$(port_of reality)" && \
         log_warn "端口 $(port_of reality) 已被占用，安装时将自动更换"
@@ -1820,12 +1919,11 @@ ask_vltcp_mode() {
     local _dp; _dp=$(port_of vltcp)
     local _vp; prompt "监听端口（回车默认 ${_dp}）: " _vp
     if [ -n "${_vp:-}" ]; then
-        case "${_vp}" in
-            *[!0-9]*) log_warn "端口无效，使用默认值 ${_dp}";;
-            *) if [ "${_vp}" -ge 1 ] && [ "${_vp}" -le 65535 ]; then
-                   st_set '.ports.vltcp = ($p|tonumber)' --arg p "${_vp}"
-               else log_warn "端口超范围"; fi;;
-        esac
+        if val_port "${_vp}" >/dev/null 2>&1; then
+            st_set '.ports.vltcp = ($p|tonumber)' --arg p "${_vp}"
+        else
+            log_warn "端口无效，使用默认值 ${_dp}"
+        fi
     fi
     port_mgr_in_use "$(port_of vltcp)" && log_warn "端口 $(port_of vltcp) 已被占用"
 
@@ -1855,8 +1953,8 @@ _menu_input_port() {
     prompt "新端口（回车随机）: " _p
     [ -z "${_p:-}" ] && _p=$(shuf -i 1024-65000 -n 1 2>/dev/null || \
                               awk 'BEGIN{srand();print int(rand()*63976)+1024}')
-    case "${_p:-}" in ''|*[!0-9]*) log_error "无效端口"; return 1;; esac
-    { [ "${_p}" -ge 1 ] && [ "${_p}" -le 65535 ]; } || { log_error "端口超范围"; return 1; }
+    # I3: 统一通过 val_port 校验，防止注入
+    val_port "${_p}" >/dev/null || return 1
     if port_mgr_in_use "${_p}"; then
         log_warn "端口 ${_p} 已被占用"
         local _a; prompt "仍然继续？(y/N): " _a
@@ -1944,28 +2042,28 @@ manage_argo() {
                 st_set '.argo.enabled = true' || { _pause; continue; }
                 config_apply || { st_set '.argo.enabled = false'; _pause; continue; }
                 svc_apply_tunnel; svc_reload_daemon
-                svc_exec enable "${_SVC_TUNNEL}"
-                svc_exec start  "${_SVC_TUNNEL}" \
+                svc_exec_mut enable "${_SVC_TUNNEL}"
+                svc_exec_mut start  "${_SVC_TUNNEL}" \
                     && log_ok "Argo 已启用并启动" \
                     || log_warn "启动失败，请检查域名配置"
                 st_persist || log_warn "state.json 写入失败" ;;
             2)
                 [ "${_en}" != "true" ] && { log_info "Argo 已禁用"; _pause; continue; }
-                svc_exec stop    "${_SVC_TUNNEL}" 2>/dev/null || true
-                svc_exec disable "${_SVC_TUNNEL}" 2>/dev/null || true
+                svc_exec_mut stop    "${_SVC_TUNNEL}" 2>/dev/null || true
+                svc_exec_mut disable "${_SVC_TUNNEL}" 2>/dev/null || true
                 st_set '.argo.enabled = false' || { _pause; continue; }
                 config_apply  || { _pause; continue; }
                 st_persist    || log_warn "state.json 写入失败"
                 log_ok "Argo 已禁用" ;;
             3)
                 [ "${_en}" != "true" ] && { log_warn "Argo 未启用"; _pause; continue; }
-                svc_exec restart "${_SVC_TUNNEL}" \
+                svc_exec_mut restart "${_SVC_TUNNEL}" \
                     && { log_ok "${_SVC_TUNNEL} 已重启"; svc_verify_health "${_SVC_TUNNEL}" 6; } \
                     || log_error "${_SVC_TUNNEL} 重启失败" ;;
             9)
                 _menu_confirm_uninstall "Argo" || { _pause; continue; }
-                svc_exec stop    "${_SVC_TUNNEL}" 2>/dev/null || true
-                svc_exec disable "${_SVC_TUNNEL}" 2>/dev/null || true
+                svc_exec_mut stop    "${_SVC_TUNNEL}" 2>/dev/null || true
+                svc_exec_mut disable "${_SVC_TUNNEL}" 2>/dev/null || true
                 if is_systemd; then
                     rm -f "/etc/systemd/system/${_SVC_TUNNEL}.service" 2>/dev/null || true
                     systemctl daemon-reload >/dev/null 2>&1 || true
@@ -2094,7 +2192,12 @@ manage_freeflow() {
                     local _p; prompt "新 path（回车保持 ${_path}）: " _p
                     if [ -n "${_p:-}" ]; then
                         case "${_p}" in /*) :;; *) _p="/${_p}";; esac
-                        st_set '.ff.path = $p' --arg p "${_p}" || { _pause; continue; }
+                        # I3: val_path 校验
+                        local _vp2
+                        if ! _vp2=$(val_path "${_p}" 2>/dev/null); then
+                            log_error "path 格式不合法"; _pause; continue
+                        fi
+                        st_set '.ff.path = $p' --arg p "${_vp2}" || { _pause; continue; }
                         config_apply && st_persist || true
                         log_ok "path 已更新: ${_p}"; config_print_nodes
                     fi
