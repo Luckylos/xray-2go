@@ -1604,38 +1604,72 @@ exec_update_uuid() {
 # §L13 Argo — 隧道配置 / 健康检查
 # ==============================================================================
 
-# 构建 cloudflared 启动命令（仅 systemd config 模式使用明文路径，token 走 env file）
+# 构建 cloudflared 启动命令
+# 两种模式统一使用 --config tunnel.yml，token 由 yml 内 token: 字段提供
 argo_build_tunnel_cmd() {
-    if [ -f "${WORK_DIR}/tunnel.yml" ]; then
-        printf '%s tunnel --no-autoupdate run --config %s' \
-            "${ARGO_BIN}" "${WORK_DIR}/tunnel.yml"
-    else
-        # token 模式：命令中不包含 token 明文，由 EnvironmentFile 注入
-        printf '%s tunnel --no-autoupdate run --token ${ARGO_TOKEN}' "${ARGO_BIN}"
-    fi
+    printf '%s tunnel --no-autoupdate run --config %s' \
+        "${ARGO_BIN}" "${WORK_DIR}/tunnel.yml"
 }
 
-_argo_gen_config_yml() {
+# json-cred 模式：生成含 tunnel:/credentials-file:/ingress: 的完整 yml
+_argo_gen_config_yml_cred() {
     local _domain="$1" _tid="$2" _cred="$3"
     local _port; _port=$(st_get '.argo.port')
-    local _content
-    _content=$(printf 'tunnel: %s\ncredentials-file: %s\n\ningress:\n  - hostname: %s\n    service: http://localhost:%s\n    originRequest:\n      connectTimeout: 30s\n      noTLSVerify: true\n  - service: http_status:404\n' \
+    local _new
+    _new=$(printf 'tunnel: %s\ncredentials-file: %s\n\ningress:\n  - hostname: %s\n    service: http://localhost:%s\n    originRequest:\n      connectTimeout: 30s\n      noTLSVerify: true\n  - service: http_status:404\n' \
         "${_tid}" "${_cred}" "${_domain}" "${_port}")
-    atomic_write "${WORK_DIR}/tunnel.yml" "${_content}" \
+    # 幂等：内容未变则跳过写入
+    local _cur; _cur=$(cat "${WORK_DIR}/tunnel.yml" 2>/dev/null || true)
+    [ "${_cur}" = "${_new}" ] && return 0
+    atomic_write "${WORK_DIR}/tunnel.yml" "${_new}" \
         || { log_error "tunnel.yml 写入失败"; return 1; }
-    log_ok "tunnel.yml 已生成 (${_domain} → localhost:${_port})"
+    log_ok "tunnel.yml 已更新 [cred] (${_domain} → localhost:${_port})"
 }
 
-_argo_regen_tunnel_yml() {
-    [ -f "${WORK_DIR}/tunnel.yml" ] || return 0
-    local _domain _tid
-    _domain=$(st_get '.argo.domain')
-    _tid=$(jq -r 'if (.TunnelID? // "") != "" then .TunnelID
-                  elif (.AccountTag? // "") != "" then .AccountTag
-                  else empty end' "${WORK_DIR}/tunnel.json" 2>/dev/null) || true
-    [ -n "${_domain:-}" ] && [ -n "${_tid:-}" ] \
-        && _argo_gen_config_yml "${_domain}" "${_tid}" "${WORK_DIR}/tunnel.json" \
-        || log_warn "tunnel.yml 端口同步跳过：缺少 domain/tid"
+# token 模式：生成含 token:/ingress: 的 yml（不含 credentials-file）
+# cloudflared 读取本地 ingress 覆盖 Cloudflare 控制台的远端路由，消除端口 desync
+_argo_gen_config_yml_token() {
+    local _domain="$1" _token="$2"
+    local _port; _port=$(st_get '.argo.port')
+    local _new
+    _new=$(printf 'tunnel: %s\n\ningress:\n  - hostname: %s\n    service: http://localhost:%s\n    originRequest:\n      connectTimeout: 30s\n      noTLSVerify: true\n  - service: http_status:404\n' \
+        "${_token}" "${_domain}" "${_port}")
+    # 幂等：内容未变则跳过写入
+    local _cur; _cur=$(cat "${WORK_DIR}/tunnel.yml" 2>/dev/null || true)
+    [ "${_cur}" = "${_new}" ] && return 0
+    atomic_write "${WORK_DIR}/tunnel.yml" "${_new}" \
+        || { log_error "tunnel.yml 写入失败"; return 1; }
+    log_ok "tunnel.yml 已更新 [token] (${_domain} → localhost:${_port})"
+}
+
+# 统一同步入口：根据当前 state 中的模式重建 tunnel.yml
+# 两种模式均强制执行，不再以 tunnel.yml 是否存在作为门控
+# 调用方：exec_update_argo_port / svc_apply_tunnel
+_argo_sync_tunnel_yml() {
+    [ "$(st_get '.argo.enabled')" = "true" ] || return 0
+    local _domain; _domain=$(st_get '.argo.domain')
+    [ -n "${_domain:-}" ] && [ "${_domain}" != "null" ] || {
+        log_warn "tunnel.yml 同步跳过：domain 未配置"
+        return 0
+    }
+
+    if [ -f "${WORK_DIR}/tunnel.json" ]; then
+        # json-cred 模式
+        local _tid
+        _tid=$(jq -r 'if (.TunnelID? // "") != "" then .TunnelID
+                      elif (.AccountTag? // "") != "" then .AccountTag
+                      else empty end' "${WORK_DIR}/tunnel.json" 2>/dev/null) || true
+        [ -n "${_tid:-}" ] || { log_warn "tunnel.yml 同步跳过：无法提取 TunnelID"; return 0; }
+        _argo_gen_config_yml_cred "${_domain}" "${_tid}" "${WORK_DIR}/tunnel.json"
+    else
+        # token 模式：从 state 读取 token
+        local _token; _token=$(st_get '.argo.token')
+        [ -n "${_token:-}" ] && [ "${_token}" != "null" ] || {
+            log_warn "tunnel.yml 同步跳过：token 未配置"
+            return 0
+        }
+        _argo_gen_config_yml_token "${_domain}" "${_token}"
+    fi
 }
 
 argo_apply_fixed_tunnel() {
@@ -1663,13 +1697,16 @@ argo_apply_fixed_tunnel() {
             log_error "TunnelID 含非法字符，拒绝写入"; return 1;; esac
         local _cred="${WORK_DIR}/tunnel.json"
         atomic_write "${_cred}" "${_auth}" || { log_error "凭证写入失败"; return 1; }
-        _argo_gen_config_yml "${_domain}" "${_tid}" "${_cred}" || return 1
+        _argo_gen_config_yml_cred "${_domain}" "${_tid}" "${_cred}" || return 1
         st_set '.argo.token = null | .argo.domain = $d | .argo.mode = "fixed"' \
             --arg d "${_domain}" || return 1
     elif printf '%s' "${_auth}" | grep -qE '^[A-Za-z0-9=_-]{120,250}$'; then
         st_set '.argo.token = $t | .argo.domain = $d | .argo.mode = "fixed"' \
             --arg t "${_auth}" --arg d "${_domain}" || return 1
-        rm -f "${WORK_DIR}/tunnel.yml" "${WORK_DIR}/tunnel.json"
+        # 强制生成本地 tunnel.yml，确保 ingress 绑定到当前 .argo.port
+        # 不再依赖 Cloudflare 控制台远端路由，消除端口 desync
+        rm -f "${WORK_DIR}/tunnel.json" 2>/dev/null || true
+        _argo_gen_config_yml_token "${_domain}" "${_auth}" || return 1
     else
         log_error "密钥格式无法识别（JSON 需含 TunnelSecret；Token 为 120-250 位字母数字串）"
         return 1
@@ -1711,7 +1748,7 @@ argo_check_health() {
 
 exec_update_argo_port() {
     local _p; _p=$(_menu_input_port '.argo.port') || return 1
-    _argo_regen_tunnel_yml
+    _argo_sync_tunnel_yml || return 1
     config_apply || return 1
     svc_apply_tunnel; svc_reload_daemon
     svc_exec restart "${_SVC_TUNNEL}" || log_warn "tunnel 重启失败，请手动重启"
