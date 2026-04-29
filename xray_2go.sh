@@ -295,7 +295,7 @@ _G_STATE=""
 
 readonly _STATE_DEFAULT='{
   "uuid":    "",
-  "argo":    {"enabled":true,  "protocol":"ws",   "port":18888,
+  "argo":    {"enabled":true,  "protocol":"ws",   "port":8888,
               "mode":"fixed",  "domain":null,      "token":null},
   "ff":      {"enabled":false, "protocol":"none", "path":"/", "host":""},
   "reality": {"enabled":false, "port":443, "sni":"addons.mozilla.org",
