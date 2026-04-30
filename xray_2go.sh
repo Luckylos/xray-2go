@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# xray-2go v9.1  — 插件化协议平台（Plugin-based Proxy Platform）
+# xray-2go v9.2-refactor  — 插件化协议平台（Plugin-based Proxy Platform）
 # 安全基线：S1-S6 注入防护 · C1-C5 并发安全 · A1-A5 架构一致性
 # 协议支持：Argo · FreeFlow · Reality · VLESS-TCP（均以插件形式加载）
-# 平台支持：Debian/Ubuntu (systemd) · Alpine (OpenRC)
+# 平台支持：Debian/Ubuntu/RHEL系 (systemd) · Alpine (OpenRC；Argo/cloudflared 需用户预装官方 cloudflared)
 # ==============================================================================
-set -uo pipefail
+set -uo pipefail  # 保持兼容交互菜单；关键路径显式检查返回值
 [ "${BASH_VERSINFO[0]}" -ge 4 ] \
     || { printf '\033[1;91m[ERR ] 需要 bash 4.0 或更高版本\033[0m\n' >&2; exit 1; }
 
@@ -34,8 +34,6 @@ readonly _SVC_TUNNEL="tunnel2go"
 
 readonly _XRAY_MIRRORS=(
     "https://github.com/XTLS/Xray-core/releases/download"
-    "https://ghfast.top/https://github.com/XTLS/Xray-core/releases/download"
-    "https://hub.fastgit.xyz/XTLS/Xray-core/releases/download"
 )
 
 readonly _XPAD_JSON='{"xPaddingObfsMode":true,"xPaddingMethod":"tokenish","xPaddingPlacement":"queryInHeader","xPaddingHeader":"X-Cache","xPaddingKey":"_Luckylos"}'
@@ -310,6 +308,31 @@ atomic_write_with_backup() {
     atomic_write "${_dest}" "${_content}"
 }
 
+# 写入敏感文件：同 FS 原子替换 + 强制 0600，避免 state/token/凭证泄露。
+atomic_write_secret() {
+    local _dest="$1" _content="$2"
+    local _old_umask _rc
+    _old_umask=$(umask)
+    umask 077
+    atomic_write "${_dest}" "${_content}"
+    _rc=$?
+    umask "${_old_umask}"
+    [ "${_rc}" -eq 0 ] || return "${_rc}"
+    chmod 600 "${_dest}" 2>/dev/null || true
+}
+
+atomic_write_secret_with_backup() {
+    local _dest="$1" _content="$2" _keep="${3:-3}"
+    if [ -f "${_dest}" ]; then
+        local _ts; _ts=$(date +%Y%m%d_%H%M%S 2>/dev/null || printf 'bak')
+        cp -f "${_dest}" "${_dest}.${_ts}.bak" 2>/dev/null || true
+        chmod 600 "${_dest}.${_ts}.bak" 2>/dev/null || true
+        ls -t "${_dest}".*.bak 2>/dev/null \
+            | tail -n "+$(( _keep + 1 ))" | xargs rm -f 2>/dev/null || true
+    fi
+    atomic_write_secret "${_dest}" "${_content}"
+}
+
 # ── 文件锁（串行化所有 read-modify-write）────────────────────────────────────
 with_lock() {
     local _fn="$1"; shift
@@ -378,11 +401,36 @@ val_path() {
     printf '%s' "${_p}"
 }
 
+# val_listen_addr: 限制 Xray listen 为明确的 IP 监听地址，避免坏 state 导致配置失败
+val_listen_addr() {
+    local _a="${1:-}"
+    case "${_a}" in
+        0.0.0.0|127.0.0.1|::|::1) printf '%s' "${_a}"; return 0 ;;
+    esac
+    if printf '%s' "${_a}" | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}$'; then
+        local IFS=. _o
+        for _o in ${_a}; do
+            [ "${_o}" -ge 0 ] 2>/dev/null && [ "${_o}" -le 255 ] 2>/dev/null || { log_error "非法监听地址: ${_a}"; return 1; }
+        done
+        printf '%s' "${_a}"; return 0
+    fi
+    if printf '%s' "${_a}" | grep -qE '^[0-9A-Fa-f:]+$' && printf '%s' "${_a}" | grep -q ':'; then
+        printf '%s' "${_a}"; return 0
+    fi
+    log_error "非法监听地址: ${_a}"
+    return 1
+}
+
+# 简单事务：配置变更失败时恢复内存 state，避免坏状态后续被持久化
+state_checkpoint() { _G_STATE_SNAPSHOT="${_G_STATE}"; }
+state_rollback()  { [ -n "${_G_STATE_SNAPSHOT:-}" ] && _G_STATE="${_G_STATE_SNAPSHOT}"; _G_STATE_SNAPSHOT=""; }
+state_commit()    { _G_STATE_SNAPSHOT=""; }
+
 _st_persist_inner() {
     local _json
     _json=$(printf '%s\n' "${_G_STATE}" | jq . 2>/dev/null) \
         || { log_error "state 序列化失败"; return 1; }
-    atomic_write_with_backup "${STATE_FILE}" "${_json}" 3 || return 1
+    atomic_write_secret_with_backup "${STATE_FILE}" "${_json}" 3 || return 1
     # S5: state.json 含 token 等敏感数据，严格限制权限
     chmod 600 "${STATE_FILE}" 2>/dev/null || true
 }
@@ -510,6 +558,8 @@ plugin_call() {
 # 将所有内置协议插件写入 PLUGIN_DIR（首次运行或插件缺失时调用）
 plugin_install_builtins() {
     mkdir -p "${PLUGIN_DIR}"
+    # 内置插件属于脚本版本的一部分：每次运行覆盖写入，确保安全/兼容性修复能随主脚本生效。
+    # 用户自定义插件请使用其它文件名，避免与 argo/ff/reality/vltcp 内置插件重名。
     _plugin_write_argo
     _plugin_write_ff
     _plugin_write_reality
@@ -1041,55 +1091,34 @@ _svc_write_file() {
     local _dest="$1" _content="$2"
     local _cur; _cur=$(cat "${_dest}" 2>/dev/null || printf '')
     if [ "${_cur}" != "${_content}" ]; then
-        atomic_write "${_dest}" "${_content}" || return 0
+        atomic_write "${_dest}" "${_content}" || return 1
         is_systemd && _G_SYSD_DIRTY=1
     fi
     return 0
 }
 
-# ── 热重载（Hot Reload）─────────────────────────────────────────────────────
-# 检测 config.json 是否发生变化（hash 比对），仅变更时才 reload/restart
-# xray 支持 SIGHUP 热重载（无需重启进程，连接不中断）
+# ── 配置重载策略 ──────────────────────────────────────────────────────────────
+# 遵循保守、可验证的服务管理路径：不依赖未确认的信号重载契约，统一通过 init 系统 restart。
 svc_reload_xray() {
     [ -f "${CONFIG_FILE}" ] || { log_error "配置文件不存在"; return 1; }
 
-    # 计算当前 config hash
     local _new_hash
     _new_hash=$(sha256sum "${CONFIG_FILE}" 2>/dev/null | awk '{print $1}') || \
         _new_hash=$(md5sum  "${CONFIG_FILE}" 2>/dev/null | awk '{print $1}') || \
         _new_hash="unknown"
 
-    # 读取上次 hash
     local _old_hash=""
     [ -f "${_CONFIG_HASH_FILE}" ] && _old_hash=$(cat "${_CONFIG_HASH_FILE}" 2>/dev/null || true)
 
     if [ "${_new_hash}" = "${_old_hash}" ] && [ "${_new_hash}" != "unknown" ]; then
-        log_info "config.json 未变化，跳过 reload"
+        log_info "config.json 未变化，跳过 restart"
         return 0
     fi
 
-    log_step "热重载 xray 配置..."
-
-    # 尝试 SIGHUP 热重载（xray 支持，无需断开连接）
-    local _xray_pid
-    _xray_pid=$(pgrep -x xray 2>/dev/null | head -1) || true
-    if [ -n "${_xray_pid:-}" ]; then
-        if kill -HUP "${_xray_pid}" 2>/dev/null; then
-            sleep 0.5
-            # 验证进程仍存活（热重载未导致崩溃）
-            if kill -0 "${_xray_pid}" 2>/dev/null; then
-                printf '%s' "${_new_hash}" > "${_CONFIG_HASH_FILE}" 2>/dev/null || true
-                log_ok "xray 热重载成功 (SIGHUP, pid=${_xray_pid})"
-                return 0
-            fi
-        fi
-    fi
-
-    # fallback：restart（C3: 通过 svc_exec_mut 加锁防并发）
-    log_info "热重载不可用，执行 restart..."
+    log_step "重启 xray2go 以加载新配置..."
     svc_exec_mut restart "${_SVC_XRAY}" || { log_error "xray restart 失败"; return 1; }
     printf '%s' "${_new_hash}" > "${_CONFIG_HASH_FILE}" 2>/dev/null || true
-    log_ok "xray 已重启"
+    log_ok "xray 已重启并加载新配置"
 }
 
 # ── 服务单元模板 ──────────────────────────────────────────────────────────────
@@ -1104,16 +1133,32 @@ _svc_tpl_xray_openrc() {
         "${XRAY_BIN}" "${CONFIG_FILE}"
 }
 
-# tunnel 服务：两种模式统一使用 --config tunnel.yml
-# token 通过 _ARGO_ENV_FILE 注入（不出现在命令行）
+# tunnel 服务：按 Cloudflare 官方两类运行方式区分：
+#   - token/remote-managed tunnel：cloudflared tunnel run --token <token>
+#   - credentials/local-managed tunnel：cloudflared tunnel --config <config.yml> run
 _svc_tpl_tunnel_systemd() {
-    printf '[Unit]\nDescription=Cloudflare Tunnel2go\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nNoNewPrivileges=yes\nTimeoutStartSec=0\nEnvironmentFile=-%s\nExecStart=%s tunnel --no-autoupdate run --config %s\nRestart=on-failure\nRestartSec=5\nStandardOutput=null\nStandardError=null\n\n[Install]\nWantedBy=multi-user.target\n' \
-        "${_ARGO_ENV_FILE}" "${ARGO_BIN}" "${WORK_DIR}/tunnel.yml"
+    local _token; _token=$(st_get '.argo.token')
+    if [ -n "${_token:-}" ] && [ "${_token}" != "null" ] && [ ! -f "${WORK_DIR}/tunnel.json" ]; then
+        # token 模式采用 Cloudflare 官方 --token 参数；token 通过 0600 EnvironmentFile 注入，避免写入 unit 和 tunnel.yml。
+        # 注意：官方 token CLI 模式会把 token 展开到进程 argv；若本机多用户不可信，请优先使用 credentials/local-managed 模式或加固 /proc 可见性。
+        printf '[Unit]\nDescription=Cloudflare Tunnel2go (token mode)\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nNoNewPrivileges=yes\nTimeoutStartSec=0\nEnvironmentFile=%s\nExecStart=%s tunnel --no-autoupdate run --token ${TUNNEL_TOKEN}\nRestart=on-failure\nRestartSec=5\nStandardOutput=null\nStandardError=null\n\n[Install]\nWantedBy=multi-user.target\n' \
+            "${_ARGO_ENV_FILE}" "${ARGO_BIN}"
+    else
+        printf '[Unit]\nDescription=Cloudflare Tunnel2go (credentials mode)\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nNoNewPrivileges=yes\nTimeoutStartSec=0\nEnvironmentFile=-%s\nExecStart=%s tunnel --no-autoupdate --config %s run\nRestart=on-failure\nRestartSec=5\nStandardOutput=null\nStandardError=null\n\n[Install]\nWantedBy=multi-user.target\n' \
+            "${_ARGO_ENV_FILE}" "${ARGO_BIN}" "${WORK_DIR}/tunnel.yml"
+    fi
 }
 
 _svc_tpl_tunnel_openrc() {
-    printf '#!/sbin/openrc-run\ndescription="Cloudflare Tunnel2go"\ndepend() { need net; }\nstart() {\n    . %s 2>/dev/null || true\n    ebegin "Starting tunnel2go"\n    start-stop-daemon --start --background \\\n        --make-pidfile --pidfile /var/run/tunnel2go.pid \\\n        --exec %s -- tunnel --no-autoupdate run --config %s\n    eend $?\n}\nstop() { start-stop-daemon --stop --pidfile /var/run/tunnel2go.pid; }\n' \
-        "${_ARGO_ENV_FILE}" "${ARGO_BIN}" "${WORK_DIR}/tunnel.yml"
+    local _token; _token=$(st_get '.argo.token')
+    if [ -n "${_token:-}" ] && [ "${_token}" != "null" ] && [ ! -f "${WORK_DIR}/tunnel.json" ]; then
+        # 不 source env 文件，避免把动态文件作为 shell 代码执行；只解析固定 TUNNEL_TOKEN 键。
+        printf '#!/sbin/openrc-run\ndescription="Cloudflare Tunnel2go (token mode)"\ndepend() { need net; }\nstart() {\n    if [ -f %s ]; then\n        TUNNEL_TOKEN=$(grep -m1 "^TUNNEL_TOKEN=" %s | cut -d= -f2-)\n        export TUNNEL_TOKEN\n    fi\n    ebegin "Starting tunnel2go"\n    start-stop-daemon --start --background \\\n        --make-pidfile --pidfile /var/run/tunnel2go.pid \\\n        --exec %s -- tunnel --no-autoupdate run --token "${TUNNEL_TOKEN}"\n    eend $?\n}\nstop() { start-stop-daemon --stop --pidfile /var/run/tunnel2go.pid; }\n' \
+            "${_ARGO_ENV_FILE}" "${_ARGO_ENV_FILE}" "${ARGO_BIN}"
+    else
+        printf '#!/sbin/openrc-run\ndescription="Cloudflare Tunnel2go (credentials mode)"\ndepend() { need net; }\nstart() {\n    ebegin "Starting tunnel2go"\n    start-stop-daemon --start --background \\\n        --make-pidfile --pidfile /var/run/tunnel2go.pid \\\n        --exec %s -- tunnel --no-autoupdate --config %s run\n    eend $?\n}\nstop() { start-stop-daemon --stop --pidfile /var/run/tunnel2go.pid; }\n' \
+            "${ARGO_BIN}" "${WORK_DIR}/tunnel.yml"
+    fi
 }
 
 _svc_write_argo_env() {
@@ -1125,27 +1170,28 @@ _svc_write_argo_env() {
     # 防止 token 含换行导致 env file 解析错误
     local _safe_token="${_token:-}"
     _safe_token=$(printf '%s' "${_safe_token}" | tr -d '\n\r')
-    atomic_write "${_ARGO_ENV_FILE}" "$(printf 'ARGO_TOKEN=%s\n' "${_safe_token}")"
+    atomic_write_secret "${_ARGO_ENV_FILE}" "$(printf 'ARGO_TOKEN=%s\nTUNNEL_TOKEN=%s\n' "${_safe_token}" "${_safe_token}")" \
+        || { log_error "Argo env 写入失败"; return 1; }
     chmod 600 "${_ARGO_ENV_FILE}" 2>/dev/null || true
 }
 
 svc_apply_xray() {
     if is_systemd; then
-        _svc_write_file "/etc/systemd/system/${_SVC_XRAY}.service" "$(_svc_tpl_xray_systemd)"
+        _svc_write_file "/etc/systemd/system/${_SVC_XRAY}.service" "$(_svc_tpl_xray_systemd)" || return 1
     else
         local _f="/etc/init.d/${_SVC_XRAY}"
-        _svc_write_file "${_f}" "$(_svc_tpl_xray_openrc)"
+        _svc_write_file "${_f}" "$(_svc_tpl_xray_openrc)" || return 1
         chmod +x "${_f}" 2>/dev/null || true
     fi
 }
 
 svc_apply_tunnel() {
-    _svc_write_argo_env
+    _svc_write_argo_env || return 1
     if is_systemd; then
-        _svc_write_file "/etc/systemd/system/${_SVC_TUNNEL}.service" "$(_svc_tpl_tunnel_systemd)"
+        _svc_write_file "/etc/systemd/system/${_SVC_TUNNEL}.service" "$(_svc_tpl_tunnel_systemd)" || return 1
     else
         local _f="/etc/init.d/${_SVC_TUNNEL}"
-        _svc_write_file "${_f}" "$(_svc_tpl_tunnel_openrc)"
+        _svc_write_file "${_f}" "$(_svc_tpl_tunnel_openrc)" || return 1
         chmod +x "${_f}" 2>/dev/null || true
     fi
 }
@@ -1203,7 +1249,7 @@ crypto_gen_reality_sid() {
 }
 
 # ==============================================================================
-# §L10 Config — 插件驱动合成 + 原子提交 + 热重载
+# §L10 Config — 插件驱动合成 + 原子提交 + 服务重启
 # ==============================================================================
 
 # 遍历插件注册表，收集所有 inbound → JSON 数组
@@ -1228,8 +1274,8 @@ config_build_inbounds() {
         # 端口冲突检测（换行分隔精确匹配）
         if [ -n "${_used_keys:-}" ] && \
            printf '%s\n' "${_used_keys}" | grep -qxF "${_key}"; then
-            log_error "端口冲突: ${_key}，跳过插件 [${_name}]"
-            continue
+            log_error "端口冲突: ${_key}，插件 [${_name}] 与已启用入站冲突"
+            return 1
         fi
         _used_keys="${_used_keys:+${_used_keys}
 }${_key}"
@@ -1280,7 +1326,7 @@ _config_apply_inner() {
     rm -f "${_t}" 2>/dev/null || true
     log_ok "config.json 已原子更新"
 
-    # 热重载（xray 运行中才执行）
+    # 服务运行中才执行重启加载
     if svc_exec status "${_SVC_XRAY}" >/dev/null 2>&1; then
         svc_reload_xray || return 1
     fi
@@ -1314,17 +1360,21 @@ _commit() {
 }
 
 # ==============================================================================
-# §L11 Argo Tunnel — tunnel.yml 管理（统一端口层）
+# §L11 Argo Tunnel — tunnel.yml / token 管理（遵循 Cloudflare 官方运行方式）
 # ==============================================================================
 # 核心设计：
-#   两种模式（token/cred）均强制生成本地 tunnel.yml
-#   ingress 绑定到 port_of argo（单一数据源），消除端口 desync
-#   token 通过 _ARGO_ENV_FILE 注入，不出现在 yml 或命令行
+#   - token/remote-managed tunnel：官方命令 cloudflared tunnel run --token <token>
+#     token 仅存入 0600 env 文件；ingress 由 Cloudflare Zero Trust 远端配置管理。
+#   - credentials/local-managed tunnel：官方命令 cloudflared tunnel --config tunnel.yml run
+#     tunnel.yml 包含 tunnel ID、credentials-file 与本地 ingress。
 
 argo_build_tunnel_cmd() {
-    # 两种模式均使用 --config tunnel.yml
-    printf '%s tunnel --no-autoupdate run --config %s' \
-        "${ARGO_BIN}" "${WORK_DIR}/tunnel.yml"
+    local _token; _token=$(st_get '.argo.token')
+    if [ -n "${_token:-}" ] && [ "${_token}" != "null" ] && [ ! -f "${WORK_DIR}/tunnel.json" ]; then
+        printf '%s tunnel --no-autoupdate run --token <redacted>' "${ARGO_BIN}"
+    else
+        printf '%s tunnel --no-autoupdate --config %s run' "${ARGO_BIN}" "${WORK_DIR}/tunnel.yml"
+    fi
 }
 
 # 生成 tunnel.yml（cred 模式：含 credentials-file）
@@ -1349,37 +1399,24 @@ ingress:
 '         "${_tid}" "${_cred}" "${_domain}" "${_port}")
     local _cur; _cur=$(cat "${WORK_DIR}/tunnel.yml" 2>/dev/null || true)
     [ "${_cur}" = "${_new}" ] && return 0
-    atomic_write "${WORK_DIR}/tunnel.yml" "${_new}"         || { log_error "tunnel.yml 写入失败"; return 1; }
+    atomic_write_secret "${WORK_DIR}/tunnel.yml" "${_new}"         || { log_error "tunnel.yml 写入失败"; return 1; }
     log_ok "tunnel.yml 已更新 [cred] (${_domain} → localhost:${_port})"
 }
 
-# 生成 tunnel.yml（token 模式：tunnel 字段为 token，无 credentials-file）
-# cloudflared 读取本地 ingress 覆盖控制台远端配置，消除端口 desync
+# token 模式：不生成 tunnel.yml；采用 Cloudflare 官方 remote-managed tunnel token 运行方式。
+# 本地脚本只能保存 token 和域名状态；ingress 应在 Cloudflare Zero Trust 远端配置为 http://localhost:<argo-port>。
 _argo_gen_yml_token() {
     local _domain="$1" _token="$2"
-    # S2: 校验端口和域名，防止 YAML 注入
+    # token/remote-managed tunnel：不把 token 写入 tunnel.yml；token 仅写入 0600 env file。
+    # 注意：cloudflared token 模式的 ingress 通常由 Cloudflare 远端配置管理；本地无法可靠覆盖 ingress。
     local _port; _port=$(val_port "$(port_of argo)") || return 1
     val_domain "${_domain}" >/dev/null || return 1
-    # token 仅允许 base64url 字符集（cloudflared token 格式）
-    printf '%s' "${_token}" | grep -qE '^[A-Za-z0-9=_-]{20,}$'         || { log_error "token 格式非法，拒绝写入 YAML"; return 1; }
-    local _new
-    _new=$(printf 'tunnel: %s
-
-ingress:
-  - hostname: %s
-    service: http://localhost:%s
-    originRequest:
-      connectTimeout: 30s
-      noTLSVerify: true
-  - service: http_status:404
-'         "${_token}" "${_domain}" "${_port}")
-    local _cur; _cur=$(cat "${WORK_DIR}/tunnel.yml" 2>/dev/null || true)
-    [ "${_cur}" = "${_new}" ] && return 0
-    atomic_write "${WORK_DIR}/tunnel.yml" "${_new}"         || { log_error "tunnel.yml 写入失败"; return 1; }
-    log_ok "tunnel.yml 已更新 [token] (${_domain} → localhost:${_port})"
+    printf '%s' "${_token}" | grep -qE '^[A-Za-z0-9=_-]{20,}$'         || { log_error "token 格式非法"; return 1; }
+    rm -f "${WORK_DIR}/tunnel.yml" 2>/dev/null || true
+    log_ok "token 模式已配置：token 保存于 ${_ARGO_ENV_FILE}；请在 Cloudflare Zero Trust 远端将 Public Hostname 服务指向 http://localhost:${_port}"
 }
 
-# 统一同步入口：根据 state 模式重建 tunnel.yml（无门控，两种模式均执行）
+# 统一同步入口：cred 模式重建 tunnel.yml；token/remote-managed 模式仅校验并提示远端 ingress。
 # 调用方：exec_update_argo_port / svc_apply_tunnel / _commit 后的端口变更
 argo_sync_tunnel_yml() {
     [ "$(st_get '.argo.enabled')" = "true" ] || return 0
@@ -1428,7 +1465,7 @@ argo_apply_fixed_tunnel() {
         case "${_tid}" in *$'\n'*|*'"'*|*"'"*|*':'*)
             log_error "TunnelID 含非法字符"; return 1;; esac
         local _cred="${WORK_DIR}/tunnel.json"
-        atomic_write "${_cred}" "${_auth}" || { log_error "凭证写入失败"; return 1; }
+        atomic_write_secret "${_cred}" "${_auth}" || { log_error "凭证写入失败"; return 1; }
         # S5: 凭证文件含 TunnelSecret，严格限制权限
         chmod 600 "${_cred}" 2>/dev/null || true
         _argo_gen_yml_cred "${_domain}" "${_tid}" "${_cred}" || return 1
@@ -1444,10 +1481,10 @@ argo_apply_fixed_tunnel() {
         return 1
     fi
 
-    _svc_write_argo_env
-    svc_apply_tunnel
+    _svc_write_argo_env || return 1
+    svc_apply_tunnel || return 1
     svc_reload_daemon
-    svc_exec enable "${_SVC_TUNNEL}" 2>/dev/null || true
+    svc_exec_mut enable "${_SVC_TUNNEL}" 2>/dev/null || true
     config_apply  || return 1
     st_persist    || log_warn "state.json 写入失败"
     # C2/C3: tunnel restart 通过 svc_exec_mut 加锁
@@ -1476,21 +1513,21 @@ argo_check_health() {
     return 1
 }
 
-# 修改 Argo 端口：同步 tunnel.yml + xray inbound + 防火墙 + 重启 tunnel
+# 修改 Argo 端口：同步 xray inbound；cred/local-managed 模式同步 tunnel.yml；token/remote-managed 模式提示远端同步
 exec_update_argo_port() {
     local _p; _p=$(_menu_input_port '.ports.argo') || return 1
-    # 1. 同步 tunnel.yml ingress（端口已由 _menu_input_port 写入 .ports.argo）
+    # 1. cred/local-managed 模式同步 tunnel.yml；token/remote-managed 模式仅校验并提示 Cloudflare 远端 ingress
     argo_sync_tunnel_yml || return 1
     # 2. 重建 xray config（插件读取新端口）
     config_apply || return 1
     # 3. 更新 tunnel 服务单元（命令不变，但 env 可能变）
-    svc_apply_tunnel; svc_reload_daemon
+    svc_apply_tunnel || return 1; svc_reload_daemon
     # 4. 重启 tunnel 使新 tunnel.yml 生效
     # C2: 端口变更后 tunnel restart 通过 svc_exec_mut 加锁
     svc_exec_mut restart "${_SVC_TUNNEL}" || log_warn "tunnel 重启失败，请手动重启"
     st_persist || log_warn "state.json 写入失败"
     fw_reconcile
-    log_ok "Argo 端口已更新: ${_p}（xray inbound + tunnel ingress 均已同步）"
+    log_ok "Argo 端口已更新: ${_p}（xray inbound 已同步；cred/local-managed tunnel.yml 已同步，token/remote-managed 模式需在 Cloudflare Zero Trust 远端确认 Public Hostname 指向 http://localhost:${_p}）"
     config_print_nodes
 }
 
@@ -1544,27 +1581,23 @@ download_xray() {
     log_info "xray 健康检查未通过，重新下载..."
     rm -f "${XRAY_BIN}" 2>/dev/null || true
     local _tag; _tag=$(_xray_latest_tag) || true
-    [ -z "${_tag:-}" ] && { log_warn "无法获取版本号，使用 latest"; _tag="latest"; }
+    [ -z "${_tag:-}" ] && { log_error "无法获取 Xray 最新版本号，拒绝使用未校验 latest 下载"; return 1; }
     local _zip_name="Xray-linux-${_G_ARCH_XRAY}.zip"
     local _z; _z=$(tmp_file "xray_XXXXXX.zip") || return 1
     _xray_download_with_fallback "${_zip_name}" "${_z}" "${_tag}" || return 1
-    if [ "${_tag}" != "latest" ] && command -v sha256sum >/dev/null 2>&1; then
-        log_step "校验 SHA256..."
-        local _dgst _expected _actual
-        _dgst=$(curl -sfL --max-time 15 \
-            "https://github.com/XTLS/Xray-core/releases/download/${_tag}/${_zip_name}.dgst" \
-            2>/dev/null) || true
-        _expected=$(printf '%s' "${_dgst:-}" | grep -i 'SHA2-256' | awk '{print $NF}' | head -1 | tr -d '[:space:]')
-        if [ -n "${_expected:-}" ]; then
-            _actual=$(sha256sum "${_z}" | awk '{print $1}')
-            if [ "${_actual}" != "${_expected}" ]; then
-                log_error "SHA256 校验失败"; rm -f "${_z}"; return 1
-            fi
-            log_ok "SHA256 校验通过"
-        else
-            log_warn "未获取到 SHA256，跳过校验"
-        fi
+    command -v sha256sum >/dev/null 2>&1 || { log_error "缺少 sha256sum，拒绝安装未校验 Xray 二进制"; rm -f "${_z}"; return 1; }
+    log_step "校验 SHA256..."
+    local _dgst _expected _actual
+    _dgst=$(curl -sfL --max-time 15 \
+        "https://github.com/XTLS/Xray-core/releases/download/${_tag}/${_zip_name}.dgst" \
+        2>/dev/null) || true
+    _expected=$(printf '%s' "${_dgst:-}" | grep -i 'SHA2-256' | awk '{print $NF}' | head -1 | tr -d '[:space:]')
+    [ -n "${_expected:-}" ] || { log_error "未获取到 Xray SHA256 摘要，拒绝继续"; rm -f "${_z}"; return 1; }
+    _actual=$(sha256sum "${_z}" | awk '{print $1}')
+    if [ "${_actual}" != "${_expected}" ]; then
+        log_error "SHA256 校验失败"; rm -f "${_z}"; return 1
     fi
+    log_ok "SHA256 校验通过"
     unzip -t "${_z}" >/dev/null 2>&1 || { log_error "zip 文件损坏"; rm -f "${_z}"; return 1; }
     unzip -o "${_z}" xray -d "${WORK_DIR}/" >/dev/null 2>&1 || { log_error "解压失败"; return 1; }
     [ -f "${XRAY_BIN}" ] || { log_error "解压后未找到 xray 二进制"; return 1; }
@@ -1578,19 +1611,54 @@ download_cloudflared() {
     if [ -f "${ARGO_BIN}" ] && [ -x "${ARGO_BIN}" ]; then
         log_info "cloudflared 已存在，跳过下载"; return 0
     fi
-    rm -f "${ARGO_BIN}" 2>/dev/null || true
-    local _url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${_G_ARCH_CF}"
-    log_step "下载 cloudflared (${_G_ARCH_CF}) ..."
-    curl -sfL --connect-timeout 15 --max-time 120 -o "${ARGO_BIN}" "${_url}"
-    [ $? -ne 0 ] && { rm -f "${ARGO_BIN}"; log_error "cloudflared 下载失败"; return 1; }
-    [ -s "${ARGO_BIN}" ] || { rm -f "${ARGO_BIN}"; log_error "cloudflared 文件为空"; return 1; }
-    local _size; _size=$(wc -c < "${ARGO_BIN}" 2>/dev/null || printf '0')
-    if [ "${_size}" -lt 5000000 ]; then
-        log_error "cloudflared 文件大小异常 (${_size} bytes < 5MB)"; rm -f "${ARGO_BIN}"; return 1
+    local _existing_cf; _existing_cf=$(command -v cloudflared 2>/dev/null || true)
+    if [ -n "${_existing_cf:-}" ]; then
+        cp -f "${_existing_cf}" "${ARGO_BIN}" || { log_error "复制 cloudflared 到 ${ARGO_BIN} 失败"; return 1; }
+        chmod +x "${ARGO_BIN}"
+        "${ARGO_BIN}" --version >/dev/null 2>&1 || { log_error "cloudflared --version 验证失败"; return 1; }
+        log_ok "使用系统已安装的 cloudflared: ${_existing_cf}"
+        return 0
     fi
+    rm -f "${ARGO_BIN}" 2>/dev/null || true
+
+    # 官方最佳实践优先：使用 Cloudflare 软件仓库/系统包管理器安装 cloudflared，避免脚本自管裸二进制校验链。
+    log_step "通过系统包管理器安装 cloudflared..."
+    if command -v apt-get >/dev/null 2>&1; then
+        platform_pkg_require ca-certificates update-ca-certificates
+        platform_pkg_require curl curl
+        mkdir -p /usr/share/keyrings
+        curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg \
+            -o /usr/share/keyrings/cloudflare-main.gpg \
+            || { log_error "Cloudflare GPG key 下载失败"; return 1; }
+        printf 'deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared any main\n' \
+            > /etc/apt/sources.list.d/cloudflared.list
+        DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1 \
+            || { log_error "cloudflared 官方仓库 apt update 失败"; return 1; }
+        DEBIAN_FRONTEND=noninteractive apt-get install -y cloudflared >/dev/null 2>&1 \
+            || { log_error "cloudflared 包安装失败"; return 1; }
+    elif command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1; then
+        local _pm; command -v dnf >/dev/null 2>&1 && _pm="dnf" || _pm="yum"
+        cat > /etc/yum.repos.d/cloudflared.repo <<'EOF'
+[cloudflared]
+name=cloudflared
+baseurl=https://pkg.cloudflare.com/cloudflared/rpm
+enabled=1
+gpgcheck=1
+gpgkey=https://pkg.cloudflare.com/cloudflare-main.gpg
+EOF
+        ${_pm} install -y cloudflared >/dev/null 2>&1 \
+            || { log_error "cloudflared 包安装失败"; return 1; }
+    else
+        log_error "当前系统无 Cloudflare 官方包仓库自动安装路径；请先按 Cloudflare 官方文档安装 cloudflared 后重试，或先在菜单中关闭 Argo"
+        return 1
+    fi
+
+    local _cf_bin; _cf_bin=$(command -v cloudflared 2>/dev/null || true)
+    [ -n "${_cf_bin:-}" ] || { log_error "cloudflared 安装后不可用"; return 1; }
+    cp -f "${_cf_bin}" "${ARGO_BIN}" || { log_error "复制 cloudflared 到 ${ARGO_BIN} 失败"; return 1; }
     chmod +x "${ARGO_BIN}"
-    "${ARGO_BIN}" --version >/dev/null 2>&1 || log_warn "cloudflared --version 验证失败"
-    log_ok "cloudflared 下载完成"
+    "${ARGO_BIN}" --version >/dev/null 2>&1 || { log_error "cloudflared --version 验证失败"; return 1; }
+    log_ok "cloudflared 已通过官方包仓库安装"
 }
 
 # ==============================================================================
@@ -1686,8 +1754,10 @@ exec_install() {
 
     config_apply || { _install_rollback "${_xray_was}" "${_argo_was}"; return 1; }
 
-    svc_apply_xray
-    [ "$(st_get '.argo.enabled')" = "true" ] && svc_apply_tunnel
+    svc_apply_xray || { _install_rollback "${_xray_was}" "${_argo_was}"; return 1; }
+    if [ "$(st_get '.argo.enabled')" = "true" ]; then
+        svc_apply_tunnel || { _install_rollback "${_xray_was}" "${_argo_was}"; return 1; }
+    fi
     svc_reload_daemon
 
     is_openrc && { lifecycle_apply_sysctl; lifecycle_apply_hosts_patch; }
@@ -1696,44 +1766,24 @@ exec_install() {
     fw_reconcile
 
     log_step "启动服务..."
-    svc_exec enable "${_SVC_XRAY}"
-    svc_exec start  "${_SVC_XRAY}" || {
+    svc_exec_mut enable "${_SVC_XRAY}"
+    svc_exec_mut start  "${_SVC_XRAY}" || {
         log_error "启动命令失败"; _install_rollback "${_xray_was}" "${_argo_was}"; return 1; }
 
     if ! svc_verify_health "${_SVC_XRAY}" 8; then
         log_error "${_SVC_XRAY} 未正常运行，回滚"
-        svc_exec stop "${_SVC_XRAY}" 2>/dev/null || true
+        svc_exec_mut stop "${_SVC_XRAY}" 2>/dev/null || true
         _install_rollback "${_xray_was}" "${_argo_was}"
         return 1
     fi
 
     if [ "$(st_get '.argo.enabled')" = "true" ]; then
-        svc_exec enable "${_SVC_TUNNEL}"
-        svc_exec start  "${_SVC_TUNNEL}" || log_error "tunnel 启动失败（不影响 xray）"
+        svc_exec_mut enable "${_SVC_TUNNEL}"
+        svc_exec_mut start  "${_SVC_TUNNEL}" || log_error "tunnel 启动失败（不影响 xray）"
         log_ok "${_SVC_TUNNEL} 已启动"
     fi
 
-    log_step "网络性能调优"
-    printf "是否立即运行 Eric86777 的网络调优脚本？(推荐 Y) [Y/n]: "
-    read -r _tune_choice </dev/tty
-    case "${_tune_choice:-y}" in
-        [yY])
-            local _tune_t; _tune_t=$(tmp_file "tune_XXXXXX.sh") || true
-            if [ -n "${_tune_t:-}" ] && \
-               curl -fsSL --max-time 30 \
-                   "https://raw.githubusercontent.com/Eric86777/vps-tcp-tune/main/net-tcp-tune.sh?$(date +%s)" \
-                   -o "${_tune_t}" 2>/dev/null; then
-                if bash -n "${_tune_t}" 2>/dev/null; then
-                    bash "${_tune_t}"
-                else
-                    log_warn "调优脚本语法检查失败，已跳过"
-                fi
-                rm -f "${_tune_t}" 2>/dev/null || true
-            else
-                log_warn "调优脚本下载失败，已跳过"
-            fi ;;
-        *) log_info "已跳过网络调优" ;;
-    esac
+    log_info "网络调优未内置执行：为避免运行未签名第三方 root 脚本，请按需参考可信来源手动配置。"
 
     st_persist || log_warn "state.json 写入失败（不影响运行）"
     log_ok "══ 安装完成 ══"
@@ -1744,8 +1794,8 @@ exec_uninstall() {
     case "${_a:-n}" in y|Y) :;; *) log_info "已取消"; return;; esac
     log_step "卸载中..."
     for _s in "${_SVC_XRAY}" "${_SVC_TUNNEL}"; do
-        svc_exec stop    "${_s}" 2>/dev/null || true
-        svc_exec disable "${_s}" 2>/dev/null || true
+        svc_exec_mut stop    "${_s}" 2>/dev/null || true
+        svc_exec_mut disable "${_s}" 2>/dev/null || true
     done
     fw_force_cleanup
     rm -f "${WORK_DIR}/xray.pid" /var/run/xray2go.pid /var/run/tunnel2go.pid 2>/dev/null || true
@@ -1770,16 +1820,8 @@ exec_uninstall() {
 }
 
 exec_update_shortcut() {
-    log_step "拉取最新脚本..."
-    local _t; _t=$(tmp_file "xray2go_XXXXXX.sh") || return 1
-    curl -sfL --connect-timeout 15 --max-time 60 -o "${_t}" "${UPSTREAM_URL}" \
-        || { log_error "拉取失败"; return 1; }
-    bash -n "${_t}" 2>/dev/null || { log_error "脚本语法验证失败"; return 1; }
-    [ -f "${SELF_DEST}" ] && cp -f "${SELF_DEST}" "${SELF_DEST}.bak" 2>/dev/null || true
-    mv "${_t}" "${SELF_DEST}" && chmod +x "${SELF_DEST}"
-    printf '#!/bin/bash\nexec %s "$@"\n' "${SELF_DEST}" > "${SHORTCUT}"
-    chmod +x "${SHORTCUT}"
-    log_ok "脚本已更新！输入 ${C_GRN}s${C_RST} 快速启动"
+    log_warn "已禁用内置自更新：为避免未签名 root 脚本覆盖，请通过 GitHub Release/包管理器等可校验渠道手动更新。"
+    return 1
 }
 
 exec_update_uuid() {
@@ -1929,7 +1971,7 @@ ask_vltcp_mode() {
 
     local _dl; _dl=$(st_get '.vltcp.listen')
     local _vl; prompt "监听地址（回车默认 ${_dl}，0.0.0.0=所有接口）: " _vl
-    [ -n "${_vl:-}" ] && st_set '.vltcp.listen = $l' --arg l "${_vl}"
+    [ -n "${_vl:-}" ] && { _vl=$(val_listen_addr "${_vl}") || { log_warn "监听地址不合法，使用默认值 ${_dl}"; _vl="${_dl}"; }; st_set '.vltcp.listen = $l' --arg l "${_vl}"; }
     log_info "VLESS-TCP 配置完成 — 端口:$(port_of vltcp) 监听:$(st_get '.vltcp.listen')"
     echo ""
 }
@@ -2041,7 +2083,7 @@ manage_argo() {
                 fi
                 st_set '.argo.enabled = true' || { _pause; continue; }
                 config_apply || { st_set '.argo.enabled = false'; _pause; continue; }
-                svc_apply_tunnel; svc_reload_daemon
+                svc_apply_tunnel || return 1; svc_reload_daemon
                 svc_exec_mut enable "${_SVC_TUNNEL}"
                 svc_exec_mut start  "${_SVC_TUNNEL}" \
                     && log_ok "Argo 已启用并启动" \
@@ -2378,6 +2420,7 @@ manage_vltcp() {
             5)
                 local _l; prompt "新监听地址（0.0.0.0=所有，127.0.0.1=仅本地）: " _l
                 if [ -n "${_l:-}" ]; then
+                    _l=$(val_listen_addr "${_l}") || { _pause; continue; }
                     st_set '.vltcp.listen = $l' --arg l "${_l}" || { _pause; continue; }
                     [ "${_en}" = "true" ] && { config_apply || { _pause; continue; }; }
                     st_persist || log_warn "state.json 写入失败"
