@@ -346,16 +346,6 @@ with_lock() {
     fi
 }
 
-# 统一 fingerprint 默认值；分享链接统一读取此值，避免各插件不一致。
-client_fp() { printf 'chrome'; }
-
-# XHTTP mode 策略：Argo 走 auto，其余 XHTTP 使用 stream-one。
-xhttp_mode_for() {
-    case "${1:-}" in
-        argo) printf 'auto' ;;
-        *)    printf 'stream-one' ;;
-    esac
-}
 
 # 修改端口后需要统一提交配置、持久化、同步防火墙，并回显 state 实际值。
 _commit_port_change() {
@@ -634,7 +624,7 @@ _plg_argo_inbound() {
     case "${_proto}" in
         xhttp)
             jq -n --argjson port "${_port}" --arg uuid "${_uuid}" \
-                   --arg mode "$(xhttp_mode_for argo)" --argjson x "${_xpad}" '{
+                   --arg mode "auto" --argjson x "${_xpad}" '{
                 port:$port, listen:"127.0.0.1", protocol:"vless",
                 settings:{clients:[{id:$uuid}], decryption:"none"},
                 streamSettings:{network:"xhttp",
@@ -656,20 +646,19 @@ _plg_argo_link() {
     _uuid=$(st_get '.uuid')
     _cfip=$(st_get '.cfip')
     _cfport=$(st_get '.cfport')
-    local _port _fp _xmode; _port=$(port_of argo); _fp=$(client_fp); _xmode=$(xhttp_mode_for argo)
     [ "$(st_get '.xpad.enabled')" = "true" ] && _xqs="${_XPAD_QS}" || _xqs=""
     case "${_proto}" in
         xhttp)
             if [ -n "${_xqs}" ]; then
-                printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=%s&type=xhttp&host=%s&path=%%2Fargo&mode=%s&extra=%%7B%s%%7D#Argo-XHTTP\n' \
-                    "${_uuid}" "${_cfip}" "${_cfport}" "${_domain}" "${_fp}" "${_domain}" "${_xmode}" "${_xqs}"
+                printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=chrome&type=xhttp&host=%s&path=%%2Fargo&mode=auto&extra=%%7B%s%%7D#Argo-XHTTP\n' \
+                    "${_uuid}" "${_cfip}" "${_cfport}" "${_domain}" "${_domain}" "${_xqs}"
             else
-                printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=%s&type=xhttp&host=%s&path=%%2Fargo&mode=%s#Argo-XHTTP\n' \
-                    "${_uuid}" "${_cfip}" "${_cfport}" "${_domain}" "${_fp}" "${_domain}" "${_xmode}"
+                printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=chrome&type=xhttp&host=%s&path=%%2Fargo&mode=auto#Argo-XHTTP\n' \
+                    "${_uuid}" "${_cfip}" "${_cfport}" "${_domain}" "${_domain}"
             fi ;;
         *)
-            printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=%s&type=ws&host=%s&path=%%2Fargo%%3Fed%%3D2560#Argo-WS\n' \
-                "${_uuid}" "${_cfip}" "${_cfport}" "${_domain}" "${_fp}" "${_domain}" ;;
+            printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=chrome&type=ws&host=%s&path=%%2Fargo%%3Fed%%3D2560#Argo-WS\n' \
+                "${_uuid}" "${_cfip}" "${_cfport}" "${_domain}" "${_domain}" ;;
     esac
 }
 PLUGIN_EOF
@@ -717,7 +706,7 @@ _plg_ff_inbound() {
                     httpupgradeSettings:{path:$path}}}' ;;
         xhttp)
             jq -n --argjson port "${_port}" --arg uuid "${_uuid}" --arg path "${_path}" \
-                   --arg mode "$(xhttp_mode_for ff)" --argjson x "${_xpad}" '{
+                   --arg mode "stream-one" --argjson x "${_xpad}" '{
                 port:$port, listen:"::", protocol:"vless",
                 settings:{clients:[{id:$uuid}], decryption:"none"},
                 streamSettings:{network:"xhttp",
@@ -742,7 +731,7 @@ _plg_ff_inbound() {
 
 _plg_ff_link() {
     _plg_ff_enabled || return 0
-    local _proto _uuid _ip _penc _port _xqs _xmode
+    local _proto _uuid _ip _penc _port _xqs
     _proto=$(st_get '.ff.protocol')
     _uuid=$(st_get '.uuid')
     _port=$(port_of ff)
@@ -750,7 +739,6 @@ _plg_ff_link() {
     [ -z "${_ip:-}" ] && { log_warn "无法获取服务器 IP，FreeFlow 节点已跳过"; return 0; }
     _penc=$(urlencode_path "$(st_get '.ff.path')")
     [ "$(st_get '.xpad.enabled')" = "true" ] && _xqs="${_XPAD_QS}" || _xqs=""
-    _xmode=$(xhttp_mode_for ff)
     case "${_proto}" in
         ws)
             printf 'vless://%s@%s:%s?encryption=none&security=none&type=ws&host=%s&path=%s#FreeFlow-WS\n' \
@@ -760,11 +748,11 @@ _plg_ff_link() {
                 "${_uuid}" "${_ip}" "${_port}" "${_ip}" "${_penc}" ;;
         xhttp)
             if [ -n "${_xqs}" ]; then
-                printf 'vless://%s@%s:%s?encryption=none&security=none&type=xhttp&host=%s&path=%s&mode=%s&extra=%%7B%s%%7D#FreeFlow-XHTTP\n' \
-                    "${_uuid}" "${_ip}" "${_port}" "${_ip}" "${_penc}" "${_xmode}" "${_xqs}"
+                printf 'vless://%s@%s:%s?encryption=none&security=none&type=xhttp&host=%s&path=%s&mode=stream-one&extra=%%7B%s%%7D#FreeFlow-XHTTP\n' \
+                    "${_uuid}" "${_ip}" "${_port}" "${_ip}" "${_penc}" "${_xqs}"
             else
-                printf 'vless://%s@%s:%s?encryption=none&security=none&type=xhttp&host=%s&path=%s&mode=%s#FreeFlow-XHTTP\n' \
-                    "${_uuid}" "${_ip}" "${_port}" "${_ip}" "${_penc}" "${_xmode}"
+                printf 'vless://%s@%s:%s?encryption=none&security=none&type=xhttp&host=%s&path=%s&mode=stream-one#FreeFlow-XHTTP\n' \
+                    "${_uuid}" "${_ip}" "${_port}" "${_ip}" "${_penc}"
             fi ;;
         tcphttp)
             local _host _henc
@@ -813,7 +801,7 @@ _plg_reality_inbound() {
         xhttp)
             jq -n --argjson port "${_port}" --arg uuid "${_uuid}" \
                    --arg sni "${_sni}" --arg pvk "${_pvk}" --arg sid "${_sid}" \
-                   --arg mode "$(xhttp_mode_for reality)" --argjson x "${_xpad}" '{
+                   --arg mode "stream-one" --argjson x "${_xpad}" '{
                 port:$port, listen:"::", protocol:"vless",
                 settings:{clients:[{id:$uuid}], decryption:"none"},
                 streamSettings:{network:"xhttp", security:"reality",
@@ -837,27 +825,26 @@ _plg_reality_link() {
     [ -n "${_rpbk:-}" ] && [ "${_rpbk}" != "null" ] || return 0
     local _ip; _ip=$(platform_get_realip)
     [ -z "${_ip:-}" ] && { log_warn "无法获取服务器 IP，Reality 节点已跳过"; return 0; }
-    local _port _rnet _uuid _xqs _fp _xmode
+    local _port _rnet _uuid _xqs
     _port=$(port_of reality)
     _rnet=$(st_get '.reality.network'); _rnet="${_rnet:-tcp}"
     _uuid=$(st_get '.uuid')
     [ "$(st_get '.xpad.enabled')" = "true" ] && _xqs="${_XPAD_QS}" || _xqs=""
-    _fp=$(client_fp); _xmode=$(xhttp_mode_for reality)
     case "${_rnet}" in
         xhttp)
             if [ -n "${_xqs}" ]; then
-                printf 'vless://%s@%s:%s?encryption=none&security=reality&sni=%s&fp=%s&pbk=%s&sid=%s&type=xhttp&path=%%2F&mode=%s&extra=%%7B%s%%7D#Reality-XHTTP\n' \
+                printf 'vless://%s@%s:%s?encryption=none&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=xhttp&path=%%2F&mode=stream-one&extra=%%7B%s%%7D#Reality-XHTTP\n' \
                     "${_uuid}" "${_ip}" "${_port}" \
-                    "$(st_get '.reality.sni')" "${_fp}" "${_rpbk}" "$(st_get '.reality.sid')" "${_xmode}" "${_xqs}"
+                    "$(st_get '.reality.sni')" "${_rpbk}" "$(st_get '.reality.sid')" "${_xqs}"
             else
-                printf 'vless://%s@%s:%s?encryption=none&security=reality&sni=%s&fp=%s&pbk=%s&sid=%s&type=xhttp&path=%%2F&mode=%s#Reality-XHTTP\n' \
+                printf 'vless://%s@%s:%s?encryption=none&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=xhttp&path=%%2F&mode=stream-one#Reality-XHTTP\n' \
                     "${_uuid}" "${_ip}" "${_port}" \
-                    "$(st_get '.reality.sni')" "${_fp}" "${_rpbk}" "$(st_get '.reality.sid')" "${_xmode}"
+                    "$(st_get '.reality.sni')" "${_rpbk}" "$(st_get '.reality.sid')"
             fi ;;
         *)
-            printf 'vless://%s@%s:%s?encryption=none&flow=xtls-rprx-vision&security=reality&sni=%s&fp=%s&pbk=%s&sid=%s&type=tcp&headerType=none#Reality-Vision\n' \
+            printf 'vless://%s@%s:%s?encryption=none&flow=xtls-rprx-vision&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=tcp&headerType=none#Reality-Vision\n' \
                 "${_uuid}" "${_ip}" "${_port}" \
-                "$(st_get '.reality.sni')" "${_fp}" "${_rpbk}" "$(st_get '.reality.sid')" ;;
+                "$(st_get '.reality.sni')" "${_rpbk}" "$(st_get '.reality.sid')" ;;
     esac
 }
 PLUGIN_EOF
