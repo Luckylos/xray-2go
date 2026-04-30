@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# xray-2go v9.2-refactor  — 插件化协议平台（Plugin-based Proxy Platform）
-# 安全基线：S1-S6 注入防护 · C1-C5 并发安全 · A1-A5 架构一致性
+# xray-2go — 插件化代理管理脚本
+# 安全基线：输入校验 · 敏感文件保护 · 原子写入 · 服务互斥 · 可回滚清理
 # 协议支持：Argo · FreeFlow · Reality · VLESS-TCP（均以插件形式加载）
 # 平台支持：Debian/Ubuntu/RHEL系 (systemd) · Alpine (OpenRC；Argo/cloudflared 需用户预装官方 cloudflared)
 # ==============================================================================
-set -uo pipefail  # 保持兼容交互菜单；关键路径显式检查返回值
+set -uo pipefail  # 交互菜单使用显式返回值处理，避免 set -e 造成误退出
 [ "${BASH_VERSINFO[0]}" -ge 4 ] \
     || { printf '\033[1;91m[ERR ] 需要 bash 4.0 或更高版本\033[0m\n' >&2; exit 1; }
 
 # ==============================================================================
-# §L1  全局常量
+# Global constants
 # ==============================================================================
 readonly WORK_DIR="/etc/xray2go"
 readonly XRAY_BIN="${WORK_DIR}/xray"
@@ -44,7 +44,7 @@ readonly _XPAD_QS='%22xPaddingObfsMode%22%3Atrue%2C%22xPaddingMethod%22%3A%22tok
 _PLUGIN_REGISTRY=()
 
 # ==============================================================================
-# §L2  临时文件沙箱（同 FS，保证 mv 原子性）
+# Temporary workspace
 # ==============================================================================
 _G_TMP_DIR=""
 
@@ -72,7 +72,7 @@ _ensure_tmp_dir() {
 tmp_file() { _ensure_tmp_dir; mktemp "${_G_TMP_DIR}/${1:-tmp_XXXXXX}"; }
 
 # ==============================================================================
-# §L3  Utils — 日志、安全输出、字符串
+# Logging and string utilities
 # ==============================================================================
 readonly C_RST=$'\033[0m'  C_BOLD=$'\033[1m'
 readonly C_RED=$'\033[1;91m'  C_GRN=$'\033[1;32m'  C_YLW=$'\033[1;33m'
@@ -111,7 +111,7 @@ urlencode_path() {
 }
 
 # ==============================================================================
-# §L4  Platform — 检测、包管理、网络
+# Platform detection and package helpers
 # ==============================================================================
 _G_INIT_SYS="" _G_ARCH_CF="" _G_ARCH_XRAY="" _G_CACHED_REALIP=""
 
@@ -168,14 +168,14 @@ platform_preflight() {
     log_step "依赖预检..."
     for _d in curl unzip jq; do platform_pkg_require "${_d}"; done
     command -v xxd    >/dev/null 2>&1 || platform_pkg_require "xxd" "xxd" 2>/dev/null \
-        || log_info "xxd 未安装，shortId 将 fallback"
-    command -v openssl >/dev/null 2>&1 || log_info "openssl 未安装，shortId 将 fallback"
+        || log_info "xxd 未安装，shortId 将使用内置随机源"
+    command -v openssl >/dev/null 2>&1 || log_info "openssl 未安装，shortId 将使用内置随机源"
     if [ -f "${XRAY_BIN}" ]; then
-        [ -x "${XRAY_BIN}" ] || { chmod +x "${XRAY_BIN}"; log_warn "已修复 xray 可执行位"; }
+        [ -x "${XRAY_BIN}" ] || { chmod +x "${XRAY_BIN}"; log_warn "已设置 xray 可执行权限"; }
         "${XRAY_BIN}" version >/dev/null 2>&1 || log_warn "xray 二进制可能损坏"
     fi
     [ -f "${ARGO_BIN}" ] && ! [ -x "${ARGO_BIN}" ] \
-        && { chmod +x "${ARGO_BIN}"; log_warn "已修复 cloudflared 可执行位"; }
+        && { chmod +x "${ARGO_BIN}"; log_warn "已设置 cloudflared 可执行权限"; }
     log_ok "依赖预检通过"
 }
 
@@ -245,12 +245,12 @@ port_mgr_random() {
 }
 
 # ==============================================================================
-# §L5  State — 读/写/持久化（with_lock + atomic_write）
+# State management
 # ==============================================================================
 _G_STATE=""
 
-# 新版 state 结构：ports 独立顶层，protocols 独立顶层
-# 兼容旧版：_st_migrate_legacy 自动迁移
+# 当前 state schema：端口和协议状态集中管理
+# 加载 state 时自动规范化 schema
 readonly _STATE_DEFAULT='{
   "uuid": "",
   "ports": {
@@ -398,8 +398,8 @@ port_of() {
     [ -n "${_v:-}" ] && [ "${_v}" != "null" ] && printf '%s' "${_v}" || printf '0'
 }
 
-# ── 统一输入校验层（S2/S3/I3 修复）──────────────────────────────────────────
-# val_port: 限制端口为纯数字 1-65535，防止 YAML/JSON 注入
+# ── 输入校验层 ───────────────────────────────────────────────────────────────
+# val_port: 限制端口为纯数字 1-65535，防止配置注入
 val_port() {
     local _p="$1"
     case "${_p}" in
@@ -459,18 +459,17 @@ _st_persist_inner() {
     _json=$(printf '%s\n' "${_G_STATE}" | jq . 2>/dev/null) \
         || { log_error "state 序列化失败"; return 1; }
     atomic_write_secret_with_backup "${STATE_FILE}" "${_json}" 3 || return 1
-    # S5: state.json 含 token 等敏感数据，严格限制权限
+    # state.json 含 token 等敏感数据，严格限制权限
     chmod 600 "${STATE_FILE}" 2>/dev/null || true
 }
 
 st_persist() { with_lock _st_persist_inner; }
 
-# 旧版 state.json 迁移（v8.x → v9.0）
-# 把 .argo.port / .reality.port / .vltcp.port 提升到 .ports.*
-_st_migrate_legacy() {
-    local _changed=0
+# State schema 规范化
+# 将可识别的既有字段归一到当前 schema，并补齐缺失默认值
+_st_normalize_schema() {
 
-    # 迁移端口字段到顶层 ports
+    # 规范化端口字段到顶层 ports
     local _ap _rp _vp _fp
     _ap=$(st_get '.argo.port    // empty')
     _rp=$(st_get '.reality.port // empty')
@@ -481,65 +480,64 @@ _st_migrate_legacy() {
     local _ports; _ports=$(st_get '.ports')
     if [ -z "${_ports:-}" ] || [ "${_ports}" = "null" ]; then
         st_set '.ports = {"argo":18888,"ff":8080,"reality":443,"vltcp":1234}'
-        _changed=1
     fi
 
-    # 将旧字段迁移到 .ports（仅当旧字段存在且非默认值时）
+    # 将分散端口字段归一到 .ports（仅当字段存在且非默认值时）
     [ -n "${_ap:-}" ] && [ "${_ap}" != "null" ] && {
         st_set '.ports.argo = ($p|tonumber)' --arg p "${_ap}"
-        st_set 'del(.argo.port)' 2>/dev/null || true; _changed=1; }
+        st_set 'del(.argo.port)' 2>/dev/null || true; }
     [ -n "${_rp:-}" ] && [ "${_rp}" != "null" ] && {
         st_set '.ports.reality = ($p|tonumber)' --arg p "${_rp}"
-        st_set 'del(.reality.port)' 2>/dev/null || true; _changed=1; }
+        st_set 'del(.reality.port)' 2>/dev/null || true; }
     [ -n "${_vp:-}" ] && [ "${_vp}" != "null" ] && {
         st_set '.ports.vltcp = ($p|tonumber)' --arg p "${_vp}"
-        st_set 'del(.vltcp.port)' 2>/dev/null || true; _changed=1; }
+        st_set 'del(.vltcp.port)' 2>/dev/null || true; }
     [ -n "${_fp:-}" ] && [ "${_fp}" != "null" ] && {
         st_set '.ports.ff = ($p|tonumber)' --arg p "${_fp}"
-        st_set 'del(.ff.port)' 2>/dev/null || true; _changed=1; }
+        st_set 'del(.ff.port)' 2>/dev/null || true; }
 
     # 补全缺失/损坏端口字段，避免菜单显示 0 或修改端口后写入无效路径
     local _c
     _c=$(st_get '.ports.argo')
-    { [ -z "${_c:-}" ] || [ "${_c}" = "null" ] || [ "${_c}" = "0" ]; } && st_set '.ports.argo = 18888' && _changed=1
+    { [ -z "${_c:-}" ] || [ "${_c}" = "null" ] || [ "${_c}" = "0" ]; } && st_set '.ports.argo = 18888'
     _c=$(st_get '.ports.ff')
-    { [ -z "${_c:-}" ] || [ "${_c}" = "null" ] || [ "${_c}" = "0" ]; } && st_set '.ports.ff = 8080' && _changed=1
+    { [ -z "${_c:-}" ] || [ "${_c}" = "null" ] || [ "${_c}" = "0" ]; } && st_set '.ports.ff = 8080'
     _c=$(st_get '.ports.reality')
-    { [ -z "${_c:-}" ] || [ "${_c}" = "null" ] || [ "${_c}" = "0" ]; } && st_set '.ports.reality = 443' && _changed=1
+    { [ -z "${_c:-}" ] || [ "${_c}" = "null" ] || [ "${_c}" = "0" ]; } && st_set '.ports.reality = 443'
     _c=$(st_get '.ports.vltcp')
-    { [ -z "${_c:-}" ] || [ "${_c}" = "null" ] || [ "${_c}" = "0" ]; } && st_set '.ports.vltcp = 1234' && _changed=1
+    { [ -z "${_c:-}" ] || [ "${_c}" = "null" ] || [ "${_c}" = "0" ]; } && st_set '.ports.vltcp = 1234'
 
     _c=$(st_get '.reality.network')
-    { [ -z "${_c:-}" ] || [ "${_c}" = "null" ]; } && st_set '.reality.network = "tcp"' && _changed=1
+    { [ -z "${_c:-}" ] || [ "${_c}" = "null" ]; } && st_set '.reality.network = "tcp"'
     _c=$(st_get '.cfip')
-    { [ -z "${_c:-}" ] || [ "${_c}" = "null" ]; } && st_set '.cfip = "cf.tencentapp.cn"' && _changed=1
+    { [ -z "${_c:-}" ] || [ "${_c}" = "null" ]; } && st_set '.cfip = "cf.tencentapp.cn"'
     _c=$(st_get '.cfport')
-    { [ -z "${_c:-}" ] || [ "${_c}" = "null" ]; } && st_set '.cfport = "443"' && _changed=1
+    { [ -z "${_c:-}" ] || [ "${_c}" = "null" ]; } && st_set '.cfport = "443"'
     _c=$(st_get '.ff.host')
-    { [ -z "${_c:-}" ] || [ "${_c}" = "null" ]; } && st_set '.ff.host = ""' && _changed=1
-    # xPadding 从旧版全局 .xpad.enabled 迁移为各协议独立开关。
-    local _legacy_xpad
-    _legacy_xpad=$(printf '%s' "${_G_STATE}" | jq -r '
+    { [ -z "${_c:-}" ] || [ "${_c}" = "null" ]; } && st_set '.ff.host = ""'
+    # 规范化 xPadding 开关结构。
+    local _global_xpad
+    _global_xpad=$(printf '%s' "${_G_STATE}" | jq -r '
         if .xpad.enabled == true then "true"
         elif .xpad.enabled == false then "false"
         else empty end
     ' 2>/dev/null) || true
-    case "${_legacy_xpad}" in
+    case "${_global_xpad}" in
         true|false)
-            st_set '.xpad.argo = $v | .xpad.ff = $v | .xpad.reality = $v | del(.xpad.enabled)' --argjson v "${_legacy_xpad}" && _changed=1 ;;
+            st_set '.xpad.argo = $v | .xpad.ff = $v | .xpad.reality = $v | del(.xpad.enabled)' --argjson v "${_global_xpad}" ;;
     esac
     printf '%s' "${_G_STATE}" | jq -e '.xpad.argo == null' >/dev/null 2>&1 && \
-        st_set '.xpad.argo = true' && _changed=1
+        st_set '.xpad.argo = true'
     printf '%s' "${_G_STATE}" | jq -e '.xpad.ff == null' >/dev/null 2>&1 && \
-        st_set '.xpad.ff = true' && _changed=1
+        st_set '.xpad.ff = true'
     printf '%s' "${_G_STATE}" | jq -e '.xpad.reality == null' >/dev/null 2>&1 && \
-        st_set '.xpad.reality = true' && _changed=1
+        st_set '.xpad.reality = true'
     _c=$(st_get '.vltcp.listen')
-    { [ -z "${_c:-}" ] || [ "${_c}" = "null" ]; } && st_set '.vltcp.listen = "0.0.0.0"' && _changed=1
+    { [ -z "${_c:-}" ] || [ "${_c}" = "null" ]; } && st_set '.vltcp.listen = "0.0.0.0"'
     _c=$(st_get '.ff.path')
-    { [ -z "${_c:-}" ] || [ "${_c}" = "null" ]; } && st_set '.ff.path = "/"' && _changed=1
+    { [ -z "${_c:-}" ] || [ "${_c}" = "null" ]; } && st_set '.ff.path = "/"'
     _c=$(st_get '.ff.protocol')
-    { [ -z "${_c:-}" ] || [ "${_c}" = "null" ]; } && st_set '.ff.protocol = "none"' && _changed=1
+    { [ -z "${_c:-}" ] || [ "${_c}" = "null" ]; } && st_set '.ff.protocol = "none"'
 
     return 0
 }
@@ -549,7 +547,7 @@ st_init() {
         local _raw; _raw=$(cat "${STATE_FILE}" 2>/dev/null || true)
         if printf '%s' "${_raw}" | jq -e . >/dev/null 2>&1; then
             _G_STATE="${_raw}"
-            _st_migrate_legacy
+            _st_normalize_schema
             local _u; _u=$(st_get '.uuid')
             [ -z "${_u:-}" ] && st_set '.uuid = $u' --arg u "$(crypto_gen_uuid)"
             return 0
@@ -557,14 +555,14 @@ st_init() {
         log_warn "state.json 损坏，重置为默认值..."
     fi
     _G_STATE="${_STATE_DEFAULT}"
-    _st_migrate_legacy
+    _st_normalize_schema
     local _u; _u=$(st_get '.uuid')
     [ -z "${_u:-}" ] && st_set '.uuid = $u' --arg u "$(crypto_gen_uuid)"
     [ -d "${WORK_DIR}" ] && { st_persist 2>/dev/null || true; log_info "状态已初始化"; }
 }
 
 # ==============================================================================
-# §L6  Plugin System — 动态加载、注册、遍历
+# Plugin runtime
 # ==============================================================================
 # 插件接口契约（每个插件文件必须实现）：
 #   plugin_inbound  — 输出单个 inbound JSON（或空字符串表示禁用）
@@ -613,8 +611,8 @@ plugin_call() {
 # 将所有内置协议插件写入 PLUGIN_DIR（首次运行或插件缺失时调用）
 plugin_install_builtins() {
     mkdir -p "${PLUGIN_DIR}"
-    # 内置插件属于脚本版本的一部分：每次运行覆盖写入，确保安全/兼容性修复能随主脚本生效。
-    # 用户自定义插件请使用其它文件名，避免与 argo/ff/reality/vltcp 内置插件重名。
+    # 内置插件属于脚本本体的一部分：每次运行刷新，确保主脚本更新能同步下发。
+    # 用户自定义插件请使用其它文件名，避免与 argo/ff/reality/vltcp 重名。
     _plugin_write_argo
     _plugin_write_ff
     _plugin_write_reality
@@ -622,7 +620,7 @@ plugin_install_builtins() {
 }
 
 # ==============================================================================
-# §L6a  内置插件定义（写入 PLUGIN_DIR/*.sh）
+# Built-in protocol plugins
 # ==============================================================================
 # 设计原则：
 #   - 插件只读 state，不写 state
@@ -926,7 +924,7 @@ PLUGIN_EOF
 }
 
 # ==============================================================================
-# §L7  Firewall — 声明式 reconcile（端口来源：插件 plugin_ports 汇总）
+# Firewall reconciliation
 # ==============================================================================
 
 # 汇总所有插件的期望端口（无硬编码端口）
@@ -1155,7 +1153,7 @@ lifecycle_cleanup_cloudflared() {
 }
 
 # ==============================================================================
-# §L8  Svc — systemd/OpenRC 统一 Adapter
+# Service adapter
 # ==============================================================================
 _G_SYSD_DIRTY=0
 
@@ -1185,8 +1183,8 @@ svc_reload_daemon() {
     _G_SYSD_DIRTY=0
 }
 
-# C3: svc 互斥锁——所有服务状态变更（start/stop/restart）通过此接口
-# 只读操作（status）不加锁，避免死锁
+# 服务状态变更互斥锁：start/stop/restart/enable/disable 统一通过此接口
+# 只读状态查询不加锁，避免死锁
 _SVC_LOCK_FILE="${WORK_DIR}/.svc_lock"
 svc_exec_mut() {
     # 用法同 svc_exec，但对 mutating 操作加独立锁
@@ -1280,8 +1278,8 @@ _svc_tpl_tunnel_openrc() {
 
 _svc_write_argo_env() {
     local _token; _token=$(st_get '.argo.token')
-    # S1: token 写入 env file 前做安全性检查
-    # tunnel.yml 模式下 token 为 null，写空值是安全的
+    # token 写入 env file 前做格式净化
+    # credentials 模式下 token 为空，写入空 env 值即可
     # token 模式下已通过 grep -qE '^[A-Za-z0-9=_-]{20,}$' 校验过格式
     # env file 格式：KEY=VALUE（不加引号，cloudflared 直接读）
     # 防止 token 含换行导致 env file 解析错误
@@ -1336,7 +1334,7 @@ svc_verify_health() {
 }
 
 # ==============================================================================
-# §L9  Crypto
+# Crypto helpers
 # ==============================================================================
 crypto_gen_uuid() {
     [ -r /proc/sys/kernel/random/uuid ] && { cat /proc/sys/kernel/random/uuid; return; }
@@ -1366,12 +1364,12 @@ crypto_gen_reality_sid() {
 }
 
 # ==============================================================================
-# §L10 Config — 插件驱动合成 + 原子提交 + 服务重启
+# Config synthesis and apply
 # ==============================================================================
 
 # 遍历插件注册表，收集所有 inbound → JSON 数组
 config_build_inbounds() {
-    # S3: 在构建 inbound 前校验 UUID，防止注入 xray JSON 配置
+    # 在构建 inbound 前校验 UUID，防止配置注入
     local _uuid_check; _uuid_check=$(st_get '.uuid')
     if ! val_uuid "${_uuid_check}" >/dev/null 2>&1; then
         log_error "UUID 格式异常，拒绝生成配置: ${_uuid_check}"
@@ -1487,7 +1485,7 @@ _module_disable_commit() {
 }
 
 # ==============================================================================
-# §L11 Argo Tunnel — tunnel.yml / token 管理（遵循 Cloudflare 官方运行方式）
+# Argo tunnel integration
 # ==============================================================================
 # 核心设计：
 #   - token/remote-managed tunnel：官方命令 cloudflared tunnel run --token <token>
@@ -1507,7 +1505,7 @@ argo_build_tunnel_cmd() {
 # 生成 tunnel.yml（cred 模式：含 credentials-file）
 _argo_gen_yml_cred() {
     local _domain="$1" _tid="$2" _cred="$3"
-    # S2: 校验所有字段，防止 YAML 注入
+    # 校验所有字段，防止 YAML 注入
     local _port; _port=$(val_port "$(port_of argo)") || return 1
     val_domain "${_domain}" >/dev/null || return 1
     # tid 只允许 hex UUID 或 AccountTag（字母数字连字符）
@@ -1593,7 +1591,7 @@ argo_apply_fixed_tunnel() {
             log_error "TunnelID 含非法字符"; return 1;; esac
         local _cred="${WORK_DIR}/tunnel.json"
         atomic_write_secret "${_cred}" "${_auth}" || { log_error "凭证写入失败"; return 1; }
-        # S5: 凭证文件含 TunnelSecret，严格限制权限
+        # 凭证文件含敏感字段，严格限制权限
         chmod 600 "${_cred}" 2>/dev/null || true
         _argo_gen_yml_cred "${_domain}" "${_tid}" "${_cred}" || return 1
         st_set '.argo.token = null | .argo.domain = $d | .argo.mode = "fixed"' \
@@ -1614,7 +1612,7 @@ argo_apply_fixed_tunnel() {
     svc_exec_mut enable "${_SVC_TUNNEL}" 2>/dev/null || true
     config_apply  || return 1
     st_persist    || log_warn "state.json 写入失败"
-    # C2/C3: tunnel restart 通过 svc_exec_mut 加锁
+    # tunnel restart 通过服务互斥接口执行
     svc_exec_mut restart "${_SVC_TUNNEL}" || { log_error "tunnel 重启失败"; return 1; }
     log_ok "固定隧道已配置 (domain=${_domain})"
     argo_check_health || true
@@ -1659,7 +1657,7 @@ exec_update_argo_port() {
 }
 
 # ==============================================================================
-# §L12 Download — 统一下载 + 校验 + 重试
+# Downloads and verification
 # ==============================================================================
 _xray_health_check() {
     local _bin="${1:-${XRAY_BIN}}"
@@ -1685,7 +1683,7 @@ _xray_latest_tag() {
     return 1
 }
 
-_xray_download_with_fallback() {
+_xray_download_from_mirrors() {
     local _filename="$1" _dest="$2" _tag="$3"
     for _mirror in "${_XRAY_MIRRORS[@]}"; do
         log_step "下载 ${_filename} ..."
@@ -1711,7 +1709,7 @@ download_xray() {
     [ -z "${_tag:-}" ] && { log_error "无法获取 Xray 最新版本号，拒绝使用未校验 latest 下载"; return 1; }
     local _zip_name="Xray-linux-${_G_ARCH_XRAY}.zip"
     local _z; _z=$(tmp_file "xray_XXXXXX.zip") || return 1
-    _xray_download_with_fallback "${_zip_name}" "${_z}" "${_tag}" || return 1
+    _xray_download_from_mirrors "${_zip_name}" "${_z}" "${_tag}" || return 1
     command -v sha256sum >/dev/null 2>&1 || { log_error "缺少 sha256sum，拒绝安装未校验 Xray 二进制"; rm -f "${_z}"; return 1; }
     log_step "校验 SHA256..."
     local _dgst _expected _actual
@@ -1789,7 +1787,7 @@ EOF
 }
 
 # ==============================================================================
-# §L13 Install / Uninstall
+# Install and uninstall
 # ==============================================================================
 _install_detect_existing_xray() {
     command -v systemctl >/dev/null 2>&1 && \
@@ -1853,10 +1851,10 @@ _install_rollback() {
 }
 
 exec_install() {
-    clear; log_title "══════════ 安装 Xray-2go v9.0 ══════════"
+    clear; log_title "══════════ 安装 Xray-2go ══════════"
     platform_preflight
     mkdir -p "${WORK_DIR}" && chmod 750 "${WORK_DIR}"
-    # S5: 确保现有敏感文件权限正确
+    # 确保现有敏感文件权限正确
     [ -f "${STATE_FILE}" ]    && chmod 600 "${STATE_FILE}"    2>/dev/null || true
     [ -f "${_ARGO_ENV_FILE}" ] && chmod 600 "${_ARGO_ENV_FILE}" 2>/dev/null || true
     [ -f "${WORK_DIR}/tunnel.json" ] && chmod 600 "${WORK_DIR}/tunnel.json" 2>/dev/null || true
@@ -1969,7 +1967,7 @@ exec_update_uuid() {
         _v=$(crypto_gen_uuid) || { log_error "UUID 生成失败"; return 1; }
         log_info "已生成 UUID: ${_v}"
     fi
-    # S3: 通过 val_uuid 统一校验，防止 JSON 注入
+    # 通过 val_uuid 统一校验，防止配置注入
     val_uuid "${_v}" >/dev/null || return 1
     st_set '.uuid = $u' --arg u "${_v}" || return 1
     _commit || return 1
@@ -1977,7 +1975,7 @@ exec_update_uuid() {
 }
 
 # ==============================================================================
-# §L14 Menu — 安装向导 + 管理子菜单 + 主菜单
+# Interactive menus
 # ==============================================================================
 
 # ── 安装向导 ──────────────────────────────────────────────────────────────────
@@ -2033,7 +2031,7 @@ ask_freeflow_mode() {
     port_mgr_in_use "$(port_of ff)" && log_warn "端口 $(port_of ff) 已被占用"
     local _p _vp; prompt "FreeFlow path（回车默认 /）: " _p
     case "${_p:-/}" in /*) :;; *) _p="/${_p}";; esac
-    # I3: path 通过 val_path 校验，防止注入
+    # path 通过 val_path 校验，防止配置注入
     if _vp=$(val_path "${_p:-/}" 2>/dev/null); then
         st_set '.ff.path = $p' --arg p "${_vp}"
     else
@@ -2140,7 +2138,7 @@ _menu_input_port() {
     prompt "新端口（回车随机）: " _port_input
     [ -z "${_port_input:-}" ] && _port_input=$(shuf -i 1024-65000 -n 1 2>/dev/null || \
                               awk 'BEGIN{srand();print int(rand()*63976)+1024}')
-    # I3: 统一通过 val_port 校验，防止注入
+    # 统一通过 val_port 校验，防止配置注入
     val_port "${_port_input}" >/dev/null || return 1
     if port_mgr_in_use "${_port_input}"; then
         log_warn "端口 ${_port_input} 已被占用"
@@ -2386,7 +2384,7 @@ manage_freeflow() {
                     local _p; prompt "新 path（回车保持 ${_path}）: " _p
                     if [ -n "${_p:-}" ]; then
                         case "${_p}" in /*) :;; *) _p="/${_p}";; esac
-                        # I3: val_path 校验
+                        # path 格式校验
                         local _vp2
                         if ! _vp2=$(val_path "${_p}" 2>/dev/null); then
                             log_error "path 格式不合法"; _pause; continue
@@ -2619,7 +2617,7 @@ _menu_collect_status() {
 _menu_render() {
     clear; echo ""
     printf "${C_BOLD}${C_PUR}  ╔══════════════════════════════════════════╗${C_RST}\n"
-    printf "${C_BOLD}${C_PUR}  ║         Xray-2go v9.1 Plugin Platform    ║${C_RST}\n"
+    printf "${C_BOLD}${C_PUR}  ║         Xray-2go Plugin Platform    ║${C_RST}\n"
     printf "${C_BOLD}${C_PUR}  ╠══════════════════════════════════════════╣${C_RST}\n"
     printf "${C_BOLD}${C_PUR}  ║${C_RST}  Xray     : ${_MENU_XC}%-29s${C_RST}${C_PUR} ${C_RST}\n" "${_MENU_XS}"
     printf "${C_BOLD}${C_PUR}  ║${C_RST}  Argo     : %-29s${C_PUR} ${C_RST}\n" "${_MENU_AD}"
@@ -2704,17 +2702,19 @@ menu() {
 }
 
 # ==============================================================================
-# §L15 Main
+# Entrypoint
 # ==============================================================================
 main() {
     check_root
     platform_detect_init
     platform_preflight
     st_init
-    # 安装内置插件（幂等：已存在则由 atomic_write 幂等处理）
+    # 刷新内置插件
     plugin_install_builtins
     # 加载插件到注册表
     plugin_load_all
     menu
 }
-main "$@"
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+    main "$@"
+fi
