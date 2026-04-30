@@ -1535,7 +1535,7 @@ argo_check_health() {
 
 # 修改 Argo 端口：同步 xray inbound；cred/local-managed 模式同步 tunnel.yml；token/remote-managed 模式提示远端同步
 exec_update_argo_port() {
-    local _p; _p=$(_menu_input_port '.ports.argo') || return 1
+    local _p; _menu_input_port '.ports.argo' _p || return 1
     # 1. cred/local-managed 模式同步 tunnel.yml；token/remote-managed 模式仅校验并提示 Cloudflare 远端 ingress
     argo_sync_tunnel_yml || return 1
     # 2. 重建 xray config（插件读取新端口）并持久化 state
@@ -2011,19 +2011,25 @@ ask_xpad_mode() {
 
 # 交互输入端口并写入 .ports.<proto>
 _menu_input_port() {
-    local _jq_path="$1" _p
-    prompt "新端口（回车随机）: " _p
-    [ -z "${_p:-}" ] && _p=$(shuf -i 1024-65000 -n 1 2>/dev/null || \
+    local _jq_path="$1" _outvar="${2:-}" _port_input
+    prompt "新端口（回车随机）: " _port_input
+    [ -z "${_port_input:-}" ] && _port_input=$(shuf -i 1024-65000 -n 1 2>/dev/null || \
                               awk 'BEGIN{srand();print int(rand()*63976)+1024}')
     # I3: 统一通过 val_port 校验，防止注入
-    val_port "${_p}" >/dev/null || return 1
-    if port_mgr_in_use "${_p}"; then
-        log_warn "端口 ${_p} 已被占用"
+    val_port "${_port_input}" >/dev/null || return 1
+    if port_mgr_in_use "${_port_input}"; then
+        log_warn "端口 ${_port_input} 已被占用"
         local _a; prompt "仍然继续？(y/N): " _a
         case "${_a:-n}" in y|Y) :;; *) return 1;; esac
     fi
-    st_set "${_jq_path} = (\$p|tonumber)" --arg p "${_p}" || return 1
-    printf '%s' "${_p}"
+    st_set "${_jq_path} = (\$p|tonumber)" --arg p "${_port_input}" || return 1
+    if [ -n "${_outvar:-}" ]; then
+        printf '%s' "${_outvar}" | grep -qE '^[A-Za-z_][A-Za-z0-9_]*$' \
+            || { log_error "内部错误：非法输出变量名 ${_outvar}"; return 1; }
+        printf -v "${_outvar}" '%s' "${_port_input}"
+    else
+        printf '%s' "${_port_input}"
+    fi
 }
 
 _menu_confirm_uninstall() {
@@ -2238,7 +2244,7 @@ manage_freeflow() {
                 _commit || { _pause; continue; }
                 log_ok "FreeFlow 协议已变更"; config_print_nodes ;;
             5)
-                local _np; _np=$(_menu_input_port '.ports.ff') || { _pause; continue; }
+                local _np; _menu_input_port '.ports.ff' _np || { _pause; continue; }
                 _commit_port_change ff "${_np}" || { _pause; continue; } ;;
             6)
                 { [ "${_en}" != "true" ] || [ "${_proto}" = "none" ]; } && { log_warn "请先启用 FreeFlow"; _pause; continue; }
@@ -2340,7 +2346,7 @@ manage_reality() {
                 _commit || { _pause; continue; }
                 log_ok "Reality 已卸载"; _pause; return ;;
             4)
-                local _np; _np=$(_menu_input_port '.ports.reality') || { _pause; continue; }
+                local _np; _menu_input_port '.ports.reality' _np || { _pause; continue; }
                 _commit_port_change reality "${_np}" || { _pause; continue; } ;;
             5)
                 log_info "建议：addons.mozilla.org / www.microsoft.com / www.apple.com"
@@ -2426,7 +2432,7 @@ manage_vltcp() {
                 _commit || { _pause; continue; }
                 log_ok "VLESS-TCP 已卸载"; _pause; return ;;
             4)
-                local _np; _np=$(_menu_input_port '.ports.vltcp') || { _pause; continue; }
+                local _np; _menu_input_port '.ports.vltcp' _np || { _pause; continue; }
                 _commit_port_change vltcp "${_np}" || { _pause; continue; } ;;
             5)
                 local _l; prompt "新监听地址（0.0.0.0=所有，127.0.0.1=仅本地）: " _l
