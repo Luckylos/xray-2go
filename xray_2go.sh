@@ -24,6 +24,7 @@ readonly UPSTREAM_URL="https://raw.githubusercontent.com/Luckylos/xray-2go/refs/
 
 readonly _LOCK_FILE="${WORK_DIR}/.lock"
 readonly _FW_PORTS_FILE="${WORK_DIR}/.fw_ports"
+readonly _FW_RULES_FILE="${WORK_DIR}/.fw_rules"
 readonly _CONFIG_HASH_FILE="${WORK_DIR}/.config.sha256"
 readonly _SYSCTL_FILE="/etc/sysctl.d/99-xray2go.conf"
 readonly _HOSTS_BAK="${WORK_DIR}/.hosts.bak"
@@ -941,6 +942,26 @@ _fw_read_managed() {
     grep -E '^[0-9]+$' "${_FW_PORTS_FILE}" 2>/dev/null | sort -un || true
 }
 
+_fw_read_managed_rules() {
+    grep -E '^[a-z0-9_]+:[0-9]+/(tcp|udp)$' "${_FW_RULES_FILE}" 2>/dev/null | sort -u || true
+}
+
+_fw_mark_rule() {
+    local _backend="$1" _port="$2" _proto="${3:-tcp}"
+    mkdir -p "${WORK_DIR}" 2>/dev/null || true
+    if ! grep -qx "${_backend}:${_port}/${_proto}" "${_FW_RULES_FILE}" 2>/dev/null; then
+        printf '%s:%s/%s\n' "${_backend}" "${_port}" "${_proto}" >> "${_FW_RULES_FILE}" 2>/dev/null || true
+    fi
+}
+
+_fw_unmark_rule() {
+    local _backend="$1" _port="$2" _proto="${3:-tcp}" _tmp
+    [ -f "${_FW_RULES_FILE}" ] || return 0
+    _tmp=$(tmp_file "fw_rules_XXXXXX") || return 0
+    grep -vx "${_backend}:${_port}/${_proto}" "${_FW_RULES_FILE}" > "${_tmp}" 2>/dev/null || true
+    mv "${_tmp}" "${_FW_RULES_FILE}" 2>/dev/null || true
+}
+
 _fw_has_nftables() {
     command -v nft >/dev/null 2>&1 && nft list ruleset >/dev/null 2>&1
 }
@@ -959,25 +980,27 @@ _fw_open_port() {
         if ! nft list chain inet xray2go input 2>/dev/null \
              | grep -q "${_proto} dport ${_port} accept"; then
             nft add rule inet xray2go input "${_proto}" dport "${_port}" accept 2>/dev/null \
-                && _any=1
+                && { _fw_mark_rule nft "${_port}" "${_proto}"; _any=1; }
+        else
+            _fw_mark_rule nft "${_port}" "${_proto}"
         fi
     fi
     if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
         if ! ufw status numbered 2>/dev/null | grep -qE "^[[:space:]]*[0-9]+.*${_port}/${_proto}"; then
-            ufw allow "${_port}/${_proto}" >/dev/null 2>&1 && _any=1
+            ufw allow "${_port}/${_proto}" >/dev/null 2>&1 && { _fw_mark_rule ufw "${_port}" "${_proto}"; _any=1; }
         fi
     fi
     if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
         if ! firewall-cmd --query-port="${_port}/${_proto}" --permanent >/dev/null 2>&1; then
             firewall-cmd --permanent --add-port="${_port}/${_proto}" >/dev/null 2>&1 && \
-                firewall-cmd --reload >/dev/null 2>&1 && _any=1
+                firewall-cmd --reload >/dev/null 2>&1 && { _fw_mark_rule firewalld "${_port}" "${_proto}"; _any=1; }
         fi
     fi
     if command -v iptables >/dev/null 2>&1; then
         iptables -C INPUT -p "${_proto}" --dport "${_port}" -j ACCEPT 2>/dev/null || {
-            iptables -I INPUT -p "${_proto}" --dport "${_port}" -j ACCEPT 2>/dev/null; _any=1; }
+            iptables -I INPUT -p "${_proto}" --dport "${_port}" -j ACCEPT 2>/dev/null && { _fw_mark_rule iptables "${_port}" "${_proto}"; _any=1; }; }
         ip6tables -C INPUT -p "${_proto}" --dport "${_port}" -j ACCEPT 2>/dev/null || {
-            ip6tables -I INPUT -p "${_proto}" --dport "${_port}" -j ACCEPT 2>/dev/null || true; }
+            ip6tables -I INPUT -p "${_proto}" --dport "${_port}" -j ACCEPT 2>/dev/null && _fw_mark_rule ip6tables6 "${_port}" "${_proto}" || true; }
     fi
     [ "${_any}" -eq 1 ] \
         && log_ok  "防火墙已开放: ${_port}/${_proto}" \
@@ -985,35 +1008,44 @@ _fw_open_port() {
 }
 
 _fw_close_port() {
-    local _port="$1" _proto="${2:-tcp}"
-    if _fw_has_nftables && _fw_nft_table_exists; then
+    local _port="$1" _proto="${2:-tcp}" _backend="${3:-all}"
+    if { [ "${_backend}" = "all" ] || [ "${_backend}" = "nft" ]; } && _fw_has_nftables && _fw_nft_table_exists; then
         local _handle
         _handle=$(nft -a list chain inet xray2go input 2>/dev/null \
             | grep "${_proto} dport ${_port} accept" \
             | grep -oE 'handle [0-9]+' | awk '{print $2}' | head -1)
         [ -n "${_handle:-}" ] && \
             nft delete rule inet xray2go input handle "${_handle}" 2>/dev/null || true
+        _fw_unmark_rule nft "${_port}" "${_proto}"
     fi
-    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
+    if { [ "${_backend}" = "all" ] || [ "${_backend}" = "ufw" ]; } && command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
         ufw delete allow "${_port}/${_proto}" >/dev/null 2>&1 || true
+        _fw_unmark_rule ufw "${_port}" "${_proto}"
     fi
-    if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+    if { [ "${_backend}" = "all" ] || [ "${_backend}" = "firewalld" ]; } && command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
         firewall-cmd --permanent --remove-port="${_port}/${_proto}" >/dev/null 2>&1 && \
             firewall-cmd --reload >/dev/null 2>&1 || true
+        _fw_unmark_rule firewalld "${_port}" "${_proto}"
     fi
     if command -v iptables >/dev/null 2>&1; then
-        local _n=0
-        while iptables -C INPUT -p "${_proto}" --dport "${_port}" -j ACCEPT 2>/dev/null; do
-            iptables -D INPUT -p "${_proto}" --dport "${_port}" -j ACCEPT 2>/dev/null || break
-            _n=$(( _n + 1 )); [ "${_n}" -gt 20 ] && break
-        done
-        _n=0
-        while ip6tables -C INPUT -p "${_proto}" --dport "${_port}" -j ACCEPT 2>/dev/null; do
-            ip6tables -D INPUT -p "${_proto}" --dport "${_port}" -j ACCEPT 2>/dev/null || break
-            _n=$(( _n + 1 )); [ "${_n}" -gt 20 ] && break
-        done
+        if [ "${_backend}" = "all" ] || [ "${_backend}" = "iptables" ]; then
+            local _n=0
+            while iptables -C INPUT -p "${_proto}" --dport "${_port}" -j ACCEPT 2>/dev/null; do
+                iptables -D INPUT -p "${_proto}" --dport "${_port}" -j ACCEPT 2>/dev/null || break
+                _n=$(( _n + 1 )); [ "${_n}" -gt 20 ] && break
+            done
+            _fw_unmark_rule iptables "${_port}" "${_proto}"
+        fi
+        if [ "${_backend}" = "all" ] || [ "${_backend}" = "ip6tables6" ]; then
+            local _n=0
+            while ip6tables -C INPUT -p "${_proto}" --dport "${_port}" -j ACCEPT 2>/dev/null; do
+                ip6tables -D INPUT -p "${_proto}" --dport "${_port}" -j ACCEPT 2>/dev/null || break
+                _n=$(( _n + 1 )); [ "${_n}" -gt 20 ] && break
+            done
+            _fw_unmark_rule ip6tables6 "${_port}" "${_proto}"
+        fi
     fi
-    log_info "防火墙已关闭: ${_port}/${_proto}"
+    log_info "防火墙规则已删除: ${_port}/${_proto}"
 }
 
 fw_reconcile() {
@@ -1023,7 +1055,14 @@ fw_reconcile() {
     _expected=$(fw_desired_ports)
     _managed=$(_fw_read_managed)
     for _p in ${_managed}; do
-        printf '%s\n' ${_expected} | grep -qx "${_p}" || _fw_close_port "${_p}" tcp
+        printf '%s\n' ${_expected} | grep -qx "${_p}" || {
+            local _rule _rp _rb _rproto
+            for _rule in $(_fw_read_managed_rules | grep -E ":${_p}/tcp$" || true); do
+                _rb=${_rule%%:*}
+                _rp=${_rule#*:}; _rproto=${_rp#*/}; _rp=${_rp%/*}
+                _fw_close_port "${_rp}" "${_rproto}" "${_rb}"
+            done
+        }
     done
     for _p in ${_expected}; do
         _fw_open_port "${_p}" tcp
@@ -1031,7 +1070,7 @@ fw_reconcile() {
     if [ -n "${_expected:-}" ]; then
         printf '%s\n' ${_expected} > "${_FW_PORTS_FILE}" 2>/dev/null || true
     else
-        rm -f "${_FW_PORTS_FILE}" 2>/dev/null || true
+        rm -f "${_FW_PORTS_FILE}" "${_FW_RULES_FILE}" 2>/dev/null || true
     fi
 }
 
@@ -1040,13 +1079,38 @@ fw_force_cleanup() {
     local _ports="" _p
     [ -f "${_FW_PORTS_FILE}" ] && \
         _ports=$(grep -E '^[0-9]+$' "${_FW_PORTS_FILE}" 2>/dev/null || true)
-    local _uniq
+    # 正常情况下只依赖 .fw_ports 删除脚本曾托管的端口；同时合并当前 state 中
+    # 仍处于启用状态的端口，覆盖 .fw_ports 损坏/未写入但本次运行 state 仍可证明
+    # 该端口属于 xray2go 的场景。避免盲删默认 443/8080 等可能由其它服务使用的端口。
+    if [ "$(st_get '.argo.enabled')" = "true" ]; then
+        _ports="${_ports}
+$(port_of argo)"
+    fi
+    if [ "$(st_get '.ff.enabled')" = "true" ] && [ "$(st_get '.ff.protocol')" != "none" ]; then
+        _ports="${_ports}
+$(port_of ff)"
+    fi
+    if [ "$(st_get '.reality.enabled')" = "true" ]; then
+        _ports="${_ports}
+$(port_of reality)"
+    fi
+    if [ "$(st_get '.vltcp.enabled')" = "true" ]; then
+        _ports="${_ports}
+$(port_of vltcp)"
+    fi
+    local _uniq _rule _rp _rb _rproto
     _uniq=$(printf '%s\n' ${_ports} | grep -E '^[0-9]+$' | sort -un)
-    for _p in ${_uniq}; do _fw_close_port "${_p}" tcp 2>/dev/null || true; done
+    for _rule in $(_fw_read_managed_rules); do
+        _rb=${_rule%%:*}
+        _rp=${_rule#*:}; _rproto=${_rp#*/}; _rp=${_rp%/*}
+        if printf '%s\n' ${_uniq} | grep -qx "${_rp}" || [ ! -f "${_FW_PORTS_FILE}" ]; then
+            _fw_close_port "${_rp}" "${_rproto}" "${_rb}" 2>/dev/null || true
+        fi
+    done
     if _fw_has_nftables && _fw_nft_table_exists; then
         nft delete table inet xray2go 2>/dev/null || true
     fi
-    rm -f "${_FW_PORTS_FILE}" 2>/dev/null || true
+    rm -f "${_FW_PORTS_FILE}" "${_FW_RULES_FILE}" 2>/dev/null || true
     log_ok "防火墙规则清理完成"
 }
 
@@ -1412,6 +1476,16 @@ _commit() {
     fw_reconcile
 }
 
+_module_disable_commit() {
+    local _name="$1"
+    config_apply || return 1
+    st_persist   || log_warn "state.json 写入失败"
+    # 模块禁用/卸载后必须删除对应托管防火墙端口，而不是只让服务不再监听。
+    # fw_reconcile 根据当前启用插件重新计算期望端口，并删除 .fw_ports 中不再期望的规则。
+    fw_reconcile
+    log_info "${_name} 防火墙端口已从托管规则中删除"
+}
+
 # ==============================================================================
 # §L11 Argo Tunnel — tunnel.yml / token 管理（遵循 Cloudflare 官方运行方式）
 # ==============================================================================
@@ -1756,9 +1830,17 @@ _install_check_port_conflicts() {
 _install_rollback() {
     local _xray_was="${1:-0}" _argo_was="${2:-0}"
     log_warn "安装中断，回滚..."
+    fw_force_cleanup
     [ "${_xray_was}" -eq 0 ] && rm -f "${XRAY_BIN}" 2>/dev/null || true
     [ "${_argo_was}" -eq 0 ] && rm -f "${ARGO_BIN}" 2>/dev/null || true
-    rm -f "${CONFIG_FILE}" "${_ARGO_ENV_FILE}" 2>/dev/null || true
+    rm -f "${CONFIG_FILE}" "${CONFIG_FILE}".*.bak "${STATE_FILE}".*.bak \
+          "${_CONFIG_HASH_FILE}" "${_FW_RULES_FILE}" "${_ARGO_ENV_FILE}" "${WORK_DIR}/tunnel.yml" \
+          "${WORK_DIR}/tunnel.json" "${WORK_DIR}/xray.pid" \
+          /var/run/xray2go.pid /var/run/tunnel2go.pid 2>/dev/null || true
+    for _s in "${_SVC_XRAY}" "${_SVC_TUNNEL}"; do
+        svc_exec_mut stop    "${_s}" 2>/dev/null || true
+        svc_exec_mut disable "${_s}" 2>/dev/null || true
+    done
     if is_systemd; then
         rm -f /etc/systemd/system/${_SVC_XRAY}.service \
               /etc/systemd/system/${_SVC_TUNNEL}.service 2>/dev/null || true
@@ -1852,6 +1934,9 @@ exec_uninstall() {
     done
     fw_force_cleanup
     rm -f "${WORK_DIR}/xray.pid" /var/run/xray2go.pid /var/run/tunnel2go.pid 2>/dev/null || true
+    rm -f "${CONFIG_FILE}" "${CONFIG_FILE}".*.bak "${STATE_FILE}" "${STATE_FILE}".*.bak \
+          "${_CONFIG_HASH_FILE}" "${_FW_RULES_FILE}" "${_ARGO_ENV_FILE}" "${WORK_DIR}/tunnel.yml" \
+          "${WORK_DIR}/tunnel.json" "${_SVC_LOCK_FILE}" "${_LOCK_FILE}" 2>/dev/null || true
     if is_systemd; then
         rm -f /etc/systemd/system/${_SVC_XRAY}.service \
               /etc/systemd/system/${_SVC_TUNNEL}.service 2>/dev/null || true
@@ -2164,8 +2249,7 @@ manage_argo() {
                 svc_exec_mut stop    "${_SVC_TUNNEL}" 2>/dev/null || true
                 svc_exec_mut disable "${_SVC_TUNNEL}" 2>/dev/null || true
                 st_set '.argo.enabled = false' || { _pause; continue; }
-                config_apply  || { _pause; continue; }
-                st_persist    || log_warn "state.json 写入失败"
+                _module_disable_commit Argo || { _pause; continue; }
                 log_ok "Argo 已禁用" ;;
             3)
                 [ "${_en}" != "true" ] && { log_warn "Argo 未启用"; _pause; continue; }
@@ -2186,8 +2270,7 @@ manage_argo() {
                       "${WORK_DIR}/tunnel.json" "${_ARGO_ENV_FILE}" 2>/dev/null || true
                 st_set '.argo.enabled = false | .argo.domain = null | .argo.token = null | .argo.mode = "fixed"' \
                     || true
-                config_apply  || { _pause; continue; }
-                st_persist    || log_warn "state.json 写入失败"
+                _module_disable_commit Argo || { _pause; continue; }
                 log_ok "Argo 已完全卸载"; _pause; return ;;
             4)
                 [ "${_en}" != "true" ] && { log_warn "请先选项 1 启用 Argo"; _pause; continue; }
@@ -2273,14 +2356,14 @@ manage_freeflow() {
             2)
                 { [ "${_en}" != "true" ] || [ "${_proto}" = "none" ]; } && { log_info "FreeFlow 已禁用"; _pause; continue; }
                 st_set '.ff.enabled = false | .ff.protocol = "none"' || { _pause; continue; }
-                _commit || { _pause; continue; }
+                _module_disable_commit FreeFlow || { _pause; continue; }
                 log_ok "FreeFlow 已禁用" ;;
             3) svc_restart_xray || true ;;
             9)
                 _menu_confirm_uninstall "FreeFlow" || { _pause; continue; }
                 st_set '.ff.enabled = false | .ff.protocol = "none" | .ff.path = "/" | .ff.host = ""' \
                     || { _pause; continue; }
-                _commit || { _pause; continue; }
+                _module_disable_commit FreeFlow || { _pause; continue; }
                 log_ok "FreeFlow 已卸载"; _pause; return ;;
             4)
                 ask_freeflow_mode
@@ -2380,14 +2463,14 @@ manage_reality() {
             2)
                 [ "${_en}" != "true" ] && { log_info "Reality 已禁用"; _pause; continue; }
                 st_set '.reality.enabled = false' || { _pause; continue; }
-                _commit || { _pause; continue; }
+                _module_disable_commit Reality || { _pause; continue; }
                 log_ok "Reality 已禁用" ;;
             3) svc_restart_xray || true ;;
             9)
                 _menu_confirm_uninstall "Reality" || { _pause; continue; }
                 st_set '.reality.enabled = false | .reality.pbk = null | .reality.pvk = null | .reality.sid = null' \
                     || { _pause; continue; }
-                _commit || { _pause; continue; }
+                _module_disable_commit Reality || { _pause; continue; }
                 log_ok "Reality 已卸载"; _pause; return ;;
             4)
                 local _np; _menu_input_port '.ports.reality' _np || { _pause; continue; }
@@ -2466,14 +2549,14 @@ manage_vltcp() {
             2)
                 [ "${_en}" != "true" ] && { log_info "VLESS-TCP 已禁用"; _pause; continue; }
                 st_set '.vltcp.enabled = false' || { _pause; continue; }
-                _commit || { _pause; continue; }
+                _module_disable_commit VLESS-TCP || { _pause; continue; }
                 log_ok "VLESS-TCP 已禁用" ;;
             3) svc_restart_xray || true ;;
             9)
                 _menu_confirm_uninstall "VLESS-TCP" || { _pause; continue; }
                 st_set '.vltcp.enabled = false | .vltcp.listen = "0.0.0.0"' || { _pause; continue; }
                 st_set '.ports.vltcp = 1234'
-                _commit || { _pause; continue; }
+                _module_disable_commit VLESS-TCP || { _pause; continue; }
                 log_ok "VLESS-TCP 已卸载"; _pause; return ;;
             4)
                 local _np; _menu_input_port '.ports.vltcp' _np || { _pause; continue; }
