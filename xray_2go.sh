@@ -2626,7 +2626,7 @@ _menu_collect_status() {
 _menu_render() {
     clear; echo ""
     printf "${C_BOLD}${C_PUR}  ╔══════════════════════════════════════════╗${C_RST}\n"
-    printf "${C_BOLD}${C_PUR}  ║         Xray-2go Plugin Platform    ║${C_RST}\n"
+    printf "${C_BOLD}${C_PUR}  ║           Xray-2go Plugin Platform       ║${C_RST}\n"
     printf "${C_BOLD}${C_PUR}  ╠══════════════════════════════════════════╣${C_RST}\n"
     printf "${C_BOLD}${C_PUR}  ║${C_RST}  Xray     : ${_MENU_XC}%-29s${C_RST}${C_PUR} ${C_RST}\n" "${_MENU_XS}"
     printf "${C_BOLD}${C_PUR}  ║${C_RST}  Argo     : %-29s${C_PUR} ${C_RST}\n" "${_MENU_AD}"
