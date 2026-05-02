@@ -1231,6 +1231,11 @@ svc_reload_xray() {
     fi
 
     log_step "重启 xray2go 以加载新配置..."
+    # 兼容旧版本/异常中断造成的 systemd active(not-found) 状态：
+    # 进程仍在运行，但 unit 文件不存在时，systemctl restart 会直接失败。
+    # 因此每次重载配置前都先确保托管服务单元存在并刷新 daemon。
+    svc_apply_xray || { log_error "xray2go 服务单元写入失败"; return 1; }
+    svc_reload_daemon
     svc_exec_mut restart "${_SVC_XRAY}" || { log_error "xray restart 失败"; return 1; }
     printf '%s' "${_new_hash}" > "${_CONFIG_HASH_FILE}" 2>/dev/null || true
     log_ok "xray 已重启并加载新配置"
@@ -1313,7 +1318,11 @@ svc_apply_tunnel() {
 
 svc_restart_xray() {
     [ -f "${CONFIG_FILE}" ] || { log_error "配置文件不存在"; return 1; }
-    svc_exec_mut restart "${_SVC_XRAY}"         && { log_ok "${_SVC_XRAY} 已重启"; svc_verify_health "${_SVC_XRAY}" 6; }         || { log_error "${_SVC_XRAY} 重启失败"; return 1; }
+    svc_apply_xray || { log_error "xray2go 服务单元写入失败"; return 1; }
+    svc_reload_daemon
+    svc_exec_mut restart "${_SVC_XRAY}" \
+        && { log_ok "${_SVC_XRAY} 已重启"; svc_verify_health "${_SVC_XRAY}" 6; } \
+        || { log_error "${_SVC_XRAY} 重启失败"; return 1; }
 }
 
 svc_verify_health() {
