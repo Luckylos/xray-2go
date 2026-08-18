@@ -26,6 +26,18 @@ def run_bash(script: str) -> str:
     return cp.stdout
 
 
+def run_bash_result(script: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["bash", "-lc", script],
+        cwd=ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        timeout=20,
+        check=False,
+    )
+
+
 def test_function_boundaries_after_source():
     out = run_bash(
         "source ./xray_2go.sh; "
@@ -138,7 +150,7 @@ def test_config_detects_wildcard_listen_conflicts_and_filters_links():
     assert_true('_used_wild_ports' in TEXT and '_used_exact_keys' in TEXT, "config build must track wildcard ports and exact listen keys separately")
     assert_true('printf \'%s\\n\' "${_used_wild_ports}" | grep -qxF "${_port}"' in TEXT, "specific listen must conflict with existing wildcard same-port listener")
     assert_true('printf \'%s\\n\' "${_used_exact_keys}" | grep -qE ":${_port}$"' in TEXT, "wildcard listen must conflict with existing specific same-port listener")
-    assert_true("^(vless|socks)://" in TEXT and "grep -E" in TEXT, "node output should filter plugin link noise and print supported share links")
+    assert_true("^(vless|trojan|socks)://" in TEXT and "grep -E" in TEXT, "node output should filter plugin link noise and print supported share links")
 
 
 def test_plugin_loader_validates_before_source_and_loads_in_subshell():
@@ -365,7 +377,7 @@ def test_socks5_module_option_and_plugin_contract():
 
 
 def test_socks5_link_is_generated_and_displayed():
-    assert_true("grep -E '^(vless|socks)://'" in TEXT, "node output must include v2rayN-compatible SOCKS links, not only vless links")
+    assert_true("grep -E '^(vless|trojan|socks)://'" in TEXT, "node output must include v2rayN-compatible SOCKS links, not only vless links")
     socks_plugin = TEXT[TEXT.index('_plugin_write_socks()'):TEXT.index('_plugin_write_cforigin()', TEXT.index('_plugin_write_socks()'))]
     assert_true("socks://%s@%s:%s#SOCKS5" in socks_plugin, "SOCKS plugin should generate v2rayN-compatible socks:// base64(user:pass) links")
     assert_true("base64" in socks_plugin and "tr -d '=\\n'" in socks_plugin, "SOCKS credentials must be URL-safe base64(user:pass) without padding")
@@ -538,6 +550,97 @@ def test_install_execute_current_plan_uses_state_based_argo_apply():
     body = m.group('body')
     assert_true('argo_apply_fixed_tunnel_from_state' in body, 'install execution should use state-based argo apply path')
     assert_true('argo_apply_fixed_tunnel ||' not in body, 'install execution should not fall back to interactive argo apply path')
+
+
+def test_state_get_preserves_false_and_zero_values():
+    cp = run_bash_result("""
+        source ./xray_2go.sh
+        _G_STATE="${_STATE_DEFAULT}"
+        _st_normalize_schema >/dev/null
+        st_set '.argo.enabled = false | .ports.argo = 0' >/dev/null
+        printf 'enabled=%s port=%s\\n' "$(st_get '.argo.enabled')" "$(st_get '.ports.argo')"
+    """)
+    assert_true(cp.returncode == 0, "state probe should complete")
+    assert_true("enabled=false" in cp.stdout and "port=0" in cp.stdout, "state reads must preserve false and zero")
+
+
+def test_install_refresh_failure_uses_initialized_rollback_flags():
+    install_start = TEXT.index("module_xray_install_core()")
+    refresh = TEXT.index("plugin_refresh_runtime ||", install_start)
+    declaration = TEXT.index("local _xray_was=0 _argo_was=0", install_start)
+    assert_true(declaration < refresh, "install rollback flags must be initialized before plugin refresh can fail")
+
+
+def test_install_plan_rejects_unconfigured_argo():
+    cp = run_bash_result("""
+        source ./xray_2go.sh
+        _G_STATE="${_STATE_DEFAULT}"
+        _st_normalize_schema >/dev/null
+        install_plan_validate
+    """)
+    assert_true(cp.returncode != 0, "an enabled but unconfigured Argo plan must fail validation")
+    assert_true("Argo" in cp.stdout and ("域名" in cp.stdout or "token" in cp.stdout), "Argo validation should explain the missing configuration")
+
+
+def test_install_execute_fails_when_argo_apply_fails():
+    cp = run_bash_result("""
+        source ./xray_2go.sh
+        _G_STATE="${_STATE_DEFAULT}"
+        _st_normalize_schema >/dev/null
+        st_set '.argo.enabled = true | .argo.domain = "origin.example.com" | .argo.token = "aaaaaaaaaaaaaaaaaaaa"' >/dev/null
+        install_plan_validate() { return 0; }
+        module_xray_install_core() { return 0; }
+        st_persist() { return 0; }
+        argo_apply_fixed_tunnel_from_state() { return 1; }
+        config_print_nodes() { return 0; }
+        cforigin_print_cloudflare_hint() { return 0; }
+        install_execute_current_plan
+    """)
+    assert_true(cp.returncode != 0, "install must fail when selected Argo application fails")
+
+
+def test_argo_enable_rolls_back_on_start_failure():
+    cp = run_bash_result("""
+        source ./xray_2go.sh
+        _G_STATE="${_STATE_DEFAULT}"
+        _st_normalize_schema >/dev/null
+        download_cloudflared() { return 0; }
+        config_apply() { return 0; }
+        svc_apply_tunnel() { return 0; }
+        svc_reload_daemon() { return 0; }
+        svc_exec_mut() { [ "$1" = "start" ] && return 1; return 0; }
+        st_persist() { return 0; }
+        fw_reconcile() { return 0; }
+        module_argo_enable
+        rc=$?
+        printf 'module-rc=%s enabled=%s\\n' "$rc" "$(st_get '.argo.enabled')"
+        exit 0
+    """)
+    assert_true("module-rc=0" not in cp.stdout, "Argo start failure must not return success")
+    assert_true("enabled=false" in cp.stdout, "Argo state must roll back after start failure")
+
+
+def test_cforigin_plain_http_does_not_require_certificates():
+    cp = run_bash_result("""
+        source ./xray_2go.sh
+        _G_STATE="${_STATE_DEFAULT}"
+        _st_normalize_schema >/dev/null
+        st_set '.argo.enabled = false | .cforigin.enabled = true | .cforigin.domain = "origin.example.com" | .cforigin.origin_tls = false | .cforigin.cert = "" | .cforigin.key = ""' >/dev/null
+        install_plan_validate
+    """)
+    assert_true(cp.returncode == 0, "plain HTTP CF Origin should validate without certificate files")
+
+
+def test_trojan_argo_capability_is_owned_by_main_script():
+    assert_true('"auth_protocol": "vless"' in TEXT, "Argo must have an explicit authentication protocol state")
+    assert_true('auth_protocol' in TEXT and 'trojan' in TEXT, "main script must contain the Trojan Argo capability")
+    assert_true('protocol:"trojan"' in TEXT, "main script must render a Trojan inbound")
+    assert_true('trojan://' in TEXT, "main script must render a Trojan share link")
+    assert_true('val_trojan_password' in TEXT, "Trojan password must have a dedicated validator")
+
+
+def test_legacy_trojan_script_is_removed_after_migration():
+    assert_true(not (ROOT / "xray_2go_Trojan_Socks5.sh").exists(), "legacy standalone Trojan script must not remain after migration")
 
 
 def main():

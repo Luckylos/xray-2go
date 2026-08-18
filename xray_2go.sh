@@ -330,6 +330,8 @@ readonly _STATE_DEFAULT='{
   "argo": {
     "enabled":  true,
     "protocol": "ws",
+    "auth_protocol": "vless",
+    "trojan_password": "",
     "mode":     "fixed",
     "domain":   null,
     "token":    null
@@ -458,7 +460,7 @@ _commit_port_change() {
 # ── State 读/写 ───────────────────────────────────────────────────────────────
 st_get() {
     local _v
-    _v=$(printf '%s' "${_G_STATE}" | jq -r "${1} // empty" 2>/dev/null) || true
+    _v=$(printf '%s' "${_G_STATE}" | jq -r "if (${1}) == null then empty else (${1}) end" 2>/dev/null) || true
     printf '%s' "${_v}"
 }
 
@@ -556,6 +558,33 @@ val_argo_token() {
     printf '%s' "${_token}" | grep -qE '^[A-Za-z0-9=_-]{20,}$' \
         || { log_error "Argo token 格式异常，拒绝写入 env"; return 1; }
     printf '%s' "${_token}"
+}
+
+val_argo_auth_state() {
+    local _token _cred_b64 _cred
+    _token=$(st_get '.argo.token')
+    _cred_b64=$(st_get '.argo.cred_b64')
+    if [ -n "${_cred_b64:-}" ] && [ "${_cred_b64}" != "null" ]; then
+        _cred=$(printf '%s' "${_cred_b64}" | base64 -d 2>/dev/null) \
+            || { log_error "Argo JSON 凭证不是合法 Base64"; return 1; }
+        printf '%s' "${_cred}" | jq -e '
+            type == "object" and
+            (((.TunnelID? // "") != "") or ((.AccountTag? // "") != ""))
+        ' >/dev/null 2>&1 || {
+            log_error "Argo JSON 凭证缺少 TunnelID/AccountTag"; return 1;
+        }
+        return 0
+    fi
+    [ -n "${_token:-}" ] && [ "${_token}" != "null" ] \
+        || { log_error "Argo 未配置 Tunnel token 或 JSON 凭证"; return 1; }
+    val_argo_token "${_token}" >/dev/null || return 1
+}
+
+val_trojan_password() {
+    local _password="${1:-}"
+    printf '%s' "${_password}" | grep -qE '^[A-Za-z0-9._~-]{8,128}$' \
+        || { log_error "Trojan 密码格式异常，需为 8-128 位 URL-safe 字符"; return 1; }
+    printf '%s' "${_password}"
 }
 
 cf_edge_port_valid() {
@@ -666,6 +695,10 @@ _st_normalize_schema() {
     { [ -z "${_c:-}" ] || [ "${_c}" = "null" ]; } && st_set '.cfip = "cf.tencentapp.cn"'
     _c=$(st_get '.cfport')
     { [ -z "${_c:-}" ] || [ "${_c}" = "null" ]; } && st_set '.cfport = "443"'
+    _c=$(st_get '.argo.auth_protocol')
+    case "${_c:-}" in vless|trojan) : ;; *) st_set '.argo.auth_protocol = "vless"' ;; esac
+    _c=$(st_get '.argo.trojan_password')
+    [ "${_c}" = "null" ] && st_set '.argo.trojan_password = ""'
     _c=$(st_get '.ff.host')
     { [ -z "${_c:-}" ] || [ "${_c}" = "null" ]; } && st_set '.ff.host = ""'
     # 规范化 xPadding 开关结构。
@@ -856,7 +889,7 @@ _plugin_snapshot_rebuild() {
         [ -n "${_p:-}" ] && _PLUGIN_SNAPSHOT_PORTS="${_PLUGIN_SNAPSHOT_PORTS}$(printf '%s\n' "${_p}")"
 
         _l=$(plugin_call "${_name}" link 2>/dev/null) || true
-        [ -n "${_l:-}" ] && _PLUGIN_SNAPSHOT_LINKS="${_PLUGIN_SNAPSHOT_LINKS}$(printf '%s\n' "${_l}" | grep -E '^(vless|socks)://' || true)"$'\n'
+        [ -n "${_l:-}" ] && _PLUGIN_SNAPSHOT_LINKS="${_PLUGIN_SNAPSHOT_LINKS}$(printf '%s\n' "${_l}" | grep -E '^(vless|trojan|socks)://' || true)"$'\n'
 
         _ib=$(plugin_call "${_name}" inbound 2>/dev/null) || {
             log_error "插件 inbound 失败: ${_name}"; return 1; }
@@ -954,18 +987,28 @@ _plg_argo_ports() {
 
 _plg_argo_inbound() {
     _plg_argo_enabled || return 0
-    local _port _proto _uuid
+    local _port _proto _auth _uuid _password
     _port=$(port_of argo)
     _proto=$(st_get '.argo.protocol')
+    _auth=$(st_get '.argo.auth_protocol')
     _uuid=$(st_get '.uuid')
+    _password=$(st_get '.argo.trojan_password')
+    [ -n "${_password:-}" ] || _password="${_uuid}"
     local _xpad
     if [ "$(xpad_of argo)" = "true" ]; then
         _xpad=$(printf '%s' "${_XPAD_JSON}" | jq -c .)
     else
         _xpad='{}'
     fi
-    case "${_proto}" in
-        xhttp)
+    case "${_auth}:${_proto}" in
+        trojan:ws)
+            jq -n --argjson port "${_port}" --arg password "${_password}" '{
+                port:$port, listen:"127.0.0.1", protocol:"trojan",
+                settings:{clients:[{password:$password}]},
+                streamSettings:{network:"ws", wsSettings:{path:"/argo"}}}' ;;
+        trojan:*)
+            log_error "Trojan Argo 当前仅支持 WS 传输"; return 1 ;;
+        vless:xhttp)
             jq -n --argjson port "${_port}" --arg uuid "${_uuid}" \
                    --arg mode "auto" --argjson x "${_xpad}" '{
                 port:$port, listen:"127.0.0.1", protocol:"vless",
@@ -982,13 +1025,22 @@ _plg_argo_inbound() {
 
 _plg_argo_link() {
     _plg_argo_enabled || return 0
-    local _domain _proto _uuid _cfip _cfport _xqs
+    local _domain _proto _auth _uuid _password _cfip _cfport _xqs
     _domain=$(st_get '.argo.domain')
     [ -n "${_domain:-}" ] && [ "${_domain}" != "null" ] || return 0
     _proto=$(st_get '.argo.protocol')
+    _auth=$(st_get '.argo.auth_protocol')
     _uuid=$(st_get '.uuid')
+    _password=$(st_get '.argo.trojan_password')
+    [ -n "${_password:-}" ] || _password="${_uuid}"
     _cfip=$(st_get '.cfip')
     _cfport=$(st_get '.cfport')
+    if [ "${_auth}" = "trojan" ]; then
+        [ "${_proto}" = "ws" ] || return 0
+        printf 'trojan://%s@%s:%s?security=tls&sni=%s&type=ws&host=%s&path=%%2Fargo%%3Fed%%3D2560#Argo-Trojan\n' \
+            "${_password}" "${_cfip}" "${_cfport}" "${_domain}" "${_domain}"
+        return 0
+    fi
     [ "$(xpad_of argo)" = "true" ] && _xqs="${_XPAD_QS}" || _xqs=""
     case "${_proto}" in
         xhttp)
@@ -2312,11 +2364,23 @@ module_argo_enable() {
     config_apply || { st_set '.argo.enabled = false'; return 1; }
     svc_apply_tunnel || return 1
     svc_reload_daemon
-    svc_exec_mut enable "${_SVC_TUNNEL}"
-    svc_exec_mut start  "${_SVC_TUNNEL}" \
-        && log_ok "Argo 已启用并启动" \
-        || log_warn "启动失败，请检查域名配置"
+    if ! svc_exec_mut enable "${_SVC_TUNNEL}"; then
+        svc_exec_mut disable "${_SVC_TUNNEL}" 2>/dev/null || true
+        st_set '.argo.enabled = false' || return 1
+        _module_disable_commit Argo || return 1
+        log_error "Argo 服务启用失败"
+        return 1
+    fi
+    if ! svc_exec_mut start "${_SVC_TUNNEL}"; then
+        svc_exec_mut stop "${_SVC_TUNNEL}" 2>/dev/null || true
+        svc_exec_mut disable "${_SVC_TUNNEL}" 2>/dev/null || true
+        st_set '.argo.enabled = false' || return 1
+        _module_disable_commit Argo || return 1
+        log_error "Argo 启动失败，请检查域名和 Tunnel 认证"
+        return 1
+    fi
     st_persist || { log_error "state.json 写入失败"; return 1; }
+    log_ok "Argo 已启用并启动"
 }
 
 module_argo_disable() {
@@ -2358,6 +2422,15 @@ module_argo_update_protocol() {
         '') : ;;
         *) log_error "无效选项，请按提示输入"; return 1 ;;
     esac
+    argo_apply_fixed_tunnel_from_state || { log_error "固定隧道同步失败"; return 1; }
+    config_print_nodes
+}
+
+module_argo_update_auth_protocol() {
+    local _en
+    _en=$(st_get '.argo.enabled')
+    [ "${_en}" = "true" ] || { log_warn "请先启用 Argo"; return 1; }
+    install_plan_argo_update_auth_protocol || return 1
     argo_apply_fixed_tunnel_from_state || { log_error "固定隧道同步失败"; return 1; }
     config_print_nodes
 }
@@ -3313,6 +3386,7 @@ _install_rollback() {
 }
 
 module_xray_install_core() {
+    local _xray_was=0 _argo_was=0
     clear; log_title "══════════ 安装 Xray-2go ══════════"
     platform_preflight
     mkdir -p "${WORK_DIR}" && chmod 750 "${WORK_DIR}"
@@ -3331,7 +3405,6 @@ module_xray_install_core() {
 
     _install_check_port_conflicts || { log_error "端口冲突无法解决"; return 1; }
 
-    local _xray_was=0 _argo_was=0
     [ -f "${XRAY_BIN}" ] && [ -x "${XRAY_BIN}" ] && _xray_was=1
     [ -f "${ARGO_BIN}" ] && [ -x "${ARGO_BIN}" ] && _argo_was=1
 
@@ -3593,6 +3666,7 @@ module_dispatch() {
 
         # field/config update actions
         argo:update_protocol) module_argo_update_protocol ;;
+        argo:update_auth_protocol) module_argo_update_auth_protocol ;;
         argo:update_domain) module_argo_update_domain ;;
         argo:update_auth) module_argo_update_auth ;;
         ff:update_mode) module_ff_update_mode ;;
@@ -3980,13 +4054,30 @@ install_plan_argo_toggle() {
     fi
 }
 
+install_plan_argo_update_auth_protocol() {
+    echo ""
+    log_title "Argo 入站认证协议"
+    printf "  ${C_GRN}1.${C_RST} VLESS ${C_YLW}[默认]${C_RST}\n"
+    printf "  ${C_GRN}2.${C_RST} Trojan + WS + Argo\n"
+    local _c
+    prompt "请选择 (1-2，回车默认1): " _c
+    case "${_c:-1}" in
+        2)
+            [ "$(st_get '.argo.protocol')" = "ws" ] || {
+                log_error "Trojan Argo 当前仅支持 WS，请先将传输协议设为 WS"; return 1; }
+            st_set '.argo.auth_protocol = "trojan"' || return 1
+            log_ok "Argo 入站认证已设置为 Trojan" ;;
+        *)
+            st_set '.argo.auth_protocol = "vless"' || return 1
+            log_ok "Argo 入站认证已设置为 VLESS" ;;
+    esac
+}
+
 install_plan_argo_update_protocol() {
     echo ""
     log_title "Argo 传输协议"
-    printf "  ${C_GRN}1.${C_RST} WS ${C_YLW}[默认]${C_RST}
-"
-    printf "  ${C_GRN}2.${C_RST} XHTTP (auto)
-"
+    printf "  ${C_GRN}1.${C_RST} WS ${C_YLW}[默认]${C_RST}\n"
+    printf "  ${C_GRN}2.${C_RST} XHTTP (auto)\n"
     local _c
     prompt "请选择 (1-2，回车默认1): " _c
     case "${_c:-1}" in
@@ -4398,6 +4489,25 @@ install_plan_validate() {
     install_plan_has_enabled_module || { log_error "安装计划无效：至少启用一个入站模块"; return 1; }
 
     if [ "$(st_get '.argo.enabled')" = "true" ]; then
+        local _argo_domain
+        _argo_domain=$(st_get '.argo.domain')
+        val_domain "${_argo_domain}" >/dev/null || {
+            log_error "Argo 域名未配置或格式不合法"; return 1;
+        }
+        val_argo_auth_state || return 1
+        local _argo_auth
+        _argo_auth=$(st_get '.argo.auth_protocol')
+        case "${_argo_auth}" in
+            vless) : ;;
+            trojan)
+                [ "$(st_get '.argo.protocol')" = "ws" ] || {
+                    log_error "Trojan Argo 当前仅支持 WS 传输"; return 1; }
+                local _trojan_password
+                _trojan_password=$(st_get '.argo.trojan_password')
+                [ -n "${_trojan_password:-}" ] || _trojan_password=$(st_get '.uuid')
+                val_trojan_password "${_trojan_password}" >/dev/null || return 1 ;;
+            *) log_error "Argo 入站认证协议非法"; return 1 ;;
+        esac
         case "$(st_get '.argo.protocol')" in ws|xhttp) : ;; *) log_error "Argo 协议非法"; return 1 ;; esac
         val_port "$(port_of argo)" >/dev/null || return 1
     fi
@@ -4444,8 +4554,10 @@ install_plan_validate() {
         val_port "$(port_of cforigin)" >/dev/null || return 1
         val_listen_addr "$(st_get '.cforigin.listen')" >/dev/null || return 1
         [ -n "$(st_get '.cforigin.domain')" ] || { log_error "CF Origin 域名不能为空"; return 1; }
-        [ -f "$(st_get '.cforigin.cert')" ] || { log_error "CF Origin 证书文件不存在"; return 1; }
-        [ -f "$(st_get '.cforigin.key')" ] || { log_error "CF Origin 私钥文件不存在"; return 1; }
+        if [ "$(st_get '.cforigin.origin_tls')" = "true" ]; then
+            [ -f "$(st_get '.cforigin.cert')" ] || { log_error "CF Origin 证书文件不存在"; return 1; }
+            [ -f "$(st_get '.cforigin.key')" ] || { log_error "CF Origin 私钥文件不存在"; return 1; }
+        fi
     fi
 
     log_ok "安装计划校验通过"
@@ -4468,7 +4580,12 @@ install_execute_current_plan() {
 
     st_persist || { log_error "state.json 写入失败"; return 1; }
 
-    [ "$(st_get '.argo.enabled')" = "true" ] &&         { argo_apply_fixed_tunnel_from_state ||           log_error "固定隧道配置失败，请返回安装计划中的 Argo 配置页修正"; }
+    if [ "$(st_get '.argo.enabled')" = "true" ]; then
+        argo_apply_fixed_tunnel_from_state || {
+            log_error "固定隧道配置失败，请返回安装计划中的 Argo 配置页修正"
+            return 1
+        }
+    fi
     config_print_nodes
     cforigin_print_cloudflare_hint
 }
@@ -4589,8 +4706,9 @@ unified_menu_argo() {
         _menu_print_action 3 "修改回源端口"
         _menu_print_action 4 "修改域名"
         _menu_print_action 5 "修改密钥/凭证"
-        _menu_print_action 6 "切换 xPadding（仅 XHTTP）"
-        _menu_print_action 7 "查看当前节点摘要"
+        _menu_print_action 6 "修改入站认证（VLESS / Trojan）"
+        _menu_print_action 7 "切换 xPadding（仅 XHTTP）"
+        _menu_print_action 8 "查看当前节点摘要"
         if [ "${_runtime}" -eq 1 ]; then
             _hr
             _menu_print_action r "重启隧道服务"
@@ -4600,15 +4718,16 @@ unified_menu_argo() {
         fi
         _menu_print_back
         _hr
-        prompt "请选择操作 $( [ "${_runtime}" -eq 1 ] && printf '(0-7/r/h/v/u)' || printf '(0-7)' ): " _c
+        prompt "请选择操作 $( [ "${_runtime}" -eq 1 ] && printf '(0-8/r/h/v/u)' || printf '(0-8)' ): " _c
         case "${_c:-}" in
             1) _unified_toggle_or_plan "${_runtime}" argo "${_en}" install_plan_argo_toggle || true ;;
             2) _unified_dispatch_or_plan "${_runtime}" argo update_protocol install_plan_argo_update_protocol || true ;;
             3) _unified_dispatch_or_plan "${_runtime}" argo update_port install_plan_argo_update_port || true ;;
             4) _unified_dispatch_or_plan "${_runtime}" argo update_domain install_plan_argo_update_domain || true ;;
             5) _unified_dispatch_or_plan "${_runtime}" argo update_auth install_plan_argo_update_auth || true ;;
-            6) _unified_runtime_fn_or_plan "${_runtime}" install_plan_argo_toggle_xpad _menu_toggle_xpad argo Argo || true ;;
-            7) log_info "Argo: ${_summary}" ;;
+            6) _unified_dispatch_or_plan "${_runtime}" argo update_auth_protocol install_plan_argo_update_auth_protocol || true ;;
+            7) _unified_runtime_fn_or_plan "${_runtime}" install_plan_argo_toggle_xpad _menu_toggle_xpad argo Argo || true ;;
+            8) log_info "Argo: ${_summary}" ;;
             r) _unified_runtime_only_fn "${_runtime}" _module_action_or_continue argo restart || true ;;
             h) _unified_runtime_only_fn "${_runtime}" argo_check_health || true ;;
             v) _unified_runtime_only_fn "${_runtime}" _module_action_or_continue argo show || true ;;
