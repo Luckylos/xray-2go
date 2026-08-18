@@ -698,7 +698,7 @@ _st_normalize_schema() {
     _c=$(st_get '.argo.auth_protocol')
     case "${_c:-}" in vless|trojan) : ;; *) st_set '.argo.auth_protocol = "vless"' ;; esac
     _c=$(st_get '.argo.trojan_password')
-    [ "${_c}" = "null" ] && st_set '.argo.trojan_password = ""'
+    { [ -z "${_c:-}" ] || [ "${_c}" = "null" ]; } && st_set '.argo.trojan_password = ""'
     _c=$(st_get '.ff.host')
     { [ -z "${_c:-}" ] || [ "${_c}" = "null" ]; } && st_set '.ff.host = ""'
     # 规范化 xPadding 开关结构。

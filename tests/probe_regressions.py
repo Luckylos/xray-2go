@@ -643,6 +643,16 @@ def test_legacy_trojan_script_is_removed_after_migration():
     assert_true(not (ROOT / "xray_2go_Trojan_Socks5.sh").exists(), "legacy standalone Trojan script must not remain after migration")
 
 
+def test_state_normalizes_missing_trojan_password_field():
+    cp = run_bash_result("""
+        source ./xray_2go.sh
+        _G_STATE='{"uuid":"56b6d850-1e42-48ef-8229-94f5d8292e54","argo":{"enabled":true,"protocol":"ws"}}'
+        _st_normalize_schema >/dev/null
+        printf '%s' "${_G_STATE}" | jq -e '(.argo | has("trojan_password")) and .argo.trojan_password == ""' >/dev/null
+    """)
+    assert_true(cp.returncode == 0, "schema normalization must add a missing Trojan password field")
+
+
 def main():
     tests = [v for k, v in globals().items() if k.startswith("test_")]
     for test in tests:
