@@ -429,3 +429,40 @@ AssertionError: failed SOCKS disable must restore committed state: rc=1 memory=f
 - **fixed**：SOCKS disable 在 commit 失败时的内存 state 漂移已修复。
 - **deferred**：如果失败发生在统一 commit 已经写入部分 config/state/artifact 之后，跨文件恢复仍需 Phase 3 transaction/apply/rollback 设计和失败注入测试；本切片没有伪装成完整事务回滚。
 - 下一切片：继续覆盖另一个 canonical runtime action 的失败状态边界，仍需先写最小 RED。
+
+## Phase 1 / Slice 8：runtime action enable failure state rollback
+
+### 范围
+
+- 切片：`phase1-slice8-action-enable-failure-state-rollback`
+- 目标：补齐 canonical SOCKS action 的 enable 失败状态边界，避免重复 enable 失败时把原本已启用的 state 错误改成 disabled。
+- 验收测试：`test_runtime_socks_enable_failure_restores_previous_state`
+
+### RED
+
+- 首次执行新增测试时，旧实现真实失败：
+
+```text
+AssertionError: failed SOCKS enable must restore committed state: rc=1 memory=false disk=true
+```
+
+- 同时在补测过程中发现上一切片的 README 测试函数定义被误放置在 SOCKS disable 测试体内，导致该测试未被 probe matrix 单独发现；已在本切片中修复函数边界，并通过矩阵数量和完整执行结果确认恢复。
+
+### GREEN / REFACTOR / 验证
+
+- `module_socks_action enable` 现在保存 `.socks.enabled` 的原始 JSON 值，再执行 `_module_enable_with_state`。
+- enable/commit 失败时恢复原始 typed state 并返回非零；原本为 `false` 的 enable 失败行为也保持不变。
+- 聚焦 GREEN：`test_runtime_socks_disable_failure_restores_previous_state` 与 `test_runtime_socks_enable_failure_restores_previous_state` 均通过。
+- 完整 fresh-process 回归：`python3 tests/probe_regressions.py` 返回码 `0`，共 `89` 项 `PASS`，`0` 项失败。
+- 最终探针矩阵：`static=47`、`safe=31`、`sandbox=11`、`total=89`。
+- `bash -n xray_2go.sh` 通过。
+- `python3 -m py_compile tests/probe_regressions.py tests/sandbox_runner.py tests/probe_matrix.py` 通过。
+- `git diff --check` 通过；测试缓存已清理。
+- 本切片只使用 sandbox/stub，不启动 Xray、cloudflared、systemd/OpenRC，不修改宿主 `/etc/xray2go`、防火墙、`/etc/hosts` 或公网链路。
+
+### 切片结论
+
+- 状态：`completed-in-worktree`
+- **fixed**：SOCKS enable 在 commit 失败时不再把原有 `true` 状态错误恢复为 `false`；README regression test 的函数边界也已恢复。
+- **deferred**：跨 config/state/service/Tunnel/firewall artifact 的统一事务回滚仍属于 Phase 3，不由本切片宣称完成。
+- 下一切片：继续按 failure-injection 顺序覆盖下一个 canonical runtime action，仍需先写最小 RED。

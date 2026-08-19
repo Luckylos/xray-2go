@@ -2211,8 +2211,12 @@ module_socks_action() {
     local _action="${1:-}"
     case "${_action}" in
         enable)
-            _module_enable_with_state '.socks.enabled = true' SOCKS5 \
-                || { st_set '.socks.enabled = false' || true; return 1; }
+            local _old_enabled
+            _old_enabled=$(printf '%s' "${_G_STATE}" | jq -c '.socks.enabled' 2>/dev/null) || return 1
+            if ! _module_enable_with_state '.socks.enabled = true' SOCKS5; then
+                st_set ".socks.enabled = ${_old_enabled}" || true
+                return 1
+            fi
             ;;
         disable)
             local _old_enabled
