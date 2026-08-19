@@ -21,20 +21,40 @@ unset _DETECTED_HOME 2>/dev/null || true
 # ==============================================================================
 # Global constants
 # ==============================================================================
-readonly WORK_DIR="/etc/xray2go"
+# 仅在显式测试模式下允许 runtime probe 注入临时 root；生产默认值保持不变。
+if [ "${X2G_TEST_MODE:-0}" = "1" ]; then
+    [ -n "${X2G_TEST_ROOT:-}" ] || {
+        printf '%s\n' '[ERR ] X2G_TEST_MODE=1 时必须提供 X2G_TEST_ROOT' >&2
+        exit 2
+    }
+    case "${X2G_TEST_ROOT}" in
+        /*) : ;;
+        *) printf '%s\n' '[ERR ] X2G_TEST_ROOT 必须是绝对路径' >&2; exit 2 ;;
+    esac
+    _X2G_ROOT="${X2G_TEST_ROOT%/}"
+    [ -n "${_X2G_ROOT}" ] && [ "${_X2G_ROOT}" != "/" ] || {
+        printf '%s\n' '[ERR ] X2G_TEST_ROOT 不得指向宿主根目录' >&2
+        exit 2
+    }
+else
+    _X2G_ROOT=""
+fi
+readonly _X2G_ROOT
+
+readonly WORK_DIR="${_X2G_ROOT}/etc/xray2go"
 readonly XRAY_BIN="${WORK_DIR}/xray"
 readonly ARGO_BIN="${WORK_DIR}/argo"
 readonly CONFIG_FILE="${WORK_DIR}/config.json"
 readonly STATE_FILE="${WORK_DIR}/state.json"
 readonly PLUGIN_DIR="${WORK_DIR}/plugins"
-readonly SHORTCUT="/usr/local/bin/s"
-readonly SELF_DEST="/usr/local/bin/xray2go"
+readonly SHORTCUT="${_X2G_ROOT}/usr/local/bin/s"
+readonly SELF_DEST="${_X2G_ROOT}/usr/local/bin/xray2go"
 
 readonly _LOCK_FILE="${WORK_DIR}/.lock"
 readonly _FW_PORTS_FILE="${WORK_DIR}/.fw_ports"
 readonly _FW_RULES_FILE="${WORK_DIR}/.fw_rules"
 readonly _CONFIG_HASH_FILE="${WORK_DIR}/.config.sha256"
-readonly _SYSCTL_FILE="/etc/sysctl.d/99-xray2go.conf"
+readonly _SYSCTL_FILE="${_X2G_ROOT}/etc/sysctl.d/99-xray2go.conf"
 readonly _HOSTS_BAK="${WORK_DIR}/.hosts.bak"
 readonly _ARGO_ENV_FILE="${WORK_DIR}/.argo_env"
 readonly _ACME_ENV_FILE="${WORK_DIR}/.acme_env"

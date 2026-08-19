@@ -2,6 +2,12 @@
 from pathlib import Path
 import re
 import subprocess
+import sys
+
+
+TESTS_DIR = Path(__file__).resolve().parent
+if str(TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(TESTS_DIR))
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "xray_2go.sh"
@@ -38,6 +44,70 @@ def run_bash_result(script: str) -> subprocess.CompletedProcess[str]:
         timeout=20,
         check=False,
     )
+
+
+def test_runtime_harness_does_not_touch_host_root():
+    from sandbox_runner import XraySandbox
+
+    host_root = Path("/etc/xray2go")
+
+    def metadata(path: Path):
+        if not path.exists():
+            return (False, None, None)
+        stat = path.stat()
+        return (True, stat.st_mode, stat.st_mtime_ns)
+
+    host_before = metadata(host_root)
+    with XraySandbox() as sandbox:
+        cp = subprocess.run(
+            [
+                "bash",
+                "-lc",
+                "source ./xray_2go.sh; "
+                "printf 'root=%s\\n' \"${_X2G_ROOT}\"; "
+                "printf 'work=%s\\n' \"${WORK_DIR}\"; "
+                "printf 'xray=%s\\n' \"${XRAY_BIN}\"; "
+                "printf 'argo=%s\\n' \"${ARGO_BIN}\"; "
+                "printf 'config=%s\\n' \"${CONFIG_FILE}\"; "
+                "printf 'state=%s\\n' \"${STATE_FILE}\"; "
+                "printf 'plugins=%s\\n' \"${PLUGIN_DIR}\"; "
+                "printf 'shortcut=%s\\n' \"${SHORTCUT}\"; "
+                "printf 'self=%s\\n' \"${SELF_DEST}\"; "
+                "printf 'sysctl=%s\\n' \"${_SYSCTL_FILE}\";",
+            ],
+            cwd=ROOT,
+            env=sandbox.environment(),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=20,
+            check=False,
+        )
+        assert_true(cp.returncode == 0, f"sandbox source must succeed (rc={cp.returncode}): {cp.stdout}")
+        expected_root = sandbox.root
+        expected = {
+            "root": expected_root,
+            "work": expected_root / "etc/xray2go",
+            "xray": expected_root / "etc/xray2go/xray",
+            "argo": expected_root / "etc/xray2go/argo",
+            "config": expected_root / "etc/xray2go/config.json",
+            "state": expected_root / "etc/xray2go/state.json",
+            "plugins": expected_root / "etc/xray2go/plugins",
+            "shortcut": expected_root / "usr/local/bin/s",
+            "self": expected_root / "usr/local/bin/xray2go",
+            "sysctl": expected_root / "etc/sysctl.d/99-xray2go.conf",
+        }
+        actual = dict(
+            line.split("=", 1)
+            for line in cp.stdout.splitlines()
+            if "=" in line
+        )
+        for name, path in expected.items():
+            assert_true(actual.get(name) == str(path), f"{name} escaped sandbox: {actual.get(name)!r} != {path}")
+        sandbox_path = sandbox.root
+
+    assert_true(not sandbox_path.exists(), f"sandbox must be removed after harness exit: {sandbox_path}")
+    assert_true(metadata(host_root) == host_before, "host /etc/xray2go changed during sandbox path probe")
 
 
 def test_function_boundaries_after_source():
