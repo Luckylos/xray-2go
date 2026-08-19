@@ -93,3 +93,47 @@ tunnel_rc=1
 - 状态：`completed-in-worktree`
 - 本切片只扩展测试 root 下的 artifact/service target 和临时 workspace 隔离，不改变生产默认路径或公开用户功能。
 - 下一切片：`phase0-slice3-runtime-probe-matrix`，先为 runtime 探针建立 safe/static/sandbox 分类和 fresh-process 执行边界；在其 RED 前不进入 Phase 1。
+
+## Phase 0 / Slice 3：runtime probe matrix
+
+### 范围
+
+- 切片：`phase0-slice3-runtime-probe-matrix`
+- 目标：将现有 `probe_regressions.py` 探针按 `static`、`safe`、`sandbox` 分类，并保证完整入口逐项通过 fresh process 执行。
+- 验收测试：`test_runtime_probe_matrix_runs_in_fresh_process`
+
+### RED
+
+- 首次执行失败为预期缺失能力：
+
+```text
+ModuleNotFoundError: No module named 'probe_matrix'
+```
+
+- 失败发生在新增的 harness 契约导入处，不是测试语法错误或业务断言失败。
+
+### GREEN / REFACTOR / 验证
+
+- 新增 `tests/probe_matrix.py`：
+  - 使用 AST 发现测试函数并保持源文件定义顺序；
+  - 明确划分 `static`、`safe`、`sandbox` 三类；
+  - `static` 不调用 subprocess；
+  - `safe` 为 subprocess 探针，由 runner 为每个 fresh process 注入一次性 `XraySandbox`；
+  - `sandbox` 由探针自身持有显式 sandbox；
+  - 每个探针使用独立 Python 子进程，并记录 PID、返回码和输出。
+- `XraySandbox.environment()` 增加 sandbox 内 `TMPDIR`，避免 `mktemp` 等临时物落到宿主 `/tmp`。
+- 将既有 runtime fixture 的证书测试路径从硬编码 `/tmp/cert.pem`、`/tmp/key.pem` 改为 `${WORK_DIR}` 内路径，并保留清理。
+- `probe_regressions.py` 的 `main()` 改为只调用矩阵 runner，不再在当前进程直接遍历执行所有测试。
+- 矩阵发现结果：`static=47`、`safe=31`、`sandbox=2`，合计 `80` 项。
+- 聚焦 GREEN：`test_runtime_probe_matrix_runs_in_fresh_process` 通过。
+- 独立矩阵验收：`executed=80`、`failed=0`、`unique_pids=80`。
+- 完整入口验收：`python3 tests/probe_regressions.py` 返回码 `0`，输出 80 项 `PASS`。
+- 聚合宿主边界验收：整套 80 项矩阵执行后 `host_unchanged=True`，`fixture_scraps_absent=True`。
+- Bash 语法、Python 编译和 diff 检查在提交前继续执行。
+- 未启动 Xray、cloudflared、systemd/OpenRC，未修改宿主防火墙、宿主 `/etc/hosts` 或真实 `/etc/xray2go`。
+
+### 切片结论
+
+- 状态：`completed-in-worktree`
+- Phase 0 的三项测试切片均已达到各自验收目标；runtime 回归入口现在默认经过 fresh-process sandbox matrix，不再直接在主进程执行潜在副作用探针。
+- 下一阶段：Phase 1 运行时 Action Layer 统一；必须重新从一个最小 dispatcher/action 行为 RED 开始。

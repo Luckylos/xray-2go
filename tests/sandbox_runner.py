@@ -19,6 +19,8 @@ class XraySandbox:
         env["X2G_TEST_MODE"] = "1"
         env["X2G_TEST_ROOT"] = str(self.root)
         env["HOME"] = str(self.root / "home")
+        env["TMPDIR"] = str(self.root / "tmp")
+        (self.root / "tmp").mkdir(parents=True, exist_ok=True)
         return env
 
     def __enter__(self) -> "XraySandbox":

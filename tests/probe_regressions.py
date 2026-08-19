@@ -193,6 +193,24 @@ printf 'tunnel_rc=%s\\n' "${tunnel_rc}"
     assert_true(metadata(host_root) == host_before, "host /etc/xray2go changed during sandbox artifact probe")
 
 
+def test_runtime_probe_matrix_runs_in_fresh_process():
+    from probe_matrix import discover_probe_matrix, run_probe_matrix
+
+    probe_source = Path(__file__)
+    matrix = discover_probe_matrix(probe_source)
+    assert_true(set(matrix) == {"static", "safe", "sandbox"}, "probe matrix must expose static/safe/sandbox categories")
+    names = [name for category in matrix.values() for name in category]
+    assert_true(len(names) == len(set(names)), "probe matrix must not duplicate test names")
+    assert_true(matrix["static"], "probe matrix must discover static probes")
+    assert_true(matrix["safe"], "probe matrix must discover subprocess probes")
+    assert_true(matrix["sandbox"], "probe matrix must discover explicit sandbox probes")
+
+    report = run_probe_matrix(probe_source, categories=("static", "safe", "sandbox"))
+    assert_true(report["failed"] == [], f"fresh-process probe matrix failures: {report}")
+    assert_true(report["executed"] == names, "probe matrix must execute every discovered probe exactly once")
+    assert_true(all(item["pid"] > 0 for item in report["results"]), "each probe must report a child process")
+
+
 def test_function_boundaries_after_source():
     out = run_bash(
         "source ./xray_2go.sh; "
@@ -683,12 +701,12 @@ def test_runtime_enable_paths_no_longer_depend_on_removed_ask_helpers():
         printf 'ff=%s proto=%s\n' "$(st_get '.ff.enabled')" "$(st_get '.ff.protocol')"
         module_dispatch socks enable
         printf 'socks=%s\n' "$(st_get '.socks.enabled')"
-        st_set '.cforigin.domain = "example.com" | .cforigin.cert = "/tmp/cert.pem" | .cforigin.key = "/tmp/key.pem"' >/dev/null
-        : >/tmp/cert.pem
-        : >/tmp/key.pem
+        st_set '.cforigin.domain = "example.com" | .cforigin.cert = "${WORK_DIR}/cert.pem" | .cforigin.key = "${WORK_DIR}/key.pem"' >/dev/null
+        : >"${WORK_DIR}/cert.pem"
+        : >"${WORK_DIR}/key.pem"
         module_dispatch cforigin enable
         printf 'cforigin=%s proto=%s path=%s\n' "$(st_get '.cforigin.enabled')" "$(st_get '.cforigin.protocol')" "$(st_get '.cforigin.path')"
-        rm -f /tmp/cert.pem /tmp/key.pem
+        rm -f "${WORK_DIR}/cert.pem" "${WORK_DIR}/key.pem"
     """)
     assert_true('ff=true proto=ws' in out, 'ff enable should no longer depend on removed ask_* helpers and should seed default protocol')
     assert_true('socks=true' in out, 'socks enable should no longer depend on removed ask_* helpers')
@@ -1178,10 +1196,15 @@ def test_readme_documents_trojan_argo_capability():
 
 
 def main():
-    tests = [v for k, v in globals().items() if k.startswith("test_")]
-    for test in tests:
-        test()
-        print(f"PASS {test.__name__}")
+    from probe_matrix import run_probe_matrix
+
+    report = run_probe_matrix(Path(__file__))
+    if report["failed"]:
+        for failure in report["failed"]:
+            print(f"FAIL {failure['name']} [{failure['category']}]\\n{failure['output']}")
+        raise SystemExit(1)
+    for result in report["results"]:
+        print(f"PASS {result['name']}")
 
 
 if __name__ == "__main__":
