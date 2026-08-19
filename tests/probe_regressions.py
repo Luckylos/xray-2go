@@ -1623,6 +1623,50 @@ printf 'rc=%s memory=%s disk=%s\\n' "${_rc}" "${_mem}" "${_disk}"
     )
 
 
+def test_runtime_ff_enable_failure_restores_complete_previous_state():
+    from sandbox_runner import XraySandbox
+
+    with XraySandbox() as sandbox:
+        cp = subprocess.run(
+            [
+                "bash",
+                "-lc",
+                """
+source ./xray_2go.sh
+mkdir -p "${WORK_DIR}"
+st_init >/dev/null 2>&1
+st_set '.ff.enabled = true | .ff.protocol = "tcphttp" | .ff.host = "old.example"' >/dev/null
+st_persist >/dev/null 2>&1
+
+_module_enable_commit() { return 1; }
+module_ff_enable >/dev/null 2>&1
+_rc=$?
+printf 'rc=%s memory=%s/%s/%s disk=%s/%s/%s\\n' \\
+    "${_rc}" \\
+    "$(st_get '.ff.enabled')" \\
+    "$(st_get '.ff.protocol')" \\
+    "$(st_get '.ff.host')" \\
+    "$(jq -r '.ff.enabled' "${STATE_FILE}")" \\
+    "$(jq -r '.ff.protocol' "${STATE_FILE}")" \\
+    "$(jq -r '.ff.host' "${STATE_FILE}")"
+""",
+            ],
+            cwd=ROOT,
+            env=sandbox.environment(),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=20,
+            check=False,
+        )
+
+    assert_true(cp.returncode == 0, f"FreeFlow enable rollback probe process failed: {cp.stdout}")
+    assert_true(
+        "rc=1 memory=true/tcphttp/old.example disk=true/tcphttp/old.example" in cp.stdout,
+        f"failed FreeFlow enable must restore complete prior state: {cp.stdout}",
+    )
+
+
 def test_readme_documents_trojan_argo_capability():
     assert_true("Trojan" in README_TEXT, "README must document the Trojan Argo capability")
     assert_true(

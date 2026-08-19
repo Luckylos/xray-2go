@@ -2114,13 +2114,22 @@ _module_persist_after_optional_apply() {
 }
 
 
-_module_enable_with_state() {
-    local _jq_expr="$1" _module_name="$2" _before="${_G_STATE}"
-    st_set "${_jq_expr}" || return 1
+_module_enable_transaction() {
+    local _module_name="$1" _before="${_G_STATE}"
+    shift
+    "$@" || {
+        _G_STATE="${_before}"
+        return 1
+    }
     if ! _module_enable_commit "${_module_name}"; then
         _G_STATE="${_before}"
         return 1
     fi
+}
+
+_module_enable_with_state() {
+    local _jq_expr="$1" _module_name="$2"
+    _module_enable_transaction "${_module_name}" st_set "${_jq_expr}"
 }
 
 module_update_port_action() {
@@ -2166,11 +2175,16 @@ module_vltcp_update_port() {
     module_update_port_action vltcp tcp
 }
 
-module_ff_enable() {
+_module_ff_enable_prepare() {
     local _proto
     _proto=$(st_get '.ff.protocol')
-    [ -n "${_proto:-}" ] && [ "${_proto}" != "none" ]         || st_set '.ff.protocol = "ws"' || return 1
-    _module_enable_with_state '.ff.enabled = true' FreeFlow         || { st_set '.ff.enabled = false | .ff.protocol = "none"' || true; return 1; }
+    [ -n "${_proto:-}" ] && [ "${_proto}" != "none" ] \
+        || st_set '.ff.protocol = "ws"' || return 1
+    st_set '.ff.enabled = true'
+}
+
+module_ff_enable() {
+    _module_enable_transaction FreeFlow _module_ff_enable_prepare
 }
 
 module_ff_disable() {

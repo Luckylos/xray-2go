@@ -548,3 +548,41 @@ AssertionError: shared enable helper must restore prior state: rc=1 memory=false
 - **fixed**：共享 enable helper 的内存 state rollback，以及 SOCKS/VLESS-TCP 两个调用方的重复实现。
 - **deferred**：helper 只覆盖其调用时已经进入 `_module_enable_with_state` 的状态变更；FreeFlow、Reality、CF Origin 等在调用 helper 前还会修改默认值或生成材料的复杂路径，仍需独立 transaction/全量快照设计和失败注入测试。
 - 下一切片：继续以 failure-injection 覆盖复杂 enable 前置变更，或进入统一 transaction 设计；必须先建立对应 RED，不得直接扩大修改范围。
+
+## Phase 1 / Slice 11：FreeFlow enable 前置状态失败回滚
+
+### 范围
+
+- 切片：`phase1-slice11-freeflow-enable-precommit-state-rollback`
+- 目标：修复 FreeFlow enable 在调用共享 commit 前修改默认传输协议、随后 commit 失败时的完整状态恢复；本切片只覆盖 FreeFlow 的 pre-commit 内存 state 边界，不扩展为跨 config/state/service/Tunnel/firewall 的统一事务。
+- 验收测试：`test_runtime_ff_enable_failure_restores_complete_previous_state`
+
+### RED
+
+- 新增 sourced-shell sandbox failure-injection 测试后，旧实现真实失败：
+
+```text
+AssertionError: failed FreeFlow enable must restore complete prior state: rc=1 memory=false/none/old.example disk=true/tcphttp/old.example
+```
+
+- 失败链路已确认：`module_ff_enable()` 会先把 `.ff.protocol` 从 `none`/空值调整为 `ws`，再设置 `.ff.enabled` 并进入 commit；commit 失败时旧分支只把内存 state 强制改成 `enabled=false, protocol=none`，没有恢复调用前的完整 `.ff` 对象。磁盘 state 仍是原提交值，形成内存/磁盘漂移。
+
+### GREEN / REFACTOR / 验证
+
+- 新增 `_module_ff_enable_prepare()`，只负责 FreeFlow enable 前置默认值和 `.ff.enabled = true` 的 state 修改。
+- 将 `_module_enable_transaction()` 提取为通用的 prepare → commit → 内存 state restore 边界，并让 `_module_enable_with_state()` 保持为兼容薄包装；`module_ff_enable()` 调用 `_module_enable_transaction FreeFlow _module_ff_enable_prepare`。因此前置 state 修改失败或 `_module_enable_commit` 失败时，均恢复调用前完整 `_G_STATE` 并返回非零。
+- 删除旧的固定回滚 `.ff.enabled = false | .ff.protocol = "none"`，避免覆盖原有协议、host 及其他 FreeFlow 字段。
+- 聚焦 GREEN：`test_runtime_ff_enable_failure_restores_complete_previous_state` 通过，确认返回码为 `1`，且内存与磁盘同时保持 `true/tcphttp/old.example`。
+- 完整 fresh-process 回归：`python3 tests/probe_regressions.py` 返回码 `0`，共 `92` 项 `PASS`，`0` 项失败。
+- 最终探针矩阵：`static=47`、`safe=31`、`sandbox=14`、`total=92`。
+- `bash -n xray_2go.sh` 通过。
+- `python3 -m py_compile tests/probe_regressions.py tests/sandbox_runner.py tests/probe_matrix.py` 通过。
+- `git diff --check` 通过；测试缓存已清理。
+- 本切片只使用 sandbox/stub，不启动 Xray、cloudflared、systemd/OpenRC，不修改宿主 `/etc/xray2go`、防火墙、`/etc/hosts` 或公网链路。
+
+### 切片结论
+
+- 状态：`completed-in-worktree`
+- **fixed**：FreeFlow enable 的 pre-commit 失败不再把原有协议和内存 state 强制改成 `false/none`；完整调用前 state 会恢复，失败码仍保留。
+- **deferred**：`_module_enable_transaction` 当前只保证其负责的内存 state 快照边界；若 commit 内部已经部分写入 config/state/service/firewall 等 artifact，跨 artifact 恢复仍需 Phase 3 的统一 transaction/apply/rollback 设计和失败注入测试。
+- 下一切片：继续以最小 RED 覆盖下一个复杂 enable 路径的前置变更，或在证据充分后进入统一 transaction 设计；不得把本切片宣称为完整事务回滚。
