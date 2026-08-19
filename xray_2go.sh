@@ -2143,6 +2143,7 @@ _transaction_collect_artifacts() {
         "${_FW_PORTS_FILE}"
         "${_FW_RULES_FILE}"
         "${_ARGO_ENV_FILE}"
+        "${ARGO_BIN}"
         "${_ACME_ENV_FILE}"
         "${WORK_DIR}/tunnel.yml"
         "${WORK_DIR}/tunnel.json"
@@ -2362,6 +2363,22 @@ _module_enable_transaction() {
     _transaction_run "模块启用" _module_enable_transaction_inner "$@"
 }
 
+_module_disable_transaction_inner() {
+    local _module_name="$1" _before="${_G_STATE}"
+    shift
+    "$@" || {
+        _G_STATE="${_before}"
+        return 1
+    }
+    if ! _module_disable_commit "${_module_name}"; then
+        _G_STATE="${_before}"
+        return 1
+    fi
+}
+_module_disable_transaction() {
+    _transaction_run "模块禁用" _module_disable_transaction_inner "$@"
+}
+
 _module_enable_with_state() {
     local _jq_expr="$1" _module_name="$2"
     _module_enable_transaction "${_module_name}" st_set "${_jq_expr}"
@@ -2423,8 +2440,7 @@ module_ff_enable() {
 }
 
 module_ff_disable() {
-    st_set '.ff.enabled = false | .ff.protocol = "none"' || return 1
-    _module_disable_commit FreeFlow || return 1
+    _module_disable_transaction FreeFlow st_set '.ff.enabled = false | .ff.protocol = "none"' || return 1
     log_ok "FreeFlow 已禁用"
 }
 
@@ -2445,8 +2461,7 @@ module_reality_enable() {
 }
 
 module_reality_disable() {
-    st_set '.reality.enabled = false' || return 1
-    _module_disable_commit Reality || return 1
+    _module_disable_transaction Reality st_set '.reality.enabled = false' || return 1
     log_ok "Reality 已禁用"
 }
 
@@ -2455,8 +2470,7 @@ module_vltcp_enable() {
 }
 
 module_vltcp_disable() {
-    st_set '.vltcp.enabled = false' || return 1
-    _module_disable_commit VLESS-TCP || return 1
+    _module_disable_transaction VLESS-TCP st_set '.vltcp.enabled = false' || return 1
     log_ok "VLESS-TCP 已禁用"
 }
 
@@ -2468,13 +2482,7 @@ module_socks_action() {
             _module_enable_with_state '.socks.enabled = true' SOCKS5 || return 1
             ;;
         disable)
-            local _old_enabled
-            _old_enabled=$(printf '%s' "${_G_STATE}" | jq -c '.socks.enabled' 2>/dev/null) || return 1
-            st_set '.socks.enabled = false' || return 1
-            if ! _module_disable_commit SOCKS5; then
-                st_set ".socks.enabled = ${_old_enabled}" || true
-                return 1
-            fi
+            _module_disable_transaction SOCKS5 st_set '.socks.enabled = false' || return 1
             log_ok "SOCKS5 已禁用"
             ;;
         *)
@@ -2511,34 +2519,33 @@ module_cforigin_enable() {
 }
 
 module_cforigin_disable() {
-    st_set '.cforigin.enabled = false' || return 1
-    _module_disable_commit "CF Origin" || return 1
+    _module_disable_transaction "CF Origin" st_set '.cforigin.enabled = false' || return 1
     log_ok "CF Origin 已禁用"
 }
 
 module_ff_uninstall() {
-    st_set '.ff.enabled = false | .ff.protocol = "none" | .ff.path = "/" | .ff.host = ""' || return 1
-    _module_disable_commit FreeFlow || return 1
+    _module_disable_transaction FreeFlow st_set '.ff.enabled = false | .ff.protocol = "none" | .ff.path = "/" | .ff.host = ""' || return 1
     log_ok "FreeFlow 已卸载"
 }
 
 module_reality_uninstall() {
-    st_set '.reality.enabled = false | .reality.pbk = null | .reality.pvk = null | .reality.sid = null' || return 1
-    _module_disable_commit Reality || return 1
+    _module_disable_transaction Reality st_set '.reality.enabled = false | .reality.pbk = null | .reality.pvk = null | .reality.sid = null' || return 1
     log_ok "Reality 已卸载"
 }
 
-module_vltcp_uninstall() {
+_module_vltcp_uninstall_prepare() {
     st_set '.vltcp.enabled = false | .vltcp.listen = "0.0.0.0"' || return 1
-    st_set '.ports.vltcp = 1234' || return 1
-    _module_disable_commit VLESS-TCP || return 1
+    st_set '.ports.vltcp = 1234'
+}
+
+module_vltcp_uninstall() {
+    _module_disable_transaction VLESS-TCP _module_vltcp_uninstall_prepare || return 1
     log_ok "VLESS-TCP 已卸载"
 }
 
 
 module_socks_uninstall() {
-    st_set '.socks.enabled = false | .socks.listen = "0.0.0.0" | .socks.user = "xray2go" | .socks.pass = "xray2go" | .ports.socks = 1080' || return 1
-    _module_disable_commit SOCKS5 || return 1
+    _module_disable_transaction SOCKS5 st_set '.socks.enabled = false | .socks.listen = "0.0.0.0" | .socks.user = "xray2go" | .socks.pass = "xray2go" | .ports.socks = 1080' || return 1
     log_ok "SOCKS5 已卸载"
 }
 
@@ -2588,14 +2595,12 @@ module_socks_update_pass() {
     [ "${_en}" = "true" ] && config_print_nodes
 }
 module_vlquic_uninstall() {
-    st_set '.vlquic.enabled = false | .vlquic.listen = "0.0.0.0" | .vlquic.domain = "" | .vlquic.cert = "" | .vlquic.key = "" | .vlquic.acme_method = "manual"' || return 1
-    _module_disable_commit VLESS-XHTTP-H3 || return 1
+    _module_disable_transaction VLESS-XHTTP-H3 st_set '.vlquic.enabled = false | .vlquic.listen = "0.0.0.0" | .vlquic.domain = "" | .vlquic.cert = "" | .vlquic.key = "" | .vlquic.acme_method = "manual"' || return 1
     log_ok "VLESS-XHTTP-H3 已卸载"
 }
 
 module_cforigin_uninstall() {
-    st_set '.cforigin.enabled = false | .cforigin.domain = "" | .cforigin.protocol = "ws" | .cforigin.path = "/origin" | .cforigin.listen = "::" | .cforigin.edge_port = 443 | .cforigin.edge_h3 = false | .cforigin.origin_tls = true | .cforigin.cert = "" | .cforigin.key = "" | .cforigin.acme_method = "manual" | .ports.cforigin = 28888' || return 1
-    _module_disable_commit "CF Origin" || return 1
+    _module_disable_transaction "CF Origin" st_set '.cforigin.enabled = false | .cforigin.domain = "" | .cforigin.protocol = "ws" | .cforigin.path = "/origin" | .cforigin.listen = "::" | .cforigin.edge_port = 443 | .cforigin.edge_h3 = false | .cforigin.origin_tls = true | .cforigin.cert = "" | .cforigin.key = "" | .cforigin.acme_method = "manual" | .ports.cforigin = 28888' || return 1
     log_ok "CF Origin 已卸载"
 }
 
@@ -2695,34 +2700,35 @@ module_cforigin_update_listen() {
     log_ok "监听地址已更新: ${_l}"
 }
 
-module_argo_enable() {
+module_argo_enable_inner() {
     if [ ! -f "${ARGO_BIN}" ] || [ ! -x "${ARGO_BIN}" ]; then
         download_cloudflared || return 1
     fi
     st_set '.argo.enabled = true' || return 1
-    config_apply || { st_set '.argo.enabled = false'; return 1; }
+    config_apply || return 1
     svc_apply_tunnel || return 1
     svc_reload_daemon
-    if ! svc_exec_mut enable "${_SVC_TUNNEL}"; then
-        svc_exec_mut disable "${_SVC_TUNNEL}" 2>/dev/null || true
-        st_set '.argo.enabled = false' || return 1
-        _module_disable_commit Argo || return 1
+    svc_exec_mut enable "${_SVC_TUNNEL}" || {
         log_error "Argo 服务启用失败"
         return 1
-    fi
-    if ! svc_exec_mut start "${_SVC_TUNNEL}"; then
-        svc_exec_mut stop "${_SVC_TUNNEL}" 2>/dev/null || true
-        svc_exec_mut disable "${_SVC_TUNNEL}" 2>/dev/null || true
-        st_set '.argo.enabled = false' || return 1
-        _module_disable_commit Argo || return 1
+    }
+    svc_exec_mut start "${_SVC_TUNNEL}" || {
         log_error "Argo 启动失败，请检查域名和 Tunnel 认证"
         return 1
-    fi
+    }
+    svc_verify_health "${_SVC_TUNNEL}" 6 || {
+        log_error "Argo 健康检查失败，请检查域名和 Tunnel 认证"
+        return 1
+    }
     st_persist || { log_error "state.json 写入失败"; return 1; }
     log_ok "Argo 已启用并启动"
 }
 
-module_argo_disable() {
+module_argo_enable() {
+    _transaction_run "Argo 启用" module_argo_enable_inner "$@"
+}
+
+module_argo_disable_inner() {
     svc_exec_mut stop    "${_SVC_TUNNEL}" 2>/dev/null || true
     svc_exec_mut disable "${_SVC_TUNNEL}" 2>/dev/null || true
     st_set '.argo.enabled = false' || return 1
@@ -2730,7 +2736,11 @@ module_argo_disable() {
     log_ok "Argo 已禁用"
 }
 
-module_argo_uninstall() {
+module_argo_disable() {
+    _transaction_run "Argo 禁用" module_argo_disable_inner "$@"
+}
+
+module_argo_uninstall_inner() {
     svc_exec_mut stop    "${_SVC_TUNNEL}" 2>/dev/null || true
     svc_exec_mut disable "${_SVC_TUNNEL}" 2>/dev/null || true
     if is_systemd; then
@@ -2741,9 +2751,13 @@ module_argo_uninstall() {
     fi
     rm -f "${ARGO_BIN}" "${WORK_DIR}/tunnel.yml" \
           "${WORK_DIR}/tunnel.json" "${_ARGO_ENV_FILE}" 2>/dev/null || true
-    st_set '.argo.enabled = false | .argo.domain = null | .argo.token = null | .argo.cred_b64 = null | .argo.mode = "fixed" | .argo.protocol = "ws" | .argo.auth_protocol = "vless" | .argo.trojan_password = ""' || true
+    st_set '.argo.enabled = false | .argo.domain = null | .argo.token = null | .argo.cred_b64 = null | .argo.mode = "fixed" | .argo.protocol = "ws" | .argo.auth_protocol = "vless" | .argo.trojan_password = ""' || return 1
     _module_disable_commit Argo || return 1
     log_ok "Argo 已完全卸载"
+}
+
+module_argo_uninstall() {
+    _transaction_run "Argo 卸载" module_argo_uninstall_inner "$@"
 }
 
 _module_argo_update_protocol_impl() {
@@ -2864,22 +2878,24 @@ module_reality_regenerate_keys() {
     [ "${_en}" = "true" ] && config_print_nodes
 }
 
-module_vlquic_enable() {
-    local _domain
+_module_vlquic_enable_prepare() {
+    local _domain _cert _key
     _domain=$(st_get '.vlquic.domain')
-    if [ -z "${_domain:-}" ] || [ "${_domain}" = "null" ] || [ ! -f "$(st_get '.vlquic.cert')" ] || [ ! -f "$(st_get '.vlquic.key')" ]; then
+    _cert=$(st_get '.vlquic.cert')
+    _key=$(st_get '.vlquic.key')
+    if [ -z "${_domain:-}" ] || [ "${_domain}" = "null" ] || [ ! -f "${_cert}" ] || [ ! -f "${_key}" ]; then
         vlquic_config_cert || return 1
     fi
-    st_set '.vlquic.enabled = true' || return 1
-    st_persist || { log_error "state.json 写入失败"; return 1; }
-    fw_reconcile
-    config_apply || { st_set '.vlquic.enabled = false'; st_persist || { log_error "state.json 写入失败"; return 1; }; fw_reconcile; return 1; }
-    log_ok "VLESS-XHTTP-H3 已启用 (UDP/$(port_of vlquic))"; config_print_nodes
+    st_set '.vlquic.enabled = true'
+}
+
+module_vlquic_enable() {
+    _module_enable_transaction "VLESS-XHTTP-H3" _module_vlquic_enable_prepare || return 1
+    log_ok "VLESS-XHTTP-H3 已启用 (UDP/$(port_of vlquic))"
 }
 
 module_vlquic_disable() {
-    st_set '.vlquic.enabled = false' || return 1
-    _module_disable_commit VLESS-XHTTP-H3 || return 1
+    _module_disable_transaction VLESS-XHTTP-H3 st_set '.vlquic.enabled = false' || return 1
     log_ok "VLESS-XHTTP-H3 已禁用"
 }
 

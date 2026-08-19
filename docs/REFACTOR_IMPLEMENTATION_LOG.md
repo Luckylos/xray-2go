@@ -718,5 +718,50 @@ AssertionError: failed commit must restore service active and enabled state: rc=
 
 - 状态：`completed-in-worktree`（待独立提交）。
 - **fixed**：事务失败时恢复当前覆盖范围内的跨 artifact 文件、managed firewall marker、内存/持久化 state，以及服务 active/enabled 状态；提交辅助函数保持 firewall fail-closed。
-- **deferred**：disable action 目前多数在调用 `_module_disable_commit` 前已修改内存 state，尚未全部由事务在“状态修改前”建立外层快照；Argo Tunnel enable/disable 的完整生命周期、健康检查、interrupt 和并发失败注入仍需独立切片；外部真实 init/service 行为未在宿主验收。
-- 下一切片：`phase3-slice1-integrate`，先以 RED 覆盖 disable/普通 action 在 pre-mutation 边界的统一接入，再补 config/state/service/Tunnel/firewall 失败注入。
+- **carried-forward**：disable action 的 pre-mutation 边界、Argo Tunnel 健康/中断/并发失败注入及外部真实 init/service 行为不属于本核心切片的原始验收范围；前两类由后续 `phase3-slice1-integrate` 切片继续收敛，真实 init/service 仍保持隔离，不在宿主验收。
+
+## Phase 3 / Slice 1 Integrate：disable pre-mutation 与 Argo 失败边界
+
+### 范围
+
+- 切片：`phase3-slice1-integrate`
+- 目标：将模块 disable/uninstall 的首次 state mutation 纳入统一事务；补齐 Argo enable/disable/uninstall 的跨 artifact 失败回滚、启动后健康检查、SIGINT 回滚和并发事务互斥验证。
+- 保持边界：只使用 `X2G_TEST_MODE=1`、绝对 `X2G_TEST_ROOT`、`XraySandbox` 和 service/config/firewall stub；不启动真实 Xray、cloudflared、systemd/OpenRC 或公网 Tunnel。
+
+### RED
+
+- 新增 `test_argo_enable_health_failure_rolls_back` 后，首次执行捕获到真实缺口：
+
+```text
+AssertionError: Argo enable must verify Tunnel health after start
+```
+
+- 该失败位于 `svc_exec_mut start` 成功后的行为边界：旧路径直接持久化 state，没有调用 `svc_verify_health`，因此健康失败不能触发事务回滚。
+- disable/uninstall 和普通 commit 的跨 artifact failure-injection probes 继续验证事务前置边界：失败路径必须恢复内存/持久化 state、config、service、Tunnel/env、firewall marker 及 service active/enabled 状态。
+
+### GREEN / REFACTOR / 验证
+
+- 新增 `_module_disable_transaction_inner` / `_module_disable_transaction`，在执行 prepare/state mutation 前进入 `_transaction_run`；FreeFlow、Reality、VLESS-TCP、SOCKS5、CF Origin、VLESS-XHTTP-H3 及各自 uninstall 路径均改为使用该入口。
+- `module_socks_action disable` 也收敛到同一 disable transaction；Argo 保留专用 `module_argo_*_inner`，由公共 transaction wrapper 包裹。
+- Argo enable 在 Tunnel service `start` 成功后、`st_persist` 前调用 `svc_verify_health "${_SVC_TUNNEL}" 6`；健康检查失败返回非零，由外层事务执行完整回滚。
+- 已通过的聚焦探针：
+  - `test_argo_enable_health_failure_rolls_back`
+  - `test_runtime_argo_enable_restores_cross_artifact_state_after_start_failure`
+  - `test_runtime_argo_disable_restores_service_state_after_commit_failure`
+  - `test_runtime_argo_uninstall_restores_deleted_artifacts_after_commit_failure`
+  - `test_transaction_interrupt_restores_files_and_state`
+  - `test_concurrent_transactions_serialize_failure_and_commit`
+- SIGINT 验证：事务中修改 config/state 后收到 `INT`，子进程返回 `130`，config 与 persisted state 恢复到事务前内容。
+- 并发验证：两个 fresh subprocess 竞争同一 sandbox lock；timeline 无交叠，失败事务返回 `1`，等待中的成功事务返回 `0` 并保留其最终 config。
+- 完整 fresh-process 回归：`python3 tests/probe_regressions.py` 返回码 `0`，共 `105` 项 `PASS`，`0` 项失败。
+- 矩阵分类：`static=47`、`safe=32`、`sandbox=26`、`total=105`。
+- `bash -n xray_2go.sh` 通过。
+- `python3 -m py_compile tests/probe_regressions.py tests/sandbox_runner.py tests/probe_matrix.py` 通过。
+- `git diff --check` 通过；未启动真实服务，未修改宿主 `/etc/xray2go`、防火墙、`/etc/hosts` 或公网链路。
+
+### 切片结论
+
+- 状态：`completed-in-worktree`（待独立提交）。
+- **fixed**：模块 disable/uninstall 的 pre-mutation 已进入统一事务；Argo health failure、跨 artifact failure、SIGINT 和并发互斥均有 sandbox/fresh-process 证据。
+- **deferred**：真实 init/service 行为、真实 cloudflared/Tunnel 健康和公网互通仍未验收；继续保持隔离，不以宿主运行态替代验证。
+- 下一切片：`phase3-slice1-finalize`，复核最终 diff、清理临时物、提交本切片，并保留上述真实环境边界为后续独立验收项。

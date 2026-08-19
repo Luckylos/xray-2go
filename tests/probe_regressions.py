@@ -3,11 +3,15 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import time
 
 
 TESTS_DIR = Path(__file__).resolve().parent
 if str(TESTS_DIR) not in sys.path:
     sys.path.insert(0, str(TESTS_DIR))
+
+from sandbox_runner import XraySandbox
+
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "xray_2go.sh"
@@ -22,28 +26,32 @@ def assert_true(cond, msg):
 
 
 def run_bash(script: str) -> str:
-    cp = subprocess.run(
-        ["bash", "-lc", script],
-        cwd=ROOT,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        timeout=20,
-        check=True,
-    )
+    with XraySandbox() as sandbox:
+        cp = subprocess.run(
+            ["bash", "-lc", script],
+            cwd=ROOT,
+            env=sandbox.environment(),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=20,
+            check=True,
+        )
     return cp.stdout
 
 
 def run_bash_result(script: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        ["bash", "-lc", script],
-        cwd=ROOT,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        timeout=20,
-        check=False,
-    )
+    with XraySandbox() as sandbox:
+        return subprocess.run(
+            ["bash", "-lc", script],
+            cwd=ROOT,
+            env=sandbox.environment(),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=20,
+            check=False,
+        )
 
 
 def test_runtime_harness_does_not_touch_host_root():
@@ -984,6 +992,7 @@ def test_argo_enable_rolls_back_on_start_failure():
         source ./xray_2go.sh
         _G_STATE="${_STATE_DEFAULT}"
         _st_normalize_schema >/dev/null
+        st_set '.argo.enabled = false' >/dev/null
         download_cloudflared() { return 0; }
         config_apply() { return 0; }
         svc_apply_tunnel() { return 0; }
@@ -998,6 +1007,342 @@ def test_argo_enable_rolls_back_on_start_failure():
     """)
     assert_true("module-rc=0" not in cp.stdout, "Argo start failure must not return success")
     assert_true("enabled=false" in cp.stdout, "Argo state must roll back after start failure")
+
+
+def test_argo_enable_health_failure_rolls_back():
+    cp = run_bash_result("""
+        source ./xray_2go.sh
+        _G_STATE="${_STATE_DEFAULT}"
+        _st_normalize_schema >/dev/null
+        st_set '.argo.enabled = false' >/dev/null
+        download_cloudflared() { return 0; }
+        config_apply() { return 0; }
+        svc_apply_tunnel() { return 0; }
+        svc_reload_daemon() { return 0; }
+        svc_exec_mut() { return 0; }
+        svc_verify_health() { printf 'health-called\\n'; return 1; }
+        st_persist() { return 0; }
+        fw_reconcile() { return 0; }
+        module_argo_enable
+        rc=$?
+        printf 'module-rc=%s enabled=%s\\n' "$rc" "$(st_get '.argo.enabled')"
+        exit 0
+    """)
+    assert_true(cp.returncode == 0, f"Argo health rollback probe process failed: {cp.stdout}")
+    assert_true("health-called" in cp.stdout, "Argo enable must verify Tunnel health after start")
+    assert_true("module-rc=1" in cp.stdout and "enabled=false" in cp.stdout, "health failure must roll back Argo enable")
+
+
+def test_runtime_argo_enable_restores_cross_artifact_state_after_start_failure():
+    from sandbox_runner import XraySandbox
+
+    with XraySandbox() as sandbox:
+        cp = subprocess.run(
+            [
+                "bash",
+                "-lc",
+                """
+source ./xray_2go.sh
+mkdir -p "${WORK_DIR}" "${_SVC_SYSTEMD_DIR}"
+printf '#!/bin/sh\\n' > "${ARGO_BIN}"
+chmod 700 "${ARGO_BIN}"
+st_init >/dev/null 2>&1
+st_set '.argo.enabled = false' >/dev/null
+st_persist >/dev/null 2>&1
+printf 'old-config' > "${CONFIG_FILE}"
+printf 'old-service' > "${_SVC_SYSTEMD_DIR}/${_SVC_TUNNEL}.service"
+printf 'old-env' > "${_ARGO_ENV_FILE}"
+printf 'old-tunnel' > "${WORK_DIR}/tunnel.yml"
+printf 'nft:1080/tcp\\n' > "${_FW_RULES_FILE}"
+printf '1080\\n' > "${_FW_PORTS_FILE}"
+_SERVICE_ACTIVE=0
+_SERVICE_ENABLED=0
+svc_exec() { [ "$1" = status ] && [ "${_SERVICE_ACTIVE}" = 1 ]; }
+svc_is_enabled() { [ "${_SERVICE_ENABLED}" = 1 ]; }
+config_apply() {
+    printf 'new-config' > "${CONFIG_FILE}"
+    printf 'iptables:9999/tcp\\n' > "${_FW_RULES_FILE}"
+    printf '9999\\n' > "${_FW_PORTS_FILE}"
+    return 0
+}
+svc_apply_tunnel() {
+    printf 'new-service' > "${_SVC_SYSTEMD_DIR}/${_SVC_TUNNEL}.service"
+    printf 'new-env' > "${_ARGO_ENV_FILE}"
+    printf 'new-tunnel' > "${WORK_DIR}/tunnel.yml"
+    return 0
+}
+svc_reload_daemon() { return 0; }
+fw_reconcile() { return 0; }
+svc_exec_mut() {
+    case "$1" in
+        enable) _SERVICE_ENABLED=1; return 0 ;;
+        disable) _SERVICE_ENABLED=0; return 0 ;;
+        start) _SERVICE_ACTIVE=1; return 1 ;;
+        stop) _SERVICE_ACTIVE=0; return 0 ;;
+    esac
+    return 1
+}
+module_argo_enable >/dev/null 2>&1
+_rc=$?
+printf 'rc=%s memory=%s state=%s config=%s service=%s env=%s tunnel=%s fw=%s ports=%s active=%s enabled=%s\\n' \\
+    "${_rc}" \\
+    "$(printf '%s' "${_G_STATE}" | jq -r '.argo.enabled')" \\
+    "$(jq -c . "${STATE_FILE}")" \\
+    "$(cat "${CONFIG_FILE}")" \\
+    "$(cat "${_SVC_SYSTEMD_DIR}/${_SVC_TUNNEL}.service")" \\
+    "$(cat "${_ARGO_ENV_FILE}")" \\
+    "$(cat "${WORK_DIR}/tunnel.yml")" \\
+    "$(cat "${_FW_RULES_FILE}")" \\
+    "$(cat "${_FW_PORTS_FILE}")" \\
+    "${_SERVICE_ACTIVE}" "${_SERVICE_ENABLED}"
+""",
+            ],
+            cwd=ROOT,
+            env=sandbox.environment(),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=20,
+            check=False,
+        )
+
+    assert_true(cp.returncode == 0, f"Argo enable rollback probe process failed: {cp.stdout}")
+    assert_true(
+        "rc=1 memory=false state={" in cp.stdout
+        and '"enabled":false' in cp.stdout
+        and "config=old-config service=old-service env=old-env tunnel=old-tunnel fw=nft:1080/tcp ports=1080 active=0 enabled=0" in cp.stdout,
+        f"failed Argo start must restore state, artifacts and service status: {cp.stdout}",
+    )
+
+
+def test_transaction_interrupt_restores_files_and_state():
+    with XraySandbox() as sandbox:
+        cp = subprocess.run(
+            [
+                "bash",
+                "-lc",
+                "source ./xray_2go.sh\n"
+                "mkdir -p \"${WORK_DIR}\"\n"
+                "printf 'old-config\\n' > \"${CONFIG_FILE}\"\n"
+                "_G_STATE=\"${_STATE_DEFAULT}\"\n"
+                "_st_normalize_schema >/dev/null\n"
+                "st_set '.argo.enabled = false' >/dev/null\n"
+                "st_persist >/dev/null\n"
+                "_interrupt_probe() {\n"
+                "    printf 'new-config\\n' > \"${CONFIG_FILE}\"\n"
+                "    st_set '.argo.enabled = true' >/dev/null\n"
+                "    kill -INT $$\n"
+                "}\n"
+                "_transaction_run '中断测试' _interrupt_probe\n",
+            ],
+            cwd=ROOT,
+            env=sandbox.environment(),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=20,
+            check=False,
+        )
+        config = (sandbox.root / "etc/xray2go/config.json").read_text(encoding="utf-8")
+        state = (sandbox.root / "etc/xray2go/state.json").read_text(encoding="utf-8")
+    assert_true(cp.returncode == 130, f"SIGINT must exit with 130: {cp.stdout}")
+    assert_true(config.startswith("old-config") and config.endswith("\n"), f"SIGINT must restore config artifact: {config!r}")
+    assert_true('"enabled":false' in state.replace(" ", ""), f"SIGINT must restore persisted state: {state}")
+
+
+def test_concurrent_transactions_serialize_failure_and_commit():
+    with XraySandbox() as sandbox:
+        work_dir = sandbox.root / "etc/xray2go"
+        work_dir.mkdir(parents=True, exist_ok=True)
+        (work_dir / "config.json").write_text("old-config\\n", encoding="utf-8")
+        command = (
+            "source ./xray_2go.sh\n"
+            "mkdir -p \"${WORK_DIR}\"\n"
+            "_G_STATE=\"${_STATE_DEFAULT}\"\n"
+            "_st_normalize_schema >/dev/null\n"
+            "_probe() {\n"
+            "    printf '%s-start\\n' \"${LABEL}\" >> \"${WORK_DIR}/timeline\"\n"
+            "    printf '%s\\n' \"${LABEL}\" > \"${CONFIG_FILE}\"\n"
+            "    sleep 0.4\n"
+            "    printf '%s-end\\n' \"${LABEL}\" >> \"${WORK_DIR}/timeline\"\n"
+            "    return \"${RESULT}\"\n"
+            "}\n"
+            "_transaction_run \"${LABEL}\" _probe\n"
+        )
+        env_a = sandbox.environment()
+        env_a.update({"LABEL": "A", "RESULT": "1"})
+        env_b = sandbox.environment()
+        env_b.update({"LABEL": "B", "RESULT": "0"})
+        proc_a = subprocess.Popen(
+            ["bash", "-lc", command],
+            cwd=ROOT,
+            env=env_a,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        time.sleep(0.05)
+        proc_b = subprocess.Popen(
+            ["bash", "-lc", command],
+            cwd=ROOT,
+            env=env_b,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        out_a, _ = proc_a.communicate(timeout=20)
+        out_b, _ = proc_b.communicate(timeout=20)
+        timeline = (work_dir / "timeline").read_text(encoding="utf-8").splitlines()
+        final_config = (work_dir / "config.json").read_text(encoding="utf-8")
+    assert_true(proc_a.returncode == 1, f"failed transaction must return failure: {out_a}")
+    assert_true(proc_b.returncode == 0, f"waiting transaction must commit successfully: {out_b}")
+    assert_true(timeline in (["A-start", "A-end", "B-start", "B-end"], ["B-start", "B-end", "A-start", "A-end"]), f"transactions must not overlap: {timeline}")
+    assert_true(final_config.startswith("B") and final_config.endswith("\n"), f"later successful transaction must own final artifact: {final_config!r}")
+
+
+def test_runtime_argo_disable_restores_service_state_after_commit_failure():
+    from sandbox_runner import XraySandbox
+
+    with XraySandbox() as sandbox:
+        cp = subprocess.run(
+            [
+                "bash",
+                "-lc",
+                """
+source ./xray_2go.sh
+mkdir -p "${WORK_DIR}" "${_SVC_SYSTEMD_DIR}"
+st_init >/dev/null 2>&1
+st_set '.argo.enabled = true' >/dev/null
+st_persist >/dev/null 2>&1
+printf 'old-config' > "${CONFIG_FILE}"
+printf 'old-service' > "${_SVC_SYSTEMD_DIR}/${_SVC_TUNNEL}.service"
+printf 'old-env' > "${_ARGO_ENV_FILE}"
+printf 'old-tunnel' > "${WORK_DIR}/tunnel.yml"
+printf 'nft:1080/tcp\\n' > "${_FW_RULES_FILE}"
+printf '1080\\n' > "${_FW_PORTS_FILE}"
+_SERVICE_ACTIVE=1
+_SERVICE_ENABLED=1
+svc_exec() { [ "$1" = status ] && [ "${_SERVICE_ACTIVE}" = 1 ]; }
+svc_is_enabled() { [ "${_SERVICE_ENABLED}" = 1 ]; }
+svc_exec_mut() {
+    case "$1" in
+        disable) _SERVICE_ENABLED=0; return 0 ;;
+        stop) _SERVICE_ACTIVE=0; return 0 ;;
+        enable) _SERVICE_ENABLED=1; return 0 ;;
+        start) _SERVICE_ACTIVE=1; return 0 ;;
+    esac
+    return 1
+}
+config_apply() {
+    printf 'new-config' > "${CONFIG_FILE}"
+    return 1
+}
+fw_reconcile() { return 0; }
+module_argo_disable >/dev/null 2>&1
+_rc=$?
+printf 'rc=%s memory=%s state=%s config=%s service=%s env=%s tunnel=%s fw=%s ports=%s active=%s enabled=%s\\n' \\
+    "${_rc}" \\
+    "$(printf '%s' "${_G_STATE}" | jq -r '.argo.enabled')" \\
+    "$(jq -c . "${STATE_FILE}")" \\
+    "$(cat "${CONFIG_FILE}")" \\
+    "$(cat "${_SVC_SYSTEMD_DIR}/${_SVC_TUNNEL}.service")" \\
+    "$(cat "${_ARGO_ENV_FILE}")" \\
+    "$(cat "${WORK_DIR}/tunnel.yml")" \\
+    "$(cat "${_FW_RULES_FILE}")" \\
+    "$(cat "${_FW_PORTS_FILE}")" \\
+    "${_SERVICE_ACTIVE}" "${_SERVICE_ENABLED}"
+""",
+            ],
+            cwd=ROOT,
+            env=sandbox.environment(),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=20,
+            check=False,
+        )
+
+    assert_true(cp.returncode == 0, f"Argo disable rollback probe process failed: {cp.stdout}")
+    assert_true(
+        "rc=1 memory=true state={" in cp.stdout
+        and '"enabled":true' in cp.stdout
+        and "config=old-config service=old-service env=old-env tunnel=old-tunnel fw=nft:1080/tcp ports=1080 active=1 enabled=1" in cp.stdout,
+        f"failed Argo disable must restore state, artifacts and service status: {cp.stdout}",
+    )
+
+
+def test_runtime_argo_uninstall_restores_deleted_artifacts_after_commit_failure():
+    from sandbox_runner import XraySandbox
+
+    with XraySandbox() as sandbox:
+        cp = subprocess.run(
+            [
+                "bash",
+                "-lc",
+                """
+source ./xray_2go.sh
+mkdir -p "${WORK_DIR}" "${_SVC_SYSTEMD_DIR}"
+printf 'old-argo' > "${ARGO_BIN}"
+chmod 700 "${ARGO_BIN}"
+st_init >/dev/null 2>&1
+st_set '.argo.enabled = true | .argo.domain = "old.example.com"' >/dev/null
+st_persist >/dev/null 2>&1
+printf 'old-config' > "${CONFIG_FILE}"
+printf 'old-service' > "${_SVC_SYSTEMD_DIR}/${_SVC_TUNNEL}.service"
+printf 'old-env' > "${_ARGO_ENV_FILE}"
+printf 'old-yml' > "${WORK_DIR}/tunnel.yml"
+printf 'old-json' > "${WORK_DIR}/tunnel.json"
+printf 'nft:1080/tcp\\n' > "${_FW_RULES_FILE}"
+printf '1080\\n' > "${_FW_PORTS_FILE}"
+_SERVICE_ACTIVE=1
+_SERVICE_ENABLED=1
+svc_exec() { [ "$1" = status ] && [ "${_SERVICE_ACTIVE}" = 1 ]; }
+svc_is_enabled() { [ "${_SERVICE_ENABLED}" = 1 ]; }
+svc_exec_mut() {
+    case "$1" in
+        disable) _SERVICE_ENABLED=0; return 0 ;;
+        stop) _SERVICE_ACTIVE=0; return 0 ;;
+        enable) _SERVICE_ENABLED=1; return 0 ;;
+        start) _SERVICE_ACTIVE=1; return 0 ;;
+    esac
+    return 1
+}
+is_systemd() { return 0; }
+systemctl() { return 0; }
+config_apply() { return 1; }
+fw_reconcile() { return 0; }
+module_argo_uninstall >/dev/null 2>&1
+_rc=$?
+printf 'rc=%s memory=%s state=%s argo=%s service=%s env=%s yml=%s json=%s fw=%s ports=%s active=%s enabled=%s\\n' \\
+    "${_rc}" \\
+    "$(printf '%s' "${_G_STATE}" | jq -r '.argo.enabled')" \\
+    "$(jq -c . "${STATE_FILE}")" \\
+    "$(cat "${ARGO_BIN}" 2>/dev/null || printf missing)" \\
+    "$(cat "${_SVC_SYSTEMD_DIR}/${_SVC_TUNNEL}.service" 2>/dev/null || printf missing)" \\
+    "$(cat "${_ARGO_ENV_FILE}" 2>/dev/null || printf missing)" \\
+    "$(cat "${WORK_DIR}/tunnel.yml" 2>/dev/null || printf missing)" \\
+    "$(cat "${WORK_DIR}/tunnel.json" 2>/dev/null || printf missing)" \\
+    "$(cat "${_FW_RULES_FILE}")" \\
+    "$(cat "${_FW_PORTS_FILE}")" \\
+    "${_SERVICE_ACTIVE}" "${_SERVICE_ENABLED}"
+""",
+            ],
+            cwd=ROOT,
+            env=sandbox.environment(),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=20,
+            check=False,
+        )
+
+    assert_true(cp.returncode == 0, f"Argo uninstall rollback probe process failed: {cp.stdout}")
+    assert_true(
+        "rc=1 memory=true state={" in cp.stdout
+        and '"enabled":true' in cp.stdout
+        and "argo=old-argo service=old-service env=old-env yml=old-yml json=old-json fw=nft:1080/tcp ports=1080 active=1 enabled=1" in cp.stdout,
+        f"failed Argo uninstall must restore deleted artifacts and service status: {cp.stdout}",
+    )
 
 
 def test_argo_domain_update_rolls_back_on_apply_failure():
@@ -1130,11 +1475,12 @@ def test_runtime_argo_updates_roll_back_in_memory_state_on_apply_failure():
 
 def test_argo_disable_and_uninstall_reset_authentication_state():
     for fn in ["module_argo_uninstall", "install_plan_argo_toggle"]:
-        m = re.search(rf"{fn}\(\) \{{(?P<body>.*?)\n\}}", TEXT, re.S)
-        assert_true(m, f"{fn} function missing")
+        owner = "module_argo_uninstall_inner" if fn == "module_argo_uninstall" else fn
+        m = re.search(rf"{owner}\(\) \{{(?P<body>.*?)\n\}}", TEXT, re.S)
+        assert_true(m, f"{owner} function missing")
         body = m.group("body")
-        assert_true('.argo.auth_protocol = "vless"' in body, f"{fn} must reset Argo auth protocol")
-        assert_true('.argo.protocol = "ws"' in body, f"{fn} must reset Argo transport protocol")
+        assert_true('.argo.auth_protocol = "vless"' in body, f"{owner} must reset Argo auth protocol")
+        assert_true('.argo.protocol = "ws"' in body, f"{owner} must reset Argo transport protocol")
 
 
 def test_trojan_password_generator_is_random_and_validator_safe():
@@ -1788,6 +2134,153 @@ printf 'rc=%s memory=%s config=%s state=%s service=%s env=%s tunnel=%s fw=%s por
     )
 
 
+def test_runtime_disable_transaction_restores_cross_artifact_state_after_commit_failure():
+    from sandbox_runner import XraySandbox
+
+    with XraySandbox() as sandbox:
+        cp = subprocess.run(
+            [
+                "bash",
+                "-lc",
+                """
+source ./xray_2go.sh
+mkdir -p "${WORK_DIR}" "${_SVC_SYSTEMD_DIR}"
+st_init >/dev/null 2>&1
+st_set '.socks.enabled = true' >/dev/null
+st_persist >/dev/null 2>&1
+printf 'old-config' > "${CONFIG_FILE}"
+printf 'old-service' > "${_SVC_SYSTEMD_DIR}/${_SVC_XRAY}.service"
+printf 'old-env' > "${_ARGO_ENV_FILE}"
+printf 'old-tunnel' > "${WORK_DIR}/tunnel.yml"
+printf 'nft:1080/tcp\\n' > "${_FW_RULES_FILE}"
+printf '1080\\n' > "${_FW_PORTS_FILE}"
+_SERVICE_ACTIVE=1
+_SERVICE_ENABLED=1
+svc_exec() {
+    case "$1" in
+        status) [ "${_SERVICE_ACTIVE}" = 1 ] ;;
+        *) return 1 ;;
+    esac
+}
+svc_is_enabled() { [ "${_SERVICE_ENABLED}" = 1 ]; }
+svc_exec_mut() {
+    case "$1" in
+        start) _SERVICE_ACTIVE=1 ;;
+        stop) _SERVICE_ACTIVE=0 ;;
+        enable) _SERVICE_ENABLED=1 ;;
+        disable) _SERVICE_ENABLED=0 ;;
+        *) return 1 ;;
+    esac
+}
+_fw_restore_managed_snapshot() { return 0; }
+_module_disable_commit() {
+    printf 'new-config' > "${CONFIG_FILE}"
+    printf '{"socks":{"enabled":false}}' > "${STATE_FILE}"
+    printf 'new-service' > "${_SVC_SYSTEMD_DIR}/${_SVC_XRAY}.service"
+    printf 'new-env' > "${_ARGO_ENV_FILE}"
+    printf 'new-tunnel' > "${WORK_DIR}/tunnel.yml"
+    printf 'iptables:9999/tcp\\n' > "${_FW_RULES_FILE}"
+    printf '9999\\n' > "${_FW_PORTS_FILE}"
+    _SERVICE_ACTIVE=0
+    _SERVICE_ENABLED=0
+    return 1
+}
+module_socks_action disable >/dev/null 2>&1
+_rc=$?
+printf 'rc=%s memory=%s config=%s state=%s service=%s env=%s tunnel=%s fw=%s ports=%s active=%s enabled=%s\\n' \\
+    "${_rc}" \\
+    "$(printf '%s' "${_G_STATE}" | jq -r '.socks.enabled')" \\
+    "$(cat "${CONFIG_FILE}")" \\
+    "$(jq -c . "${STATE_FILE}")" \\
+    "$(cat "${_SVC_SYSTEMD_DIR}/${_SVC_XRAY}.service")" \\
+    "$(cat "${_ARGO_ENV_FILE}")" \\
+    "$(cat "${WORK_DIR}/tunnel.yml")" \\
+    "$(cat "${_FW_RULES_FILE}")" \\
+    "$(cat "${_FW_PORTS_FILE}")" \\
+    "${_SERVICE_ACTIVE}" "${_SERVICE_ENABLED}"
+""",
+            ],
+            cwd=ROOT,
+            env=sandbox.environment(),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=20,
+            check=False,
+        )
+
+    assert_true(cp.returncode == 0, f"disable transaction rollback probe process failed: {cp.stdout}")
+    assert_true(
+        "rc=1 memory=true config=old-config state={" in cp.stdout
+        and '"enabled":true' in cp.stdout
+        and "service=old-service env=old-env tunnel=old-tunnel fw=nft:1080/tcp ports=1080 active=1 enabled=1" in cp.stdout,
+        f"failed disable commit must restore all artifacts and state: {cp.stdout}",
+    )
+
+
+def test_runtime_commit_restores_cross_artifact_state_after_failure():
+    from sandbox_runner import XraySandbox
+
+    with XraySandbox() as sandbox:
+        cp = subprocess.run(
+            [
+                "bash",
+                "-lc",
+                """
+source ./xray_2go.sh
+mkdir -p "${WORK_DIR}" "${_SVC_SYSTEMD_DIR}"
+st_init >/dev/null 2>&1
+st_set '.socks.enabled = true' >/dev/null
+st_persist >/dev/null 2>&1
+printf 'old-config' > "${CONFIG_FILE}"
+printf 'old-service' > "${_SVC_SYSTEMD_DIR}/${_SVC_XRAY}.service"
+printf 'old-env' > "${_ARGO_ENV_FILE}"
+printf 'old-tunnel' > "${WORK_DIR}/tunnel.yml"
+printf 'nft:1080/tcp\\n' > "${_FW_RULES_FILE}"
+printf '1080\\n' > "${_FW_PORTS_FILE}"
+_commit_inner() {
+    st_set '.socks.enabled = false' >/dev/null
+    st_persist >/dev/null 2>&1
+    printf 'new-config' > "${CONFIG_FILE}"
+    printf 'new-service' > "${_SVC_SYSTEMD_DIR}/${_SVC_XRAY}.service"
+    printf 'new-env' > "${_ARGO_ENV_FILE}"
+    printf 'new-tunnel' > "${WORK_DIR}/tunnel.yml"
+    printf 'iptables:9999/tcp\\n' > "${_FW_RULES_FILE}"
+    printf '9999\\n' > "${_FW_PORTS_FILE}"
+    return 1
+}
+_commit >/dev/null 2>&1
+_rc=$?
+printf 'rc=%s memory=%s config=%s state=%s service=%s env=%s tunnel=%s fw=%s ports=%s\\n' \\
+    "${_rc}" \\
+    "$(printf '%s' "${_G_STATE}" | jq -r '.socks.enabled')" \\
+    "$(cat "${CONFIG_FILE}")" \\
+    "$(jq -c . "${STATE_FILE}")" \\
+    "$(cat "${_SVC_SYSTEMD_DIR}/${_SVC_XRAY}.service")" \\
+    "$(cat "${_ARGO_ENV_FILE}")" \\
+    "$(cat "${WORK_DIR}/tunnel.yml")" \\
+    "$(cat "${_FW_RULES_FILE}")" \\
+    "$(cat "${_FW_PORTS_FILE}")"
+""",
+            ],
+            cwd=ROOT,
+            env=sandbox.environment(),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=20,
+            check=False,
+        )
+
+    assert_true(cp.returncode == 0, f"ordinary commit rollback probe process failed: {cp.stdout}")
+    assert_true(
+        "rc=1 memory=true config=old-config state={" in cp.stdout
+        and '"enabled":true' in cp.stdout
+        and "service=old-service env=old-env tunnel=old-tunnel fw=nft:1080/tcp ports=1080" in cp.stdout,
+        f"failed ordinary commit must restore all artifacts and state: {cp.stdout}",
+    )
+
+
 def test_runtime_transaction_restores_service_enabled_state_after_commit_failure():
     from sandbox_runner import XraySandbox
 
@@ -1844,6 +2337,70 @@ printf 'rc=%s active=%s enabled=%s\\n' "${_rc}" "${_SERVICE_ACTIVE}" "${_SERVICE
     assert_true(
         "rc=1 active=1 enabled=1" in cp.stdout,
         f"failed commit must restore service active and enabled state: {cp.stdout}",
+    )
+
+
+def test_runtime_vlquic_enable_restores_cross_artifact_state_after_config_failure():
+    from sandbox_runner import XraySandbox
+
+    with XraySandbox() as sandbox:
+        cp = subprocess.run(
+            [
+                "bash",
+                "-lc",
+                """
+source ./xray_2go.sh
+mkdir -p "${WORK_DIR}" "${_SVC_SYSTEMD_DIR}"
+printf 'cert' > "${WORK_DIR}/cert.pem"
+printf 'key' > "${WORK_DIR}/key.pem"
+st_init >/dev/null 2>&1
+st_set '.vlquic.enabled = false | .vlquic.domain = "old.example" | .vlquic.cert = "'"${WORK_DIR}"'/cert.pem" | .vlquic.key = "'"${WORK_DIR}"'/key.pem"' >/dev/null
+st_persist >/dev/null 2>&1
+printf 'old-config' > "${CONFIG_FILE}"
+printf 'old-service' > "${_SVC_SYSTEMD_DIR}/${_SVC_XRAY}.service"
+printf 'old-env' > "${_ARGO_ENV_FILE}"
+printf 'old-tunnel' > "${WORK_DIR}/tunnel.yml"
+printf 'nft:1080/tcp\\n' > "${_FW_RULES_FILE}"
+printf '1080\\n' > "${_FW_PORTS_FILE}"
+fw_reconcile() { return 0; }
+config_apply() {
+    printf 'new-config' > "${CONFIG_FILE}"
+    printf 'new-service' > "${_SVC_SYSTEMD_DIR}/${_SVC_XRAY}.service"
+    printf 'new-env' > "${_ARGO_ENV_FILE}"
+    printf 'new-tunnel' > "${WORK_DIR}/tunnel.yml"
+    printf 'iptables:9999/tcp\\n' > "${_FW_RULES_FILE}"
+    printf '9999\\n' > "${_FW_PORTS_FILE}"
+    return 1
+}
+module_vlquic_enable >/dev/null 2>&1
+_rc=$?
+printf 'rc=%s memory=%s config=%s state=%s service=%s env=%s tunnel=%s fw=%s ports=%s\\n' \\
+    "${_rc}" \\
+    "$(printf '%s' "${_G_STATE}" | jq -r '.vlquic.enabled')" \\
+    "$(cat "${CONFIG_FILE}")" \\
+    "$(jq -c . "${STATE_FILE}")" \\
+    "$(cat "${_SVC_SYSTEMD_DIR}/${_SVC_XRAY}.service")" \\
+    "$(cat "${_ARGO_ENV_FILE}")" \\
+    "$(cat "${WORK_DIR}/tunnel.yml")" \\
+    "$(cat "${_FW_RULES_FILE}")" \\
+    "$(cat "${_FW_PORTS_FILE}")"
+""",
+            ],
+            cwd=ROOT,
+            env=sandbox.environment(),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=20,
+            check=False,
+        )
+
+    assert_true(cp.returncode == 0, f"VLESS-XHTTP-H3 enable rollback probe process failed: {cp.stdout}")
+    assert_true(
+        "rc=1 memory=false config=old-config state={" in cp.stdout
+        and '"enabled":false' in cp.stdout
+        and "service=old-service env=old-env tunnel=old-tunnel fw=nft:1080/tcp ports=1080" in cp.stdout,
+        f"failed VLESS-XHTTP-H3 enable must restore all artifacts and state: {cp.stdout}",
     )
 
 
