@@ -506,3 +506,45 @@ AssertionError: failed VLESS-TCP enable must restore committed state: rc=1 memor
 - **fixed**：VLESS-TCP enable commit 失败时的内存 state 漂移。
 - **deferred**：SOCKS、VLESS-TCP、FreeFlow、Reality、VLQUIC、CF Origin 等模块仍存在不同程度的局部 rollback 实现；统一的 state/config/service/Tunnel/firewall transaction 仍应按计划在后续边界集中设计，未通过逐模块补丁宣称完成。
 - 下一切片：优先评估并以 RED 测试确定共享 enable rollback/transaction 边界，不继续无条件复制模块级补丁。
+
+## Phase 1 / Slice 10：共享 enable helper failure rollback
+
+### 范围
+
+- 切片：`phase1-slice10-shared-enable-helper-failure-rollback`
+- 目标：将简单 enable action 的 commit 失败恢复逻辑收敛到 `_module_enable_with_state`，避免每个调用方复制 state snapshot/restore。
+- 验收测试：`test_shared_enable_helper_restores_state_on_commit_failure`
+
+### RED
+
+- 共享 helper 测试首次执行时，旧实现真实失败：
+
+```text
+AssertionError: shared enable helper must restore prior state: rc=1 memory=false disk=true
+```
+
+- 失败语义确认 `_module_enable_with_state` 在 `st_set` 成功、`_module_enable_commit` 失败后只返回错误，没有恢复调用前 `_G_STATE`；磁盘 state 仍保持旧值。
+
+### GREEN / REFACTOR / 验证
+
+- `_module_enable_with_state` 现在在修改前保存完整 `_G_STATE`。
+- `_module_enable_commit` 失败时恢复完整内存 state 并返回非零；成功路径不变。
+- `module_socks_action enable` 和 `module_vltcp_enable` 已改为直接复用该 helper，删除重复的局部 snapshot/restore 逻辑。
+- 聚焦验证通过：
+  - `test_shared_enable_helper_restores_state_on_commit_failure`
+  - `test_runtime_socks_disable_failure_restores_previous_state`
+  - `test_runtime_socks_enable_failure_restores_previous_state`
+  - `test_runtime_vltcp_enable_failure_restores_previous_state`
+- 完整 fresh-process 回归：`python3 tests/probe_regressions.py` 返回码 `0`，共 `91` 项 `PASS`，`0` 项失败。
+- 最终探针矩阵：`static=47`、`safe=31`、`sandbox=13`、`total=91`。
+- `bash -n xray_2go.sh` 通过。
+- `python3 -m py_compile tests/probe_regressions.py tests/sandbox_runner.py tests/probe_matrix.py` 通过。
+- `git diff --check` 通过；测试缓存已清理。
+- 本切片只使用 sandbox/stub，不启动 Xray、cloudflared、systemd/OpenRC，不修改宿主 `/etc/xray2go`、防火墙、`/etc/hosts` 或公网链路。
+
+### 切片结论
+
+- 状态：`completed-in-worktree`
+- **fixed**：共享 enable helper 的内存 state rollback，以及 SOCKS/VLESS-TCP 两个调用方的重复实现。
+- **deferred**：helper 只覆盖其调用时已经进入 `_module_enable_with_state` 的状态变更；FreeFlow、Reality、CF Origin 等在调用 helper 前还会修改默认值或生成材料的复杂路径，仍需独立 transaction/全量快照设计和失败注入测试。
+- 下一切片：继续以 failure-injection 覆盖复杂 enable 前置变更，或进入统一 transaction 设计；必须先建立对应 RED，不得直接扩大修改范围。

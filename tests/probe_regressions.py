@@ -1584,6 +1584,45 @@ printf 'rc=%s memory=%s disk=%s\\n' "${_rc}" "${_mem}" "${_disk}"
     )
 
 
+def test_shared_enable_helper_restores_state_on_commit_failure():
+    from sandbox_runner import XraySandbox
+
+    with XraySandbox() as sandbox:
+        cp = subprocess.run(
+            [
+                "bash",
+                "-lc",
+                """
+source ./xray_2go.sh
+mkdir -p "${WORK_DIR}"
+st_init >/dev/null 2>&1
+st_set '.vltcp.enabled = true' >/dev/null
+st_persist >/dev/null 2>&1
+
+_module_enable_commit() { return 1; }
+_module_enable_with_state '.vltcp.enabled = false' 'VLESS-TCP'
+_rc=$?
+_mem=$(st_get '.vltcp.enabled')
+_disk=$(jq -r '.vltcp.enabled' "${STATE_FILE}")
+printf 'rc=%s memory=%s disk=%s\\n' "${_rc}" "${_mem}" "${_disk}"
+""",
+            ],
+            cwd=ROOT,
+            env=sandbox.environment(),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=20,
+            check=False,
+        )
+
+    assert_true(cp.returncode == 0, f"shared enable rollback probe process failed: {cp.stdout}")
+    assert_true(
+        "rc=1 memory=true disk=true" in cp.stdout,
+        f"shared enable helper must restore prior state: {cp.stdout}",
+    )
+
+
 def test_readme_documents_trojan_argo_capability():
     assert_true("Trojan" in README_TEXT, "README must document the Trojan Argo capability")
     assert_true(

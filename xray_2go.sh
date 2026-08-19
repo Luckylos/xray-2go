@@ -2115,9 +2115,12 @@ _module_persist_after_optional_apply() {
 
 
 _module_enable_with_state() {
-    local _jq_expr="$1" _module_name="$2"
+    local _jq_expr="$1" _module_name="$2" _before="${_G_STATE}"
     st_set "${_jq_expr}" || return 1
-    _module_enable_commit "${_module_name}" || return 1
+    if ! _module_enable_commit "${_module_name}"; then
+        _G_STATE="${_before}"
+        return 1
+    fi
 }
 
 module_update_port_action() {
@@ -2196,13 +2199,7 @@ module_reality_disable() {
 }
 
 module_vltcp_enable() {
-    local _old_enabled
-    _old_enabled=$(printf '%s' "${_G_STATE}" | jq -c '.vltcp.enabled' 2>/dev/null) || return 1
-    st_set '.vltcp.enabled = true' || return 1
-    if ! _module_enable_commit "VLESS-TCP"; then
-        st_set ".vltcp.enabled = ${_old_enabled}" || true
-        return 1
-    fi
+    _module_enable_with_state '.vltcp.enabled = true' "VLESS-TCP"
 }
 
 module_vltcp_disable() {
@@ -2216,12 +2213,7 @@ module_socks_action() {
     local _action="${1:-}"
     case "${_action}" in
         enable)
-            local _old_enabled
-            _old_enabled=$(printf '%s' "${_G_STATE}" | jq -c '.socks.enabled' 2>/dev/null) || return 1
-            if ! _module_enable_with_state '.socks.enabled = true' SOCKS5; then
-                st_set ".socks.enabled = ${_old_enabled}" || true
-                return 1
-            fi
+            _module_enable_with_state '.socks.enabled = true' SOCKS5 || return 1
             ;;
         disable)
             local _old_enabled
