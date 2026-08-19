@@ -172,3 +172,43 @@ bash: 行 1: module_socks_action: 未找到命令
 - 状态：`completed-in-worktree`
 - 本切片只统一 SOCKS enable/disable action ownership，未改变 CLI、状态格式、服务名、生产默认路径或公开协议行为。
 - 下一切片：Phase 1 `update_port`，仍需先写一个最小失败测试；若发现端口更新的外部契约在不同入口不一致，先补 BDD 场景再改实现。
+
+## Phase 1 / Slice 2：同构 runtime update_port canonical owner
+
+### 范围
+
+- 切片：`phase1-slice2-update-port-action-owner`
+- 目标：将 FreeFlow、Reality、VLESS-TCP、VLESS-XHTTP-H3 和 SOCKS5 的同构 runtime `update_port` 路径收敛到一个 canonical action；保留 Argo 与 CF Origin 的专用实现，因为它们分别包含 Tunnel/回源端口语义。
+- 验收测试：`test_runtime_port_actions_have_single_canonical_owner`
+
+### RED
+
+- 新增测试后首次执行失败，原因是生产脚本没有统一端口 action：
+
+```text
+bash: 行 1: module_update_port_action: 未找到命令
+```
+
+- 失败来自实际 sourced shell 的 sandbox runtime 调用，而非静态字符串检查。
+
+### GREEN / 验证
+
+- 新增 `module_update_port_action()`，只接受同构模块 `ff|reality|vltcp|vlquic|socks`，统一调用既有 `_menu_update_port`。
+- 统一保留各模块已有 `module_*_update_port()` 函数作为薄包装，保持现有函数边界和安装计划调用契约。
+- `module_dispatch()` 对上述五个模块的 `update_port` 直接路由到 canonical action，并显式保留：
+  - TCP：FreeFlow、Reality、VLESS-TCP、SOCKS5；
+  - UDP + `udp` label：VLESS-XHTTP-H3。
+- Argo 继续使用 `module_argo_update_port`；CF Origin 继续使用 `module_cforigin_update_port`，未改变专用回源/Tunnel 逻辑。
+- 更新两条静态回归断言，使其验证 canonical owner 的 TCP/UDP 参数，而不是已删除的 wrapper 直接调用细节。
+- 聚焦 GREEN：`test_runtime_port_actions_have_single_canonical_owner` 通过，实际验证 Reality 端口更新和 dispatcher 到 VLESS-TCP 的路由。
+- 完整 fresh-process 回归：`python3 tests/probe_regressions.py` 返回码 `0`，共 `81` 项 `PASS`。
+- `bash -n xray_2go.sh` 通过。
+- `python3 -m py_compile tests/probe_regressions.py tests/sandbox_runner.py tests/probe_matrix.py` 通过。
+- `git diff --check` 通过，测试缓存已清理。
+- 本切片测试使用 sandbox/stub，不启动 Xray、cloudflared、systemd/OpenRC，不修改宿主 `/etc/xray2go`、防火墙、`/etc/hosts` 或公网链路。
+
+### 切片结论
+
+- 状态：`completed-in-worktree`
+- 本切片未改变 CLI、状态格式、服务名称、生产默认路径或协议行为；只改变 runtime 同构端口 action 的内部 ownership/routing。
+- 下一切片：Phase 1 `listen/path` action；继续先写一个最小 RED，若发现不同模块的输入/提交语义不一致则拆成独立 BDD 场景，不强行泛化。

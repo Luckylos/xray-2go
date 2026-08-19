@@ -518,7 +518,7 @@ def test_protocol_links_and_udp_port_input_consistency():
         rm -f "${_seq}"
     """)
     assert_true(out.strip() == 'tcp=443 udp=444', "random port selection must check TCP/UDP independently")
-    assert_true('_menu_update_port vlquic udp udp' in TEXT, "VLQUIC management port input must preserve UDP conflict checks")
+    assert_true('module_update_port_action vlquic udp udp' in TEXT, "VLQUIC management port input must preserve UDP conflict checks")
 
 
 def test_state_schema_and_plugin_permission_hardening():
@@ -549,7 +549,7 @@ def test_socks5_module_option_and_plugin_contract():
     socks_plugin = TEXT[TEXT.index('_plugin_write_socks()'):TEXT.index('_plugin_write_cforigin()', TEXT.index('_plugin_write_socks()'))]
     for token in ['_plg_socks_inbound()', 'protocol:"socks"', 'auth:"password"', 'accounts:[{user:$user, pass:$pass}]', '_plg_socks_ports()', '_plg_socks_link()']:
         assert_true(token in socks_plugin, f"SOCKS5 plugin token missing: {token}")
-    assert_true('_menu_update_port socks tcp' in TEXT, "SOCKS5 port update must use TCP conflict checks")
+    assert_true('module_update_port_action socks tcp' in TEXT, "SOCKS5 port update must use TCP conflict checks")
 
 
 def test_socks5_link_is_generated_and_displayed():
@@ -724,6 +724,43 @@ def test_socks_runtime_actions_have_single_canonical_owner():
     assert_true("after_enable=true" in cp.stdout, "canonical SOCKS action must enable the module")
     assert_true("after_disable=false" in cp.stdout, "canonical SOCKS action must disable the module")
     assert_true("dispatcher_action=enable" in cp.stdout, "dispatcher must route SOCKS enable to canonical action")
+
+
+def test_runtime_port_actions_have_single_canonical_owner():
+    from sandbox_runner import XraySandbox
+
+    with XraySandbox() as sandbox:
+        cp = subprocess.run(
+            [
+                "bash",
+                "-lc",
+                "source ./xray_2go.sh; "
+                "set -e; "
+                "mkdir -p \"${WORK_DIR}\"; "
+                "st_init; "
+                "config_apply() { :; }; "
+                "st_persist() { :; }; "
+                "fw_reconcile() { :; }; "
+                "config_print_nodes() { :; }; "
+                "port_mgr_in_use() { return 1; }; "
+                "prompt() { printf -v \"$2\" '%s' 2443; }; "
+                "module_update_port_action reality tcp; "
+                "printf 'reality=%s\\n' \"$(port_of reality)\"; "
+                "module_update_port_action() { printf 'dispatcher_port=%s/%s\\n' \"$1\" \"$2\"; }; "
+                "module_dispatch vltcp update_port",
+            ],
+            cwd=ROOT,
+            env=sandbox.environment(),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=20,
+            check=False,
+        )
+
+    assert_true(cp.returncode == 0, f"canonical runtime port action failed: {cp.stdout}")
+    assert_true("reality=2443" in cp.stdout, "canonical port action must update the requested port")
+    assert_true("dispatcher_port=vltcp/tcp" in cp.stdout, "dispatcher must route update_port to canonical action")
 
 
 def test_runtime_enable_paths_no_longer_depend_on_removed_ask_helpers():

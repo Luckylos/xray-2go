@@ -2120,12 +2120,25 @@ _module_enable_with_state() {
     _module_enable_commit "${_module_name}" || return 1
 }
 
+module_update_port_action() {
+    local _proto="${1:-}" _net="${2:-tcp}" _label_suffix="${3:-}"
+    case "${_proto}" in
+        ff|reality|vltcp|vlquic|socks)
+            _menu_update_port "${_proto}" "${_net}" "${_label_suffix}"
+            ;;
+        *)
+            log_error "不支持统一端口更新的模块: ${_proto}"
+            return 1
+            ;;
+    esac
+}
+
 module_reality_update_port() {
-    _menu_update_port reality tcp
+    module_update_port_action reality tcp
 }
 
 module_vltcp_update_port() {
-    _menu_update_port vltcp tcp
+    module_update_port_action vltcp tcp
 }
 
 module_ff_enable() {
@@ -2246,7 +2259,7 @@ module_socks_uninstall() {
 }
 
 module_socks_update_port() {
-    _menu_update_port socks tcp
+    module_update_port_action socks tcp
 }
 
 module_socks_update_listen() {
@@ -2311,7 +2324,7 @@ module_cforigin_uninstall() {
 }
 
 module_vlquic_update_port() {
-    _menu_update_port vlquic udp udp
+    module_update_port_action vlquic udp udp
 }
 
 module_cforigin_update_port() {
@@ -2534,7 +2547,7 @@ module_ff_update_mode() {
     _module_enable_commit FreeFlow || return 1
 }
 module_ff_update_port() {
-    _menu_update_port ff tcp
+    module_update_port_action ff tcp
 }
 
 module_ff_update_host_or_path() {
@@ -3758,12 +3771,12 @@ module_dispatch() {
         cforigin:uninstall) module_cforigin_uninstall ;;
         socks:uninstall) module_socks_uninstall ;;
         argo:update_port) module_argo_update_port ;;
-        ff:update_port) module_ff_update_port ;;
-        reality:update_port) module_reality_update_port ;;
-        vltcp:update_port) module_vltcp_update_port ;;
-        vlquic:update_port) module_vlquic_update_port ;;
+        ff:update_port) module_update_port_action ff tcp ;;
+        reality:update_port) module_update_port_action reality tcp ;;
+        vltcp:update_port) module_update_port_action vltcp tcp ;;
+        vlquic:update_port) module_update_port_action vlquic udp udp ;;
         cforigin:update_port) module_cforigin_update_port ;;
-        socks:update_port) module_socks_update_port ;;
+        socks:update_port) module_update_port_action socks tcp ;;
 
         # field/config update actions
         argo:update_protocol) module_argo_update_protocol ;;
