@@ -2196,8 +2196,13 @@ module_reality_disable() {
 }
 
 module_vltcp_enable() {
+    local _old_enabled
+    _old_enabled=$(printf '%s' "${_G_STATE}" | jq -c '.vltcp.enabled' 2>/dev/null) || return 1
     st_set '.vltcp.enabled = true' || return 1
-    _module_enable_commit "VLESS-TCP" || { st_set '.vltcp.enabled = false'; return 1; }
+    if ! _module_enable_commit "VLESS-TCP"; then
+        st_set ".vltcp.enabled = ${_old_enabled}" || true
+        return 1
+    fi
 }
 
 module_vltcp_disable() {
