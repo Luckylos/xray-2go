@@ -831,6 +831,37 @@ def test_runtime_show_actions_have_single_canonical_owner():
     assert_true("dispatcher_show=reality" in cp.stdout, "dispatcher must route show to canonical action")
 
 
+def test_runtime_argo_field_actions_have_single_canonical_owner():
+    from sandbox_runner import XraySandbox
+
+    with XraySandbox() as sandbox:
+        cp = subprocess.run(
+            [
+                "bash",
+                "-lc",
+                "source ./xray_2go.sh; "
+                "set -e; "
+                "module_argo_update_action() { printf 'argo_action=%s\\n' \"$1\"; }; "
+                "module_dispatch argo update_protocol; "
+                "module_dispatch argo update_auth_protocol; "
+                "module_dispatch argo update_trojan_password; "
+                "module_dispatch argo update_domain; "
+                "module_dispatch argo update_auth",
+            ],
+            cwd=ROOT,
+            env=sandbox.environment(),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=20,
+            check=False,
+        )
+
+    assert_true(cp.returncode == 0, f"Argo field dispatcher failed: {cp.stdout}")
+    for action in ["protocol", "auth_protocol", "trojan_password", "domain", "auth"]:
+        assert_true(f"argo_action={action}" in cp.stdout, f"Argo dispatcher must route {action} to canonical owner: {cp.stdout}")
+
+
 def test_runtime_enable_paths_no_longer_depend_on_removed_ask_helpers():
     out = run_bash("""
         source ./xray_2go.sh
@@ -1061,7 +1092,7 @@ def test_illegal_trojan_transport_state_does_not_lock_config_synthesis():
 
 
 def test_transport_switch_is_guarded_while_trojan_auth_is_active():
-    for fn in ["install_plan_argo_update_protocol", "module_argo_update_protocol"]:
+    for fn in ["install_plan_argo_update_protocol", "_module_argo_update_protocol_impl"]:
         m = re.search(rf"{fn}\(\) \{{(?P<body>.*?)\n\}}", TEXT, re.S)
         assert_true(m, f"{fn} function missing")
         body = m.group("body")

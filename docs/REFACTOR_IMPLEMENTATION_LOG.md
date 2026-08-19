@@ -287,3 +287,54 @@ bash: 行 1: module_show_action: 未找到命令
 - 状态：`completed-in-worktree`
 - 本切片未改变 CLI、状态格式、服务名称、生产默认路径、节点链接内容或 summary 格式；只改变 show action 的内部 ownership/routing。
 - 下一切片：Phase 1 Argo protocol/auth/domain/password 专用 action 统一；继续先写最小 RED，保留 Trojan WS-only 和失败回滚边界。
+
+## Phase 1 / Slice 5：Argo field action canonical owner
+
+### 范围
+
+- 切片：`phase1-slice5-argo-field-action-owner`
+- 目标：将 Argo runtime 的 `update_protocol`、`update_auth_protocol`、`update_trojan_password`、`update_domain`、`update_auth` 五个字段动作收敛到统一 `module_argo_update_action` owner。
+- 保留 `update_port` 专用实现；安装计划 helper 继续只修改 draft state，不与 runtime apply 混合。
+- 验收测试：`test_runtime_argo_field_actions_have_single_canonical_owner`
+
+### RED
+
+- 初始测试先要求 canonical owner 存在，旧代码按预期失败：
+
+```text
+bash: 行 1: module_argo_update_action: 未找到命令
+```
+
+- 将测试临时改为验证旧 dispatcher 时，首个旧 runtime 路由在 Argo 未启用状态下输出：
+
+```text
+[WARN] 请先选项 1 启用 Argo
+```
+
+这确认 dispatcher 仍直接绑定旧动作 owner，而不是统一路由；该 RED 证据已保留在本记录，最终回归测试只保留 GREEN 契约。
+
+### GREEN / REFACTOR / 验证
+
+- 将五个原 runtime 实现重命名为内部实现：
+  - `_module_argo_update_protocol_impl`
+  - `_module_argo_update_auth_protocol_impl`
+  - `_module_argo_update_trojan_password_impl`
+  - `_module_argo_update_domain_impl`
+  - `_module_argo_update_auth_impl`
+- 新增 `module_argo_update_action()` 按字段动作路由到上述唯一实现；未知字段显式失败。
+- 保留原有 `module_argo_update_*()` 函数作为兼容薄包装，直接委托 canonical owner，既不复制校验，也不绕过原 apply/rollback 逻辑。
+- `module_dispatch()` 的五个 Argo runtime 字段路由已直接调用 `module_argo_update_action`。
+- Trojan WS-only 守卫、独立密码校验、固定 Tunnel apply 失败回滚、域名失败回滚均保留在原内部实现中。
+- 更新静态 transport guard 测试，使其检查 canonical 内部实现，而不是过时的薄包装函数体。
+- 聚焦 GREEN：`test_runtime_argo_field_actions_have_single_canonical_owner` 通过，实际 sourced shell sandbox 验证五个 dispatcher action 均到达 canonical owner。
+- 完整 fresh-process 回归：`python3 tests/probe_regressions.py` 返回码 `0`，共 `84` 项 `PASS`。
+- `bash -n xray_2go.sh` 通过。
+- `python3 -m py_compile tests/probe_regressions.py tests/sandbox_runner.py tests/probe_matrix.py` 通过。
+- `git diff --check` 通过，测试缓存已清理。
+- 本切片仅执行 sandbox/stub 与静态测试，不启动 Xray、cloudflared、systemd/OpenRC，不修改宿主 `/etc/xray2go`、防火墙、`/etc/hosts` 或公网链路。
+
+### 切片结论
+
+- 状态：`completed-in-worktree`
+- 未改变 CLI、状态格式、服务名称、生产默认路径、安装计划语义、Trojan WS-only 约束或失败回滚行为；只收敛 Argo runtime 字段动作的 ownership/routing。
+- 下一切片：Phase 1 runtime restart/status 与跨 action 事务边界；继续先写最小 RED，不把真实服务启动作为本地验收。

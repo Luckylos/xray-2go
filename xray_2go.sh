@@ -2484,7 +2484,7 @@ module_argo_uninstall() {
     log_ok "Argo 已完全卸载"
 }
 
-module_argo_update_protocol() {
+_module_argo_update_protocol_impl() {
     local _en _proto _pp
     _en=$(st_get '.argo.enabled')
     _proto=$(st_get '.argo.protocol')
@@ -2510,7 +2510,7 @@ module_argo_update_protocol() {
     config_print_nodes
 }
 
-module_argo_update_auth_protocol() {
+_module_argo_update_auth_protocol_impl() {
     local _en _auth _pw
     _en=$(st_get '.argo.enabled')
     [ "${_en}" = "true" ] || { log_warn "请先启用 Argo"; return 1; }
@@ -2525,7 +2525,7 @@ module_argo_update_auth_protocol() {
     config_print_nodes
 }
 
-module_argo_update_trojan_password() {
+_module_argo_update_trojan_password_impl() {
     local _en _pw
     _en=$(st_get '.argo.enabled')
     [ "${_en}" = "true" ] || { log_warn "请先启用 Argo"; return 1; }
@@ -3240,7 +3240,7 @@ argo_apply_fixed_tunnel_from_state() {
     argo_check_health || true
 }
 
-module_argo_update_domain() {
+_module_argo_update_domain_impl() {
     local _domain _old_domain _old_domain_json
     [ "$(st_get '.argo.enabled')" = "true" ] || { log_warn "请先启用 Argo"; return 1; }
     _old_domain=$(st_get '.argo.domain')
@@ -3260,11 +3260,45 @@ module_argo_update_domain() {
     config_print_nodes
 }
 
-module_argo_update_auth() {
+_module_argo_update_auth_impl() {
     [ "$(st_get '.argo.enabled')" = "true" ] || { log_warn "请先启用 Argo"; return 1; }
     install_plan_argo_update_auth || return 1
     argo_apply_fixed_tunnel_from_state || return 1
     config_print_nodes
+}
+
+module_argo_update_action() {
+    case "${1:-}" in
+        protocol)         _module_argo_update_protocol_impl ;;
+        auth_protocol)    _module_argo_update_auth_protocol_impl ;;
+        trojan_password)  _module_argo_update_trojan_password_impl ;;
+        domain)           _module_argo_update_domain_impl ;;
+        auth)             _module_argo_update_auth_impl ;;
+        *)
+            log_error "未知 Argo 字段动作: ${1:-}"
+            return 1
+            ;;
+    esac
+}
+
+module_argo_update_protocol() {
+    module_argo_update_action protocol
+}
+
+module_argo_update_auth_protocol() {
+    module_argo_update_action auth_protocol
+}
+
+module_argo_update_trojan_password() {
+    module_argo_update_action trojan_password
+}
+
+module_argo_update_domain() {
+    module_argo_update_action domain
+}
+
+module_argo_update_auth() {
+    module_argo_update_action auth
 }
 
 argo_check_health() {
@@ -3794,11 +3828,11 @@ module_dispatch() {
         socks:update_port) module_update_port_action socks tcp ;;
 
         # field/config update actions
-        argo:update_protocol) module_argo_update_protocol ;;
-        argo:update_auth_protocol) module_argo_update_auth_protocol ;;
-        argo:update_trojan_password) module_argo_update_trojan_password ;;
-        argo:update_domain) module_argo_update_domain ;;
-        argo:update_auth) module_argo_update_auth ;;
+        argo:update_protocol) module_argo_update_action protocol ;;
+        argo:update_auth_protocol) module_argo_update_action auth_protocol ;;
+        argo:update_trojan_password) module_argo_update_action trojan_password ;;
+        argo:update_domain) module_argo_update_action domain ;;
+        argo:update_auth) module_argo_update_action auth ;;
         ff:update_mode) module_ff_update_mode ;;
         ff:update_host_or_path) module_ff_update_host_or_path ;;
         reality:update_transport) module_reality_update_transport ;;
