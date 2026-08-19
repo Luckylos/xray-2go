@@ -623,3 +623,40 @@ AssertionError: failed Reality enable must restore generated material and prior 
 - **fixed**：Reality enable 的 pre-commit 失败会恢复生成前完整内存 state，不再遗留新密钥和新 SID；失败码仍保留，已提交 state 不被覆盖。
 - **deferred**：`_module_enable_transaction` 当前只保证其负责的内存 state 快照边界；若 commit 内部已经部分写入 config/state/service/firewall 等 artifact，跨 artifact 恢复仍需 Phase 3 的统一 transaction/apply/rollback 设计和失败注入测试。
 - 下一切片：继续以最小 RED 覆盖下一个复杂 enable 路径的前置变更；不得把本切片宣称为完整事务回滚。
+
+## Phase 1 / Slice 13：CF Origin enable 前置默认值失败回滚
+
+### 范围
+
+- 切片：`phase1-slice13-cforigin-enable-precommit-state-rollback`
+- 目标：修复 CF Origin enable 在 commit 前补齐协议、path、listen 和 edge port 默认值、随后 commit 失败时只恢复 enabled 标志而遗留默认值的问题；本切片只覆盖 CF Origin 的 pre-commit 内存 state 边界，不扩展为跨 config/state/service/firewall 的统一事务。
+- 验收测试：`test_runtime_cforigin_enable_failure_restores_precommit_defaults`
+
+### RED
+
+- 新增 sourced-shell sandbox failure-injection 测试，预置 CF Origin 的多个可选字段为 `null` 并注入 `_module_enable_commit` 失败；旧实现真实失败：
+
+```text
+AssertionError: failed CF Origin enable must restore pre-commit defaults and prior state: rc=1 memory=false/ws//origin/::/443/old.example disk=false/null/null/null/null/old.example
+```
+
+- 失败链路已确认：`module_cforigin_enable()` 在进入 `_module_enable_with_state` 前依次补齐协议 `ws`、path `/origin`、listen `::` 和 edge port `443`；共享 helper 的快照从默认值已写入之后才开始，commit 失败时旧分支又只设置 `.cforigin.enabled = false`，导致内存 state 遗留默认值，而磁盘 state 仍保持旧提交值。
+
+### GREEN / REFACTOR / 验证
+
+- 新增 `_module_cforigin_enable_prepare()`，集中 CF Origin enable 的前置默认值和 `.cforigin.enabled = true` 状态修改。
+- `module_cforigin_enable()` 改为调用 `_module_enable_transaction "CF Origin" _module_cforigin_enable_prepare`，成功后继续执行原有 `cforigin_print_cloudflare_hint`；prepare 或 commit 失败时恢复调用前完整 `_G_STATE`，删除旧的局部 enabled-only 回滚。
+- 聚焦 GREEN：`test_runtime_cforigin_enable_failure_restores_precommit_defaults` 通过，确认返回码为 `1`，且内存与磁盘同时保持 `false/null/null/null/null/old.example`。
+- 完整 fresh-process 回归：探针矩阵返回码 `0`，共 `94` 项 `PASS`，`0` 项失败。
+- 最终探针矩阵：`static=47`、`safe=31`、`sandbox=16`、`total=94`。
+- `bash -n xray_2go.sh` 通过。
+- `python3 -m py_compile tests/probe_regressions.py tests/sandbox_runner.py tests/probe_matrix.py` 通过。
+- `git diff --check` 通过；测试缓存已清理。
+- 本切片只使用 sandbox/stub，未启动真实 Xray、cloudflared、systemd/OpenRC，未修改宿主 `/etc/xray2go`、防火墙、`/etc/hosts` 或公网链路。
+
+### 切片结论
+
+- 状态：`completed-in-worktree`
+- **fixed**：CF Origin enable 的 pre-commit 失败会恢复调用前完整内存 state，不再遗留自动补齐的协议、path、listen 和 edge port 默认值；失败码仍保留，已提交 state 不被覆盖。
+- **deferred**：`_module_enable_transaction` 当前只保证其负责的内存 state 快照边界；若 commit 内部已经部分写入 config/state/service/firewall 等 artifact，跨 artifact 恢复仍需 Phase 3 的统一 transaction/apply/rollback 设计和失败注入测试。
+- 下一切片：继续以最小 RED 覆盖其他 enable 路径或进入统一 transaction 设计；不得把本切片宣称为完整事务回滚。

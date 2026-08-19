@@ -2257,7 +2257,7 @@ module_socks_disable() {
     module_socks_action disable
 }
 
-module_cforigin_enable() {
+_module_cforigin_enable_prepare() {
     local _proto _path _listen _edge
     _proto=$(st_get '.cforigin.protocol')
     case "${_proto:-}" in ws|httpupgrade|xhttp) : ;; *) st_set '.cforigin.protocol = "ws"' || return 1 ;; esac
@@ -2267,7 +2267,11 @@ module_cforigin_enable() {
     [ -n "${_listen:-}" ] && [ "${_listen}" != "null" ] || st_set '.cforigin.listen = "::"' || return 1
     _edge=$(st_get '.cforigin.edge_port')
     [ -n "${_edge:-}" ] && [ "${_edge}" != "null" ] || st_set '.cforigin.edge_port = 443' || return 1
-    _module_enable_with_state '.cforigin.enabled = true' "CF Origin" || { st_set '.cforigin.enabled = false' || true; return 1; }
+    st_set '.cforigin.enabled = true' || return 1
+}
+
+module_cforigin_enable() {
+    _module_enable_transaction "CF Origin" _module_cforigin_enable_prepare || return 1
     cforigin_print_cloudflare_hint
 }
 

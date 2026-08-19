@@ -1720,6 +1720,56 @@ printf 'rc=%s memory=%s/%s/%s/%s disk=%s/%s/%s/%s\\n' \\
     )
 
 
+def test_runtime_cforigin_enable_failure_restores_precommit_defaults():
+    from sandbox_runner import XraySandbox
+
+    with XraySandbox() as sandbox:
+        cp = subprocess.run(
+            [
+                "bash",
+                "-lc",
+                """
+source ./xray_2go.sh
+mkdir -p "${WORK_DIR}"
+st_init >/dev/null 2>&1
+st_set '.cforigin.enabled = false | .cforigin.protocol = null | .cforigin.path = null | .cforigin.listen = null | .cforigin.edge_port = null | .cforigin.domain = "old.example"' >/dev/null
+st_persist >/dev/null 2>&1
+
+_module_enable_commit() { return 1; }
+module_cforigin_enable >/dev/null 2>&1
+_rc=$?
+printf 'rc=%s memory=%s/%s/%s/%s/%s/%s disk=%s/%s/%s/%s/%s/%s\\n' \\
+    "${_rc}" \\
+    "$(printf '%s' "${_G_STATE}" | jq -r '.cforigin.enabled')" \\
+    "$(printf '%s' "${_G_STATE}" | jq -r '.cforigin.protocol')" \\
+    "$(printf '%s' "${_G_STATE}" | jq -r '.cforigin.path')" \\
+    "$(printf '%s' "${_G_STATE}" | jq -r '.cforigin.listen')" \\
+    "$(printf '%s' "${_G_STATE}" | jq -r '.cforigin.edge_port')" \\
+    "$(printf '%s' "${_G_STATE}" | jq -r '.cforigin.domain')" \\
+    "$(jq -r '.cforigin.enabled' "${STATE_FILE}")" \\
+    "$(jq -r '.cforigin.protocol' "${STATE_FILE}")" \\
+    "$(jq -r '.cforigin.path' "${STATE_FILE}")" \\
+    "$(jq -r '.cforigin.listen' "${STATE_FILE}")" \\
+    "$(jq -r '.cforigin.edge_port' "${STATE_FILE}")" \\
+    "$(jq -r '.cforigin.domain' "${STATE_FILE}")"
+""",
+            ],
+            cwd=ROOT,
+            env=sandbox.environment(),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=20,
+            check=False,
+        )
+
+    assert_true(cp.returncode == 0, f"CF Origin enable rollback probe process failed: {cp.stdout}")
+    assert_true(
+        "rc=1 memory=false/null/null/null/null/old.example disk=false/null/null/null/null/old.example" in cp.stdout,
+        f"failed CF Origin enable must restore pre-commit defaults and prior state: {cp.stdout}",
+    )
+
+
 def test_readme_documents_trojan_argo_capability():
     assert_true("Trojan" in README_TEXT, "README must document the Trojan Argo capability")
     assert_true(
