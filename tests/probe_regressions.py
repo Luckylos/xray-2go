@@ -1353,6 +1353,120 @@ def test_stored_trojan_password_is_used_by_inbound_and_share_link():
     assert_true("link=trojan://Link.pass_9~x-y@" in out, f"stored Trojan password must drive the share link: {out}")
 
 
+def test_runtime_restart_status_actions_have_single_canonical_owner():
+    from sandbox_runner import XraySandbox
+
+    with XraySandbox() as sandbox:
+        cp = subprocess.run(
+            [
+                "bash",
+                "-lc",
+                """
+source ./xray_2go.sh
+
+declare -F module_restart_action >/dev/null || { echo 'missing_restart_owner'; exit 79; }
+declare -F module_status_action >/dev/null || { echo 'missing_status_owner'; exit 80; }
+
+module_restart_action() { printf 'restart=%s\\n' "$1"; }
+module_status_action() { printf 'status=%s\\n' "$1"; }
+
+module_dispatch ff restart
+module_dispatch argo restart
+check_xray
+check_argo
+""",
+            ],
+            cwd=ROOT,
+            env=sandbox.environment(),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=20,
+            check=False,
+        )
+
+    assert_true(cp.returncode == 0, f"restart/status canonical-owner RED/GREEN probe failed: {cp.stdout}")
+    assert_true("restart=xray" in cp.stdout, f"non-Argo restart must route to the canonical xray owner: {cp.stdout}")
+    assert_true("restart=argo" in cp.stdout, f"Argo restart must route to the canonical Argo owner: {cp.stdout}")
+    assert_true("status=xray" in cp.stdout, f"xray status must route to the canonical status owner: {cp.stdout}")
+    assert_true("status=argo" in cp.stdout, f"Argo status must route to the canonical status owner: {cp.stdout}")
+
+    for function_name, target in (
+        ("module_xray_restart", "xray"),
+        ("module_argo_restart", "argo"),
+        ("check_xray", "xray"),
+        ("check_argo", "argo"),
+    ):
+        match = re.search(
+            rf"^{re.escape(function_name)}\(\) \{{(?P<body>.*?)^\}}",
+            TEXT,
+            re.MULTILINE | re.DOTALL,
+        )
+        if match is None:
+            raise AssertionError(f"compatibility wrapper missing: {function_name}")
+        body = match.group("body")
+        owner = "module_restart_action" if function_name.startswith("module_") else "module_status_action"
+        assert_true(
+            f"{owner} {target}" in body,
+            f"{function_name} must delegate to {owner} {target}, not duplicate action logic",
+        )
+
+
+def test_runtime_restart_status_canonical_owner_preserves_failure_and_status_contract():
+    from sandbox_runner import XraySandbox
+
+    with XraySandbox() as sandbox:
+        cp = subprocess.run(
+            [
+                "bash",
+                "-lc",
+                """
+source ./xray_2go.sh
+mkdir -p "${WORK_DIR}"
+st_init >/dev/null 2>&1
+
+check_xray_install() { return 0; }
+svc_restart_xray() { return 1; }
+module_restart_action xray >/dev/null 2>&1
+printf 'xray_restart_rc=%s\\n' "$?"
+
+svc_exec_mut() { return 0; }
+svc_verify_health() { return 1; }
+module_restart_action argo >/dev/null 2>&1
+printf 'argo_restart_rc=%s\\n' "$?"
+
+svc_exec() { return 0; }
+_xray_status=$(module_status_action xray); _xray_status_rc=$?
+printf 'xray_status=%s xray_status_rc=%s\\n' "${_xray_status}" "${_xray_status_rc}"
+
+st_set '.argo.enabled = true' >/dev/null
+mkdir -p "$(dirname "${ARGO_BIN}")"
+touch "${ARGO_BIN}"
+_argo_status=$(module_status_action argo); _argo_status_rc=$?
+printf 'argo_status=%s argo_status_rc=%s\\n' "${_argo_status}" "${_argo_status_rc}"
+
+svc_exec() { return 1; }
+_stopped=$(module_status_action xray); _stopped_rc=$?
+printf 'stopped_status=%s stopped_status_rc=%s\\n' "${_stopped}" "${_stopped_rc}"
+""",
+            ],
+            cwd=ROOT,
+            env=sandbox.environment(),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=20,
+            check=False,
+        )
+
+    assert_true(cp.returncode == 0, f"canonical restart/status behavior probe failed: {cp.stdout}")
+    assert_true("xray_restart_rc=1" in cp.stdout, f"xray restart failure must propagate: {cp.stdout}")
+    assert_true("argo_restart_rc=1" in cp.stdout, f"Argo health failure must propagate: {cp.stdout}")
+    assert_true("xray_status=running xray_status_rc=0" in cp.stdout, f"xray running status contract changed: {cp.stdout}")
+    assert_true("argo_status=running argo_status_rc=0" in cp.stdout, f"Argo running status contract changed: {cp.stdout}")
+    assert_true("stopped_status=stopped stopped_status_rc=1" in cp.stdout, f"stopped status contract changed: {cp.stdout}")
+
+
 def test_readme_documents_trojan_argo_capability():
     assert_true("Trojan" in README_TEXT, "README must document the Trojan Argo capability")
     assert_true(

@@ -3751,14 +3751,59 @@ module_nodes_show() {
     return 1
 }
 
+module_restart_action() {
+    local _target="${1:-}"
+    case "${_target}" in
+        xray)
+            svc_restart_xray
+            ;;
+        argo)
+            svc_exec_mut restart "${_SVC_TUNNEL}" || {
+                log_error "${_SVC_TUNNEL} 重启失败"
+                return 1
+            }
+            log_ok "${_SVC_TUNNEL} 已重启"
+            svc_verify_health "${_SVC_TUNNEL}" 6 || {
+                log_error "${_SVC_TUNNEL} 健康检查失败"
+                return 1
+            }
+            ;;
+        *)
+            log_error "不支持的重启目标: ${_target}"
+            return 1
+            ;;
+    esac
+}
+
 module_xray_restart() {
-    svc_restart_xray || true
+    module_restart_action xray
 }
 
 module_argo_restart() {
-    svc_exec_mut restart "${_SVC_TUNNEL}" \
-        && { log_ok "${_SVC_TUNNEL} 已重启"; svc_verify_health "${_SVC_TUNNEL}" 6; } \
-        || log_error "${_SVC_TUNNEL} 重启失败"
+    module_restart_action argo
+}
+
+module_status_action() {
+    local _target="${1:-}"
+    case "${_target}" in
+        xray)
+            check_xray_install || { printf 'not installed'; return 2; }
+            svc_exec status "${_SVC_XRAY}" \
+                && { printf 'running'; return 0; } \
+                || { printf 'stopped'; return 1; }
+            ;;
+        argo)
+            [ "$(st_get '.argo.enabled')" = "true" ] || { printf 'disabled'; return 3; }
+            [ -f "${ARGO_BIN}" ] || { printf 'not installed'; return 2; }
+            svc_exec status "${_SVC_TUNNEL}" \
+                && { printf 'running'; return 0; } \
+                || { printf 'stopped'; return 1; }
+            ;;
+        *)
+            printf 'unknown'
+            return 1
+            ;;
+    esac
 }
 
 module_dispatch() {
@@ -3781,12 +3826,12 @@ module_dispatch() {
         socks:menu)    unified_menu_socks runtime ;;
 
         # shared runtime actions
-        argo:restart) module_argo_restart ;;
-        ff:restart) module_xray_restart ;;
-        reality:restart) module_xray_restart ;;
-        vltcp:restart) module_xray_restart ;;
-        vlquic:restart) module_xray_restart ;;
-        cforigin:restart) module_xray_restart ;;
+        argo:restart) module_restart_action argo ;;
+        ff:restart) module_restart_action xray ;;
+        reality:restart) module_restart_action xray ;;
+        vltcp:restart) module_restart_action xray ;;
+        vlquic:restart) module_restart_action xray ;;
+        cforigin:restart) module_restart_action xray ;;
         argo:show) module_show_action argo ;;
         ff:show) module_show_action ff ;;
         reality:show) module_show_action reality ;;
@@ -3919,7 +3964,10 @@ _menu_toggle_xpad() {
 }
 
 _xray_runtime_status() {
-    svc_exec status "${_SVC_XRAY}" >/dev/null 2>&1 && printf 'running' || printf 'stopped'
+    local _rc
+    module_status_action xray >/dev/null
+    _rc=$?
+    [ "${_rc}" -eq 0 ] && printf 'running' || printf 'stopped'
 }
 
 _menu_print_module_status() {
@@ -3958,10 +4006,7 @@ check_xray_install() {
 }
 
 check_xray() {
-    check_xray_install || { printf 'not installed'; return 2; }
-    svc_exec status "${_SVC_XRAY}" \
-        && { printf 'running'; return 0; } \
-        || { printf 'stopped'; return 1; }
+    module_status_action xray
 }
 
 _manage_module_entry_check() {
@@ -3973,11 +4018,7 @@ _module_action_or_continue() {
 }
 
 check_argo() {
-    [ "$(st_get '.argo.enabled')" = "true" ] || { printf 'disabled'; return 3; }
-    [ -f "${ARGO_BIN}" ]                      || { printf 'not installed'; return 2; }
-    svc_exec status "${_SVC_TUNNEL}" \
-        && { printf 'running'; return 0; } \
-        || { printf 'stopped'; return 1; }
+    module_status_action argo
 }
 
 # ── Argo 管理 ─────────────────────────────────────────────────────────────────

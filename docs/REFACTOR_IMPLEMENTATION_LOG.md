@@ -338,3 +338,52 @@ bash: 行 1: module_argo_update_action: 未找到命令
 - 状态：`completed-in-worktree`
 - 未改变 CLI、状态格式、服务名称、生产默认路径、安装计划语义、Trojan WS-only 约束或失败回滚行为；只收敛 Argo runtime 字段动作的 ownership/routing。
 - 下一切片：Phase 1 runtime restart/status 与跨 action 事务边界；继续先写最小 RED，不把真实服务启动作为本地验收。
+
+## Phase 1 / Slice 6：runtime restart/status canonical owner
+
+### 范围
+
+- 切片：`phase1-slice6-restart-status-action-owner`
+- 目标：将 runtime restart 与服务状态查询收敛到明确的 canonical owner，dispatcher 只负责 restart 路由，兼容函数不再复制动作逻辑。
+- 验收测试：
+  - `test_runtime_restart_status_actions_have_single_canonical_owner`
+  - `test_runtime_restart_status_canonical_owner_preserves_failure_and_status_contract`
+
+### RED
+
+- 首次执行新增聚焦测试时，旧脚本按预期缺少 canonical owner；探针首先报告 restart owner 缺失：
+
+```text
+Traceback (most recent call last):
+  ...
+AssertionError: restart/status canonical-owner RED/GREEN probe failed: missing_restart_owner
+```
+
+- RED 发生在实际 sourced shell 的 sandbox 进程中，失败原因是 `module_restart_action` 尚未存在，而不是 Python 编译、测试导入或宿主路径错误。
+
+### GREEN / REFACTOR / 验证
+
+- 新增 `module_restart_action()`：
+  - `xray` 委托既有 `svc_restart_xray`，保留配置文件、service unit、daemon reload、restart 与 health check 顺序；
+  - `argo` 统一执行 `tunnel2go` restart 和 `svc_verify_health`；restart 或健康检查失败均返回非零并输出失败日志；
+  - 非法目标 fail-closed。
+- 新增 `module_status_action()`，统一承载 `xray` 与 `argo` 的状态文本和返回码：`running`、`stopped`、`not installed`、`disabled` 及既有错误码均保留。
+- `module_xray_restart()`、`module_argo_restart()`、`check_xray()`、`check_argo()` 保留为兼容薄包装，仅委托 canonical owner；`_xray_runtime_status()` 也改为通过统一状态 owner 查询。
+- `module_dispatch()` 的 Argo restart 及其他模块共享的 Xray restart 路由直接调用 `module_restart_action`，不再经过旧 restart wrapper。
+- 聚焦 GREEN：
+  - sourced shell sandbox 验证 dispatcher 的 Argo/Xray restart 路由与 status wrapper 路由；
+  - 验证 wrapper 不复制业务逻辑；
+  - 使用 stubbed service boundary 验证 Xray restart 失败、Argo health 失败均 fail-closed；
+  - 验证 running/stopped 状态文本与返回码契约。
+- 完整 fresh-process 回归：`python3 tests/probe_regressions.py` 返回码 `0`，共 `87` 项 `PASS`。
+- `bash -n xray_2go.sh` 通过。
+- `python3 -m py_compile tests/probe_regressions.py tests/sandbox_runner.py tests/probe_matrix.py` 通过。
+- `git diff --check` 通过；测试缓存在最终清理阶段删除。
+- 本切片只使用 sandbox/stub 和静态源码断言，不启动 Xray、cloudflared、systemd/OpenRC，不修改宿主 `/etc/xray2go`、防火墙、`/etc/hosts` 或公网链路。
+
+### 切片结论
+
+- 状态：`completed-in-worktree`
+- 未改变 CLI、状态格式、服务名称、生产默认路径、安装计划语义、协议行为或节点输出；只收敛 runtime restart/status 的内部 ownership/routing，并修复 `module_xray_restart()` 吞掉 restart 失败码的边界。
+- 真实服务生命周期、systemd/OpenRC 和公网 Tunnel 仍未在宿主上验收，符合当前安全边界；后续需要在隔离 runtime fixture 中继续覆盖事务失败与跨 action rollback。
+- 下一切片：Phase 1 失败路径与状态回滚；继续先写最小 RED。
