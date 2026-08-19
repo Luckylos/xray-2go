@@ -699,6 +699,12 @@ _st_normalize_schema() {
     case "${_c:-}" in vless|trojan) : ;; *) st_set '.argo.auth_protocol = "vless"' ;; esac
     _c=$(st_get '.argo.trojan_password')
     { [ -z "${_c:-}" ] || [ "${_c}" = "null" ]; } && st_set '.argo.trojan_password = ""'
+    # Trojan Argo 仅支持 WS：修复非法组合，避免 inbound fail-closed 锁死 config_apply
+    if [ "$(st_get '.argo.auth_protocol')" = "trojan" ] \
+       && [ "$(st_get '.argo.protocol')" != "ws" ]; then
+        log_warn "检测到非法组合 (Trojan + 非 WS)，已将 Argo 入站认证回落为 VLESS"
+        st_set '.argo.auth_protocol = "vless"'
+    fi
     _c=$(st_get '.ff.host')
     { [ -z "${_c:-}" ] || [ "${_c}" = "null" ]; } && st_set '.ff.host = ""'
     # 规范化 xPadding 开关结构。
@@ -2402,7 +2408,7 @@ module_argo_uninstall() {
     fi
     rm -f "${ARGO_BIN}" "${WORK_DIR}/tunnel.yml" \
           "${WORK_DIR}/tunnel.json" "${_ARGO_ENV_FILE}" 2>/dev/null || true
-    st_set '.argo.enabled = false | .argo.domain = null | .argo.token = null | .argo.cred_b64 = null | .argo.mode = "fixed"' || true
+    st_set '.argo.enabled = false | .argo.domain = null | .argo.token = null | .argo.cred_b64 = null | .argo.mode = "fixed" | .argo.protocol = "ws" | .argo.auth_protocol = "vless" | .argo.trojan_password = ""' || true
     _module_disable_commit Argo || return 1
     log_ok "Argo 已完全卸载"
 }
@@ -2417,21 +2423,33 @@ module_argo_update_protocol() {
     printf "  ${C_GRN}2.${C_RST} XHTTP\n"
     prompt "协议 (回车维持 ${_proto}): " _pp
     case "${_pp:-}" in
-        2) st_set '.argo.protocol = "xhttp"' ;;
+        2)
+            [ "$(st_get '.argo.auth_protocol')" = "trojan" ] && {
+                log_error "当前入站认证为 Trojan，仅支持 WS；请先将入站认证改回 VLESS"; return 1; }
+            st_set '.argo.protocol = "xhttp"' ;;
         1) st_set '.argo.protocol = "ws"' ;;
         '') : ;;
         *) log_error "无效选项，请按提示输入"; return 1 ;;
     esac
-    argo_apply_fixed_tunnel_from_state || { log_error "固定隧道同步失败"; return 1; }
+    argo_apply_fixed_tunnel_from_state || {
+        st_set '.argo.protocol = $v' --arg v "${_proto}" || true
+        log_error "固定隧道同步失败，已回滚传输协议为 ${_proto}"
+        return 1
+    }
     config_print_nodes
 }
 
 module_argo_update_auth_protocol() {
-    local _en
+    local _en _auth
     _en=$(st_get '.argo.enabled')
     [ "${_en}" = "true" ] || { log_warn "请先启用 Argo"; return 1; }
+    _auth=$(st_get '.argo.auth_protocol')
     install_plan_argo_update_auth_protocol || return 1
-    argo_apply_fixed_tunnel_from_state || { log_error "固定隧道同步失败"; return 1; }
+    argo_apply_fixed_tunnel_from_state || {
+        st_set '.argo.auth_protocol = $v' --arg v "${_auth}" || true
+        log_error "固定隧道同步失败，已回滚入站认证为 ${_auth}"
+        return 1
+    }
     config_print_nodes
 }
 module_ff_update_mode() {
@@ -4045,7 +4063,7 @@ install_plan_render_summary() {
 
 install_plan_argo_toggle() {
     if [ "$(st_get '.argo.enabled')" = "true" ]; then
-        st_set '.argo.enabled = false | .argo.domain = null | .argo.token = null | .argo.cred_b64 = null | .argo.mode = "fixed"' || return 1
+        st_set '.argo.enabled = false | .argo.domain = null | .argo.token = null | .argo.cred_b64 = null | .argo.mode = "fixed" | .argo.protocol = "ws" | .argo.auth_protocol = "vless" | .argo.trojan_password = ""' || return 1
         log_ok "Argo 已禁用"
     else
         st_set '.argo.enabled = true' || return 1
@@ -4081,7 +4099,10 @@ install_plan_argo_update_protocol() {
     local _c
     prompt "请选择 (1-2，回车默认1): " _c
     case "${_c:-1}" in
-        2) st_set '.argo.protocol = "xhttp"' || return 1 ;;
+        2)
+            [ "$(st_get '.argo.auth_protocol')" = "trojan" ] && {
+                log_error "当前入站认证为 Trojan，仅支持 WS；请先将入站认证改回 VLESS"; return 1; }
+            st_set '.argo.protocol = "xhttp"' || return 1 ;;
         *) st_set '.argo.protocol = "ws"' || return 1 ;;
     esac
     log_ok "Argo 协议已设置为: $(st_get '.argo.protocol')"

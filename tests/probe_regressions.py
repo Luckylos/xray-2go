@@ -653,6 +653,62 @@ def test_state_normalizes_missing_trojan_password_field():
     assert_true(cp.returncode == 0, "schema normalization must add a missing Trojan password field")
 
 
+def test_state_self_heals_illegal_trojan_transport_combination():
+    cp = run_bash_result("""
+        source ./xray_2go.sh
+        _G_STATE='{"uuid":"56b6d850-1e42-48ef-8229-94f5d8292e54","argo":{"enabled":true,"protocol":"xhttp","auth_protocol":"trojan","trojan_password":""}}'
+        _st_normalize_schema >/dev/null 2>&1
+        printf '%s' "${_G_STATE}" | jq -e '.argo.auth_protocol == "vless"' >/dev/null
+    """)
+    assert_true(cp.returncode == 0, "normalization must heal Trojan with non-WS transport back to VLESS")
+
+
+def test_illegal_trojan_transport_state_does_not_lock_config_synthesis():
+    cp = run_bash_result("""
+        source ./xray_2go.sh
+        _G_STATE='{"uuid":"56b6d850-1e42-48ef-8229-94f5d8292e54","argo":{"enabled":true,"protocol":"xhttp","auth_protocol":"trojan","trojan_password":""}}'
+        _st_normalize_schema >/dev/null 2>&1
+        plugin_install_builtins >/dev/null 2>&1
+        plugin_load_all >/dev/null 2>&1
+        config_synthesize >/dev/null 2>&1
+    """)
+    assert_true(cp.returncode == 0, "healed state must not leave config synthesis fail-closed")
+
+
+def test_transport_switch_is_guarded_while_trojan_auth_is_active():
+    for fn in ["install_plan_argo_update_protocol", "module_argo_update_protocol"]:
+        m = re.search(rf"{fn}\(\) \{{(?P<body>.*?)\n\}}", TEXT, re.S)
+        assert_true(m, f"{fn} function missing")
+        body = m.group("body")
+        assert_true(
+            "auth_protocol" in body and "trojan" in body,
+            f"{fn} must refuse switching transport away from WS while Trojan auth is active",
+        )
+
+
+def test_runtime_argo_updates_roll_back_in_memory_state_on_apply_failure():
+    for fn, field in [
+        ("module_argo_update_protocol", ".argo.protocol"),
+        ("module_argo_update_auth_protocol", ".argo.auth_protocol"),
+    ]:
+        m = re.search(rf"{fn}\(\) \{{(?P<body>.*?)\n\}}", TEXT, re.S)
+        assert_true(m, f"{fn} function missing")
+        body = m.group("body")
+        assert_true(
+            f"st_set '{field} = $v'" in body,
+            f"{fn} must roll back {field} when tunnel apply fails",
+        )
+
+
+def test_argo_disable_and_uninstall_reset_authentication_state():
+    for fn in ["module_argo_uninstall", "install_plan_argo_toggle"]:
+        m = re.search(rf"{fn}\(\) \{{(?P<body>.*?)\n\}}", TEXT, re.S)
+        assert_true(m, f"{fn} function missing")
+        body = m.group("body")
+        assert_true('.argo.auth_protocol = "vless"' in body, f"{fn} must reset Argo auth protocol")
+        assert_true('.argo.protocol = "ws"' in body, f"{fn} must reset Argo transport protocol")
+
+
 def main():
     tests = [v for k, v in globals().items() if k.startswith("test_")]
     for test in tests:
