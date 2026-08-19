@@ -765,3 +765,42 @@ AssertionError: Argo enable must verify Tunnel health after start
 - **fixed**：模块 disable/uninstall 的 pre-mutation 已进入统一事务；Argo health failure、跨 artifact failure、SIGINT 和并发互斥均有 sandbox/fresh-process 证据。
 - **deferred**：真实 init/service 行为、真实 cloudflared/Tunnel 健康和公网互通仍未验收；继续保持隔离，不以宿主运行态替代验证。
 - 下一切片：`phase3-slice1-finalize`，复核最终 diff、清理临时物、提交本切片，并保留上述真实环境边界为后续独立验收项。
+
+## Phase 3 / Slice 1 Argo lifecycle follow-up：安装与重启健康边界
+
+### 范围
+
+- 切片：`phase3-slice1-argo`
+- 目标：补齐 Argo Tunnel 安装启动与 runtime restart 的 service 生命周期、健康检查和失败回滚；验证必须通过真实 sourced shell + sandbox，而不是只做静态 owner 检查。
+- 保持边界：继续使用 `X2G_TEST_MODE=1`、绝对 `X2G_TEST_ROOT`、`XraySandbox` 及 service/config/firewall stub；不启动真实 Xray、cloudflared、systemd/OpenRC 或公网 Tunnel。
+
+### RED
+
+- `test_argo_install_tunnel_failure_rolls_back_before_state_commit` 在旧实现中观察到：
+
+```text
+svc-call=tunnel2go max=0 mode=optional
+state-persist-called
+install-rc=0
+```
+
+- 该路径会吞掉 Argo Tunnel 启动失败，继续持久化 state 并报告安装成功，违反健康验证完成后再提交的事务顺序。
+- `test_argo_restart_health_failure_restores_service_lifecycle` 在旧实现中观察到：
+
+```text
+rc=1 active=0 enabled=1
+```
+
+- Argo restart 健康检查失败虽然返回非零，但没有恢复重启已改变的 service active 状态，留下服务生命周期漂移。
+
+### GREEN / 验证
+
+- Argo 安装现在使用 `svc_enable_start_verify "${_SVC_TUNNEL}" 6 required`；启动或健康检查失败时停止 Tunnel、调用既有 `_install_rollback`，并在 `st_persist` 前返回非零。
+- Argo runtime restart 抽出 `_module_argo_restart_inner`，由 canonical `module_restart_action argo` 通过 `_transaction_run` 执行；restart 或健康检查失败时恢复事务前 service active/enabled 状态。
+- 新增测试均通过真实 sourced shell 和临时 sandbox 执行；未依赖宿主服务状态。
+- 最新完整 fresh-process 回归、语法、Python 编译和 diff 检查结果以本切片最终验证命令为准。
+
+### 切片结论
+
+- **fixed**：Argo 安装 Tunnel 启动/健康失败不再伪成功；Argo restart 健康失败不再留下 service active/enabled 漂移；相关失败边界有隔离运行态证据。
+- **deferred**：真实 init/service 行为、真实 cloudflared/Tunnel 健康和公网互通仍未验收；继续保持隔离，不以宿主运行态替代验证。

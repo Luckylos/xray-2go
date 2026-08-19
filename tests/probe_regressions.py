@@ -378,11 +378,99 @@ def test_install_service_and_firewall_fail_closed_status():
     helper_body = TEXT[TEXT.index('svc_enable_start_verify()'):TEXT.index('# ==============================================================================', TEXT.index('svc_enable_start_verify()'))]
     assert_true('fw_reconcile || { _install_rollback' in install_body, "install must rollback/fail when firewall reconcile fails")
     assert_true('svc_enable_start_verify "${_SVC_XRAY}" 8 required' in install_body, "xray install start path should use shared verified start helper")
-    assert_true('svc_enable_start_verify "${_SVC_TUNNEL}" 0 optional' in install_body, "tunnel install start path should use shared optional start helper")
+    assert_true('svc_enable_start_verify "${_SVC_TUNNEL}" 6 required' in install_body, "Argo install must require verified Tunnel startup")
     assert_true('svc_exec_mut enable "${_svc}"' in helper_body and 'svc_exec_mut start  "${_svc}"' in helper_body, "service helper must centralize enable/start")
     assert_true('svc_verify_health "${_svc}" "${_max}"' in helper_body, "service helper must verify health when max wait > 0")
     assert_true('log_ok "${_svc} 已启动"' in helper_body, "service helper success message missing")
     assert_true('log_warn "${_svc} 启动失败' in helper_body, "optional service start failure warning missing")
+
+
+def test_argo_install_tunnel_failure_rolls_back_before_state_commit():
+    cp = run_bash_result("""
+        source ./xray_2go.sh
+        _G_STATE="${_STATE_DEFAULT}"
+        _st_normalize_schema >/dev/null
+        st_set '.argo.enabled = true' >/dev/null
+        clear() { :; }
+        platform_preflight() { :; }
+        plugin_refresh_runtime() { :; }
+        _install_detect_existing_xray() { return 1; }
+        _install_check_port_conflicts() { :; }
+        download_xray() { :; }
+        download_cloudflared() { :; }
+        config_apply() { :; }
+        svc_apply_xray() { :; }
+        svc_apply_tunnel() { :; }
+        svc_reload_daemon() { :; }
+        is_openrc() { return 1; }
+        platform_fix_time_sync() { :; }
+        fw_reconcile() { :; }
+        _install_rollback() { printf 'install-rollback-called\\n'; return 0; }
+        svc_enable_start_verify() {
+            printf 'svc-call=%s max=%s mode=%s\\n' "$1" "$2" "$3"
+            [ "$1" = "${_SVC_TUNNEL}" ] && return 1
+            return 0
+        }
+        st_persist() { printf 'state-persist-called\\n'; return 0; }
+        module_xray_install_core
+        rc=$?
+        printf 'install-rc=%s enabled=%s\\n' "$rc" "$(st_get '.argo.enabled')"
+        exit 0
+    """)
+    assert_true(cp.returncode == 0, f"Argo install failure probe process failed: {cp.stdout}")
+    assert_true("svc-call=tunnel2go max=6 mode=required" in cp.stdout, f"Argo install must use required Tunnel health verification: {cp.stdout}")
+    assert_true("install-rollback-called" in cp.stdout, f"Tunnel failure must trigger install rollback: {cp.stdout}")
+    assert_true("install-rc=1" in cp.stdout and "state-persist-called" not in cp.stdout, f"Tunnel failure must fail before state persistence: {cp.stdout}")
+
+
+def test_argo_restart_health_failure_restores_service_lifecycle():
+    from sandbox_runner import XraySandbox
+
+    with XraySandbox() as sandbox:
+        cp = subprocess.run(
+            [
+                "bash",
+                "-lc",
+                """
+source ./xray_2go.sh
+mkdir -p "${WORK_DIR}"
+st_init >/dev/null 2>&1
+st_set '.argo.enabled = true' >/dev/null
+st_persist >/dev/null 2>&1
+_SERVICE_ACTIVE=1
+_SERVICE_ENABLED=1
+svc_exec() { [ "$1" = status ] && [ "${_SERVICE_ACTIVE}" = 1 ]; }
+svc_is_enabled() { [ "${_SERVICE_ENABLED}" = 1 ]; }
+svc_exec_mut() {
+    case "$1" in
+        restart) _SERVICE_ACTIVE=0; return 0 ;;
+        start) _SERVICE_ACTIVE=1; return 0 ;;
+        stop) _SERVICE_ACTIVE=0; return 0 ;;
+        enable) _SERVICE_ENABLED=1; return 0 ;;
+        disable) _SERVICE_ENABLED=0; return 0 ;;
+    esac
+    return 1
+}
+svc_verify_health() { printf 'argo-health-called\\n'; return 1; }
+module_argo_restart >/dev/null 2>&1
+_rc=$?
+printf 'rc=%s active=%s enabled=%s\\n' "${_rc}" "${_SERVICE_ACTIVE}" "${_SERVICE_ENABLED}"
+""",
+            ],
+            cwd=ROOT,
+            env=sandbox.environment(),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=20,
+            check=False,
+        )
+
+    assert_true(cp.returncode == 0, f"Argo restart rollback probe process failed: {cp.stdout}")
+    assert_true(
+        "rc=1 active=1 enabled=1" in cp.stdout,
+        f"Argo restart health failure must restore service lifecycle state: {cp.stdout}",
+    )
 
 
 def test_menu_status_and_commit_helpers_are_shared():

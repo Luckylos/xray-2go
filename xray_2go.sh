@@ -3865,7 +3865,12 @@ module_xray_install_core() {
     fi
 
     if [ "$(st_get '.argo.enabled')" = "true" ]; then
-        svc_enable_start_verify "${_SVC_TUNNEL}" 0 optional
+        if ! svc_enable_start_verify "${_SVC_TUNNEL}" 6 required; then
+            log_error "${_SVC_TUNNEL} 未正常运行，回滚"
+            svc_exec_mut stop "${_SVC_TUNNEL}" 2>/dev/null || true
+            _install_rollback "${_xray_was}" "${_argo_was}"
+            return 1
+        fi
     fi
 
     log_info "网络调优未内置执行：为避免运行未签名第三方 root 脚本，请按需参考可信来源手动配置。"
@@ -4029,6 +4034,18 @@ module_nodes_show() {
     return 1
 }
 
+_module_argo_restart_inner() {
+    svc_exec_mut restart "${_SVC_TUNNEL}" || {
+        log_error "${_SVC_TUNNEL} 重启失败"
+        return 1
+    }
+    log_ok "${_SVC_TUNNEL} 已重启"
+    svc_verify_health "${_SVC_TUNNEL}" 6 || {
+        log_error "${_SVC_TUNNEL} 健康检查失败"
+        return 1
+    }
+}
+
 module_restart_action() {
     local _target="${1:-}"
     case "${_target}" in
@@ -4036,15 +4053,7 @@ module_restart_action() {
             svc_restart_xray
             ;;
         argo)
-            svc_exec_mut restart "${_SVC_TUNNEL}" || {
-                log_error "${_SVC_TUNNEL} 重启失败"
-                return 1
-            }
-            log_ok "${_SVC_TUNNEL} 已重启"
-            svc_verify_health "${_SVC_TUNNEL}" 6 || {
-                log_error "${_SVC_TUNNEL} 健康检查失败"
-                return 1
-            }
+            _transaction_run "Argo 重启" _module_argo_restart_inner
             ;;
         *)
             log_error "不支持的重启目标: ${_target}"
