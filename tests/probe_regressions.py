@@ -494,7 +494,11 @@ def test_single_file_module_transaction_helpers():
         assert_true('_module_action_or_continue' in body or '_unified_runtime_toggle' in body, f"{body_name} live actions should route through shared dispatcher/toggle helpers")
     assert_true('_module_apply_if_enabled "${_en}"' in TEXT, "enabled-only config updates should use shared apply helper")
     assert_true('_module_persist_after_optional_apply()' in TEXT, "enabled-only update persistence should use shared optional-apply commit helper")
-    for fn in ['module_reality_update_transport()', 'module_vltcp_update_listen()', 'module_vlquic_update_listen()', 'module_cforigin_update_protocol()', 'module_cforigin_update_path()', 'module_cforigin_update_listen()', 'module_socks_update_user()', 'module_socks_update_pass()', 'module_cforigin_update_domain()']:
+    for proto in ['socks', 'vltcp', 'vlquic']:
+        assert_true(f'module_update_listen_action {proto}' in TEXT, f'{proto} listen wrapper/dispatcher should delegate to canonical action')
+    canonical_body = TEXT[TEXT.index('module_update_listen_action()'):TEXT.index('\n}\n', TEXT.index('module_update_listen_action()'))]
+    assert_true('_module_persist_after_optional_apply "${_en}"' in canonical_body, "canonical listen action should use shared optional-apply commit helper")
+    for fn in ['module_reality_update_transport()', 'module_cforigin_update_protocol()', 'module_cforigin_update_path()', 'module_cforigin_update_listen()', 'module_socks_update_user()', 'module_socks_update_pass()', 'module_cforigin_update_domain()']:
         body = TEXT[TEXT.index(fn):TEXT.index('\n}\n', TEXT.index(fn))]
         assert_true('_module_persist_after_optional_apply "${_en}"' in body, f"{fn} should use shared optional-apply commit helper")
 
@@ -761,6 +765,40 @@ def test_runtime_port_actions_have_single_canonical_owner():
     assert_true(cp.returncode == 0, f"canonical runtime port action failed: {cp.stdout}")
     assert_true("reality=2443" in cp.stdout, "canonical port action must update the requested port")
     assert_true("dispatcher_port=vltcp/tcp" in cp.stdout, "dispatcher must route update_port to canonical action")
+
+
+def test_runtime_listen_actions_have_single_canonical_owner():
+    from sandbox_runner import XraySandbox
+
+    with XraySandbox() as sandbox:
+        cp = subprocess.run(
+            [
+                "bash",
+                "-lc",
+                "source ./xray_2go.sh; "
+                "set -e; "
+                "mkdir -p \"${WORK_DIR}\"; "
+                "st_init; "
+                "config_apply() { :; }; "
+                "st_persist() { :; }; "
+                "prompt() { printf -v \"$2\" '%s' 127.0.0.1; }; "
+                "module_update_listen_action vltcp; "
+                "printf 'vltcp=%s\\n' \"$(st_get '.vltcp.listen')\"; "
+                "module_update_listen_action() { printf 'dispatcher_listen=%s\\n' \"$1\"; }; "
+                "module_dispatch socks update_listen",
+            ],
+            cwd=ROOT,
+            env=sandbox.environment(),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=20,
+            check=False,
+        )
+
+    assert_true(cp.returncode == 0, f"canonical runtime listen action failed: {cp.stdout}")
+    assert_true("vltcp=127.0.0.1" in cp.stdout, "canonical listen action must update the requested address")
+    assert_true("dispatcher_listen=socks" in cp.stdout, "dispatcher must route update_listen to canonical action")
 
 
 def test_runtime_enable_paths_no_longer_depend_on_removed_ask_helpers():

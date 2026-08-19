@@ -212,3 +212,42 @@ bash: 行 1: module_update_port_action: 未找到命令
 - 状态：`completed-in-worktree`
 - 本切片未改变 CLI、状态格式、服务名称、生产默认路径或协议行为；只改变 runtime 同构端口 action 的内部 ownership/routing。
 - 下一切片：Phase 1 `listen/path` action；继续先写一个最小 RED，若发现不同模块的输入/提交语义不一致则拆成独立 BDD 场景，不强行泛化。
+
+## Phase 1 / Slice 3：同构 runtime update_listen canonical owner
+
+### 范围
+
+- 切片：`phase1-slice3-update-listen-action-owner`
+- 目标：将 VLESS-TCP、VLESS-XHTTP-H3 和 SOCKS5 的同构 runtime `update_listen` 路径收敛到一个 canonical action；保留 CF Origin 的专用监听提示与 `update_path` owner。
+- 验收测试：`test_runtime_listen_actions_have_single_canonical_owner`
+
+### RED
+
+- 新增测试后首次执行失败，原因是生产脚本没有统一监听地址 action：
+
+```text
+[INFO] 状态已初始化
+bash: 行 1: module_update_listen_action: 未找到命令
+```
+
+- 失败来自实际 sourced shell 的 sandbox runtime 调用，而非静态字符串检查。
+
+### GREEN / REFACTOR / 验证
+
+- 新增 `module_update_listen_action()`，只接受 `socks|vltcp|vlquic`，统一完成监听地址输入、`val_listen_addr` 校验、state 更新、可选配置应用/持久化和节点输出。
+- 保留 `module_socks_update_listen()`、`module_vltcp_update_listen()`、`module_vlquic_update_listen()` 作为薄包装；`module_dispatch()` 对三个 `update_listen` 动作直接路由到 canonical owner。
+- GREEN 过程中发现并修复一个真实返回码边界：模块未启用时条件式节点输出会返回 `1`，在 `set -e` fresh shell 中把成功更新误报为失败；canonical action 现在显式 `return 0`。
+- 更新事务静态测试，使共享提交断言落在 canonical owner，专用 CF Origin action 仍单独验证。
+- 聚焦 GREEN：`test_runtime_listen_actions_have_single_canonical_owner` 通过，实际验证 VLESS-TCP 地址更新和 SOCKS dispatcher 路由。
+- 完整 fresh-process 回归：`python3 tests/probe_regressions.py` 返回码 `0`，共 `82` 项 `PASS`。
+- `bash -n xray_2go.sh` 通过。
+- `python3 -m py_compile tests/probe_regressions.py tests/sandbox_runner.py tests/probe_matrix.py` 通过。
+- `git diff --check` 通过，测试缓存已清理。
+- 本切片测试使用 sandbox/stub，不启动 Xray、cloudflared、systemd/OpenRC，不修改宿主 `/etc/xray2go`、防火墙、`/etc/hosts` 或公网链路。
+
+### 切片结论
+
+- 状态：`completed-in-worktree`
+- 本切片未改变 CLI、状态格式、服务名称、生产默认路径或协议行为；只改变 runtime 同构监听地址 action 的内部 ownership/routing。
+- `cforigin:update_listen`、`cforigin:update_path` 保持专用 owner，未被不安全地纳入通用 action。
+- 下一切片：Phase 1 `show/summary` action；仍需先写最小 RED。

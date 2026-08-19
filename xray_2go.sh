@@ -2133,6 +2133,28 @@ module_update_port_action() {
     esac
 }
 
+module_update_listen_action() {
+    local _proto="${1:-}" _en _l _label
+    case "${_proto}" in
+        socks)  _label="SOCKS5" ;;
+        vltcp)  _label="VLESS-TCP" ;;
+        vlquic) _label="VLESS-XHTTP-H3" ;;
+        *)
+            log_error "不支持统一监听地址更新的模块: ${_proto}"
+            return 1
+            ;;
+    esac
+    _en=$(st_get ".${_proto}.enabled")
+    prompt "新监听地址（0.0.0.0=所有，127.0.0.1=仅本地）: " _l
+    [ -n "${_l:-}" ] || return 0
+    _l=$(val_listen_addr "${_l}") || return 1
+    st_set ".${_proto}.listen = \$l" --arg l "${_l}" || return 1
+    _module_persist_after_optional_apply "${_en}" || return 1
+    log_ok "${_label} 监听地址已更新: ${_l}"
+    [ "${_en}" = "true" ] && config_print_nodes
+    return 0
+}
+
 module_reality_update_port() {
     module_update_port_action reality tcp
 }
@@ -2263,15 +2285,7 @@ module_socks_update_port() {
 }
 
 module_socks_update_listen() {
-    local _en _l
-    _en=$(st_get '.socks.enabled')
-    prompt "新监听地址（0.0.0.0=所有，127.0.0.1=仅本地）: " _l
-    [ -n "${_l:-}" ] || return 0
-    _l=$(val_listen_addr "${_l}") || return 1
-    st_set '.socks.listen = $l' --arg l "${_l}" || return 1
-    _module_persist_after_optional_apply "${_en}" || return 1
-    log_ok "SOCKS5 监听地址已更新: ${_l}"
-    [ "${_en}" = "true" ] && config_print_nodes
+    module_update_listen_action socks
 }
 
 module_socks_update_auth() {
@@ -2358,27 +2372,11 @@ module_reality_update_transport() {
 }
 
 module_vltcp_update_listen() {
-    local _en _l
-    _en=$(st_get '.vltcp.enabled')
-    prompt "新监听地址（0.0.0.0=所有，127.0.0.1=仅本地）: " _l
-    [ -n "${_l:-}" ] || return 0
-    _l=$(val_listen_addr "${_l}") || return 1
-    st_set '.vltcp.listen = $l' --arg l "${_l}" || return 1
-    _module_persist_after_optional_apply "${_en}" || return 1
-    log_ok "监听地址已更新: ${_l}"
-    [ "${_en}" = "true" ] && config_print_nodes
+    module_update_listen_action vltcp
 }
 
 module_vlquic_update_listen() {
-    local _en _l
-    _en=$(st_get '.vlquic.enabled')
-    prompt "新监听地址（0.0.0.0=所有，127.0.0.1=仅本地）: " _l
-    [ -n "${_l:-}" ] || return 0
-    _l=$(val_listen_addr "${_l}") || return 1
-    st_set '.vlquic.listen = $l' --arg l "${_l}" || return 1
-    _module_persist_after_optional_apply "${_en}" || return 1
-    log_ok "监听地址已更新: ${_l}"
-    [ "${_en}" = "true" ] && config_print_nodes
+    module_update_listen_action vlquic
 }
 
 module_cforigin_update_protocol() {
@@ -3787,13 +3785,13 @@ module_dispatch() {
         ff:update_mode) module_ff_update_mode ;;
         ff:update_host_or_path) module_ff_update_host_or_path ;;
         reality:update_transport) module_reality_update_transport ;;
-        vltcp:update_listen) module_vltcp_update_listen ;;
-        vlquic:update_listen) module_vlquic_update_listen ;;
+        vltcp:update_listen) module_update_listen_action vltcp ;;
+        vlquic:update_listen) module_update_listen_action vlquic ;;
         cforigin:update_protocol) module_cforigin_update_protocol ;;
         cforigin:update_domain) module_cforigin_update_domain ;;
         cforigin:update_path) module_cforigin_update_path ;;
         cforigin:update_listen) module_cforigin_update_listen ;;
-        socks:update_listen) module_socks_update_listen ;;
+        socks:update_listen) module_update_listen_action socks ;;
         socks:update_auth) module_socks_update_auth ;;
         socks:update_user) module_socks_update_user ;;
         socks:update_pass) module_socks_update_pass ;;
