@@ -533,10 +533,12 @@ def test_state_schema_and_plugin_permission_hardening():
 
 def test_commit_helpers_fail_closed_on_firewall_reconcile():
     for fn in ['_commit', '_module_enable_commit', '_module_disable_commit']:
-        m = re.search(rf"{re.escape(fn)}\(\) \{{(?P<body>.*?)\n\}}", TEXT, re.S)
-        assert_true(m, f'{fn} function missing')
-        body = m.group('body')
-        assert_true('fw_reconcile || return 1' in body, f'{fn} must fail closed if firewall reconciliation fails')
+        candidates = [f'{fn}_inner()', f'{fn}()']
+        start = next((TEXT.index(candidate) for candidate in candidates if candidate in TEXT), None)
+        assert_true(start is not None, f'{fn} function missing')
+        end = TEXT.index('\n}\n', start)
+        body = TEXT[start:end]
+        assert_true('fw_reconcile || return 1' in body, f'{fn} implementation must fail closed if firewall reconciliation fails')
 
 
 def test_socks5_module_option_and_plugin_contract():
@@ -1717,6 +1719,131 @@ printf 'rc=%s memory=%s/%s/%s/%s disk=%s/%s/%s/%s\\n' \\
     assert_true(
         "rc=1 memory=false/null/null/oldsid disk=false/null/null/oldsid" in cp.stdout,
         f"failed Reality enable must restore generated material and prior state: {cp.stdout}",
+    )
+
+
+def test_runtime_transaction_restores_cross_artifact_state_after_commit_failure():
+    from sandbox_runner import XraySandbox
+
+    with XraySandbox() as sandbox:
+        cp = subprocess.run(
+            [
+                "bash",
+                "-lc",
+                """
+source ./xray_2go.sh
+mkdir -p "${WORK_DIR}" "${_SVC_SYSTEMD_DIR}"
+st_init >/dev/null 2>&1
+st_set '.socks.enabled = false' >/dev/null
+st_persist >/dev/null 2>&1
+printf 'old-config' > "${CONFIG_FILE}"
+printf 'old-service' > "${_SVC_SYSTEMD_DIR}/${_SVC_XRAY}.service"
+printf 'old-env' > "${_ARGO_ENV_FILE}"
+printf 'old-tunnel' > "${WORK_DIR}/tunnel.yml"
+printf 'nft:1080/tcp\\n' > "${_FW_RULES_FILE}"
+printf '1080\\n' > "${_FW_PORTS_FILE}"
+
+svc_exec() { return 1; }
+svc_exec_mut() { return 0; }
+_fw_restore_managed_snapshot() { return 0; }
+_module_enable_commit() {
+    printf 'new-config' > "${CONFIG_FILE}"
+    printf '{"socks":{"enabled":true}}' > "${STATE_FILE}"
+    printf 'new-service' > "${_SVC_SYSTEMD_DIR}/${_SVC_XRAY}.service"
+    printf 'new-env' > "${_ARGO_ENV_FILE}"
+    printf 'new-tunnel' > "${WORK_DIR}/tunnel.yml"
+    printf 'iptables:9999/tcp\\n' > "${_FW_RULES_FILE}"
+    printf '9999\\n' > "${_FW_PORTS_FILE}"
+    return 1
+}
+module_socks_enable >/dev/null 2>&1
+_rc=$?
+printf 'rc=%s memory=%s config=%s state=%s service=%s env=%s tunnel=%s fw=%s ports=%s\\n' \\
+    "${_rc}" \\
+    "$(printf '%s' "${_G_STATE}" | jq -r '.socks.enabled')" \\
+    "$(cat "${CONFIG_FILE}")" \\
+    "$(jq -c . "${STATE_FILE}")" \\
+    "$(cat "${_SVC_SYSTEMD_DIR}/${_SVC_XRAY}.service")" \\
+    "$(cat "${_ARGO_ENV_FILE}")" \\
+    "$(cat "${WORK_DIR}/tunnel.yml")" \\
+    "$(cat "${_FW_RULES_FILE}")" \\
+    "$(cat "${_FW_PORTS_FILE}")"
+""",
+            ],
+            cwd=ROOT,
+            env=sandbox.environment(),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=20,
+            check=False,
+        )
+
+    assert_true(cp.returncode == 0, f"transaction rollback probe process failed: {cp.stdout}")
+    assert_true(
+        "rc=1 memory=false config=old-config state={" in cp.stdout
+        and '"enabled":false' in cp.stdout
+        and "service=old-service env=old-env tunnel=old-tunnel fw=nft:1080/tcp ports=1080" in cp.stdout,
+        f"failed commit must restore all artifacts and state: {cp.stdout}",
+    )
+
+
+def test_runtime_transaction_restores_service_enabled_state_after_commit_failure():
+    from sandbox_runner import XraySandbox
+
+    with XraySandbox() as sandbox:
+        cp = subprocess.run(
+            [
+                "bash",
+                "-lc",
+                """
+source ./xray_2go.sh
+mkdir -p "${WORK_DIR}"
+st_init >/dev/null 2>&1
+st_set '.socks.enabled = false' >/dev/null
+st_persist >/dev/null 2>&1
+_SERVICE_ACTIVE=1
+_SERVICE_ENABLED=1
+svc_exec() {
+    case "$1" in
+        status) [ "${_SERVICE_ACTIVE}" = 1 ] ;;
+        *) return 1 ;;
+    esac
+}
+svc_is_enabled() { [ "${_SERVICE_ENABLED}" = 1 ]; }
+svc_exec_mut() {
+    case "$1" in
+        start) _SERVICE_ACTIVE=1 ;;
+        stop) _SERVICE_ACTIVE=0 ;;
+        enable) _SERVICE_ENABLED=1 ;;
+        disable) _SERVICE_ENABLED=0 ;;
+        *) return 1 ;;
+    esac
+}
+_fw_restore_managed_snapshot() { return 0; }
+_module_enable_commit() {
+    _SERVICE_ACTIVE=0
+    _SERVICE_ENABLED=0
+    return 1
+}
+module_socks_enable >/dev/null 2>&1
+_rc=$?
+printf 'rc=%s active=%s enabled=%s\\n' "${_rc}" "${_SERVICE_ACTIVE}" "${_SERVICE_ENABLED}"
+""",
+            ],
+            cwd=ROOT,
+            env=sandbox.environment(),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=20,
+            check=False,
+        )
+
+    assert_true(cp.returncode == 0, f"service rollback probe process failed: {cp.stdout}")
+    assert_true(
+        "rc=1 active=1 enabled=1" in cp.stdout,
+        f"failed commit must restore service active and enabled state: {cp.stdout}",
     )
 
 

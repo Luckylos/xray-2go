@@ -84,15 +84,31 @@ _PLUGIN_SNAPSHOT_INBOUNDS=""
 # Temporary workspace
 # ==============================================================================
 _G_TMP_DIR=""
+_TXN_ACTIVE=0
+_TXN_DIR=""
+_TXN_LOCK_FD=""
+_TXN_PRE_STATE=""
+_TXN_PRE_STATE_FILE=0
+_TXN_PRE_XRAY_ACTIVE=0
+_TXN_PRE_TUNNEL_ACTIVE=0
+_TXN_PRE_XRAY_ENABLED=0
+_TXN_PRE_TUNNEL_ENABLED=0
+_TXN_PRE_FW_FILE=""
+_TXN_ARTIFACT_PATHS=()
 
 trap '_trap_exit' EXIT
 trap '_trap_int'  INT TERM
 
 _trap_exit() {
+    [ -n "${_TXN_DIR:-}" ] && rm -rf "${_TXN_DIR}" 2>/dev/null || true
     [ -n "${_G_TMP_DIR:-}" ] && rm -rf "${_G_TMP_DIR}" 2>/dev/null || true
     [ -t 1 ] && tput cnorm 2>/dev/null || true
 }
 _trap_int() {
+    if [ "${_TXN_ACTIVE:-0}" -eq 1 ]; then
+        _transaction_rollback 130 || true
+        _transaction_end || true
+    fi
     printf '\n' >&2
     printf '\033[1;91m[ERR ] 已中断\033[0m\n' >&2
     exit 130
@@ -460,6 +476,10 @@ atomic_write_secret_with_backup() {
 # ── 文件锁（串行化所有 read-modify-write）────────────────────────────────────
 with_lock() {
     local _fn="$1"; shift
+    if [ "${_TXN_ACTIVE:-0}" -eq 1 ]; then
+        "${_fn}" "$@"
+        return $?
+    fi
     mkdir -p "${WORK_DIR}" 2>/dev/null || true
     _ensure_tmp_dir || return 1
     if command -v flock >/dev/null 2>&1; then
@@ -1697,6 +1717,30 @@ EOF
     [ "${_failed}" -eq 0 ] || { log_error "部分防火墙规则同步失败"; return 1; }
 }
 
+_fw_restore_managed_snapshot() {
+    local _snapshot="$1" _rule _backend _rp _proto _failed=0
+    [ -f "${_snapshot}" ] || return 1
+    while IFS= read -r _rule; do
+        [ -n "${_rule:-}" ] || continue
+        if ! grep -Fqx "${_rule}" "${_snapshot}" 2>/dev/null; then
+            _backend=${_rule%%:*}
+            _rp=${_rule#*:}; _proto=${_rp#*/}; _rp=${_rp%/*}
+            _fw_close_port "${_rp}" "${_proto}" "${_backend}" || _failed=1
+        fi
+    done <<EOF
+$(_fw_read_managed_rules)
+EOF
+    while IFS= read -r _rule; do
+        [ -n "${_rule:-}" ] || continue
+        if ! _fw_read_managed_rules | grep -Fqx "${_rule}" 2>/dev/null; then
+            _backend=${_rule%%:*}
+            _rp=${_rule#*:}; _proto=${_rp#*/}; _rp=${_rp%/*}
+            _fw_open_port_backend "${_backend}" "${_rp}" "${_proto}" || _failed=1
+        fi
+    done < "${_snapshot}"
+    [ "${_failed}" -eq 0 ]
+}
+
 fw_force_cleanup() {
     log_step "清理 xray2go 托管防火墙规则..."
     local _rule _rp _rb _rproto
@@ -1775,6 +1819,17 @@ svc_exec() {
         esac
     fi
     return "${_rc}"
+}
+
+svc_is_enabled() {
+    local _name="$1"
+    if is_systemd; then
+        systemctl is-enabled --quiet "${_name}" >/dev/null 2>&1
+    elif is_openrc; then
+        rc-update show default 2>/dev/null | awk -v n="${_name}" '$1 == n { found=1 } END { exit(found ? 0 : 1) }'
+    else
+        return 1
+    fi
 }
 
 svc_reload_daemon() {
@@ -2076,14 +2131,189 @@ config_print_nodes() {
     echo ""
 }
 
+# ==============================================================================
+# 统一事务：锁定、快照、应用失败回滚
+# ==============================================================================
+_transaction_collect_artifacts() {
+    _TXN_ARTIFACT_PATHS=(
+        "${CONFIG_FILE}"
+        "${STATE_FILE}"
+        "${WORK_DIR}/config_failed.json"
+        "${_CONFIG_HASH_FILE}"
+        "${_FW_PORTS_FILE}"
+        "${_FW_RULES_FILE}"
+        "${_ARGO_ENV_FILE}"
+        "${_ACME_ENV_FILE}"
+        "${WORK_DIR}/tunnel.yml"
+        "${WORK_DIR}/tunnel.json"
+        "${_SVC_SYSTEMD_DIR}/${_SVC_XRAY}.service"
+        "${_SVC_SYSTEMD_DIR}/${_SVC_TUNNEL}.service"
+        "${_SVC_OPENRC_DIR}/${_SVC_XRAY}"
+        "${_SVC_OPENRC_DIR}/${_SVC_TUNNEL}"
+        "${_SYSCTL_FILE}"
+    )
+    local _p
+    for _p in "${STATE_FILE}".*.bak "${CONFIG_FILE}".*.bak; do
+        [ -e "${_p}" ] || continue
+        _TXN_ARTIFACT_PATHS+=("${_p}")
+    done
+}
+
+_transaction_lock_acquire() {
+    mkdir -p "${WORK_DIR}" 2>/dev/null || return 1
+    if command -v flock >/dev/null 2>&1; then
+        exec {_TXN_LOCK_FD}>"${_LOCK_FILE}" || return 1
+        flock -x "${_TXN_LOCK_FD}" || {
+            eval "exec ${_TXN_LOCK_FD}>&-" 2>/dev/null || true
+            _TXN_LOCK_FD=""
+            return 1
+        }
+    fi
+}
+
+_transaction_lock_release() {
+    [ -n "${_TXN_LOCK_FD:-}" ] || return 0
+    flock -u "${_TXN_LOCK_FD}" 2>/dev/null || true
+    eval "exec ${_TXN_LOCK_FD}>&-" 2>/dev/null || true
+    _TXN_LOCK_FD=""
+}
+
+_transaction_snapshot_files() {
+    local _i=0 _p _exists
+    _transaction_collect_artifacts
+    mkdir -p "${_TXN_DIR}/files"
+    : > "${_TXN_DIR}/manifest"
+    for _p in "${_TXN_ARTIFACT_PATHS[@]}"; do
+        _exists=0
+        if [ -e "${_p}" ] || [ -L "${_p}" ]; then
+            _exists=1
+            cp -a -- "${_p}" "${_TXN_DIR}/files/${_i}" || return 1
+        fi
+        printf '%s\t%s\t%s\n' "${_i}" "${_exists}" "${_p}" >> "${_TXN_DIR}/manifest"
+        _i=$(( _i + 1 ))
+    done
+}
+
+_transaction_begin() {
+    _transaction_lock_acquire || {
+        log_error "获取事务锁失败"
+        return 1
+    }
+    _TXN_DIR=$(mktemp -d "${WORK_DIR}/.txn_XXXXXX") || {
+        _transaction_lock_release
+        log_error "创建事务快照目录失败"
+        return 1
+    }
+    _TXN_PRE_STATE="${_G_STATE}"
+    _TXN_PRE_STATE_FILE=0
+    [ -f "${STATE_FILE}" ] && _TXN_PRE_STATE_FILE=1
+    _transaction_snapshot_files || {
+        rm -rf "${_TXN_DIR}" 2>/dev/null || true
+        _TXN_DIR=""
+        _transaction_lock_release
+        log_error "创建事务文件快照失败"
+        return 1
+    }
+    _TXN_PRE_FW_FILE="${_TXN_DIR}/firewall.rules"
+    _fw_read_managed_rules > "${_TXN_PRE_FW_FILE}" 2>/dev/null || :
+    _TXN_PRE_XRAY_ACTIVE=0
+    _TXN_PRE_TUNNEL_ACTIVE=0
+    _TXN_PRE_XRAY_ENABLED=0
+    _TXN_PRE_TUNNEL_ENABLED=0
+    svc_exec status "${_SVC_XRAY}" >/dev/null 2>&1 && _TXN_PRE_XRAY_ACTIVE=1 || true
+    svc_exec status "${_SVC_TUNNEL}" >/dev/null 2>&1 && _TXN_PRE_TUNNEL_ACTIVE=1 || true
+    svc_is_enabled "${_SVC_XRAY}" >/dev/null 2>&1 && _TXN_PRE_XRAY_ENABLED=1 || true
+    svc_is_enabled "${_SVC_TUNNEL}" >/dev/null 2>&1 && _TXN_PRE_TUNNEL_ENABLED=1 || true
+    _TXN_ACTIVE=1
+}
+
+_transaction_restore_files() {
+    local _p _i _exists
+    _transaction_collect_artifacts
+    for _p in "${_TXN_ARTIFACT_PATHS[@]}"; do
+        if ! awk -F '\t' -v p="${_p}" '$2 == 1 && $3 == p { found=1 } END { exit(found ? 0 : 1) }' \
+            "${_TXN_DIR}/manifest"; then
+            rm -rf -- "${_p}" 2>/dev/null || return 1
+        fi
+    done
+    while IFS=$'\t' read -r _i _exists _p; do
+        [ -n "${_p:-}" ] || continue
+        rm -rf -- "${_p}" 2>/dev/null || return 1
+        [ "${_exists}" = 1 ] || continue
+        mkdir -p "$(dirname "${_p}")" 2>/dev/null || return 1
+        cp -a -- "${_TXN_DIR}/files/${_i}" "${_p}" || return 1
+    done < "${_TXN_DIR}/manifest"
+}
+
+_transaction_restore_service() {
+    local _name="$1" _was_active="$2" _was_enabled="$3" _is_active=0 _is_enabled=0
+    svc_exec status "${_name}" >/dev/null 2>&1 && _is_active=1 || true
+    svc_is_enabled "${_name}" >/dev/null 2>&1 && _is_enabled=1 || true
+    if [ "${_was_enabled}" = 1 ] && [ "${_is_enabled}" = 0 ]; then
+        svc_exec_mut enable "${_name}" >/dev/null 2>&1 || return 1
+    elif [ "${_was_enabled}" = 0 ] && [ "${_is_enabled}" = 1 ]; then
+        svc_exec_mut disable "${_name}" >/dev/null 2>&1 || return 1
+    fi
+    if [ "${_was_active}" = 1 ] && [ "${_is_active}" = 0 ]; then
+        svc_exec_mut start "${_name}" >/dev/null 2>&1 || return 1
+    elif [ "${_was_active}" = 0 ] && [ "${_is_active}" = 1 ]; then
+        svc_exec_mut stop "${_name}" >/dev/null 2>&1 || return 1
+    fi
+}
+
+_transaction_rollback() {
+    local _failed=0 _restored_state
+    _fw_restore_managed_snapshot "${_TXN_PRE_FW_FILE}" || _failed=1
+    _transaction_restore_files || _failed=1
+    if [ -f "${STATE_FILE}" ]; then
+        _restored_state=$(cat "${STATE_FILE}" 2>/dev/null) || _restored_state=""
+        printf '%s' "${_restored_state}" | jq -e . >/dev/null 2>&1 && _G_STATE="${_restored_state}"
+    elif [ "${_TXN_PRE_STATE_FILE}" -eq 0 ]; then
+        _G_STATE="${_TXN_PRE_STATE}"
+    fi
+    _transaction_restore_service "${_SVC_XRAY}" "${_TXN_PRE_XRAY_ACTIVE}" "${_TXN_PRE_XRAY_ENABLED}" || _failed=1
+    _transaction_restore_service "${_SVC_TUNNEL}" "${_TXN_PRE_TUNNEL_ACTIVE}" "${_TXN_PRE_TUNNEL_ENABLED}" || _failed=1
+    [ "${_failed}" -eq 0 ]
+}
+
+_transaction_end() {
+    _TXN_ACTIVE=0
+    _transaction_lock_release
+    [ -n "${_TXN_DIR:-}" ] && rm -rf "${_TXN_DIR}" 2>/dev/null || true
+    _TXN_DIR=""
+    _TXN_PRE_STATE=""
+    _TXN_PRE_FW_FILE=""
+    _TXN_ARTIFACT_PATHS=()
+}
+
+_transaction_run() {
+    local _label="$1" _rc=0
+    shift
+    if [ "${_TXN_ACTIVE:-0}" -eq 1 ]; then
+        "$@"
+        return $?
+    fi
+    _transaction_begin || return 1
+    "$@" || _rc=$?
+    if [ "${_rc}" -ne 0 ]; then
+        _transaction_rollback || {
+            log_error "${_label} 失败，事务回滚未完全成功"
+            _rc=1
+        }
+    fi
+    _transaction_end
+    return "${_rc}"
+}
+
 # 组合提交：config_apply + st_persist + fw_reconcile
-_commit() {
+_commit_inner() {
     config_apply || return 1
     st_persist   || { log_error "state.json 写入失败，拒绝同步防火墙以避免状态漂移"; return 1; }
     fw_reconcile || return 1
 }
+_commit() { _transaction_run "配置提交" _commit_inner "$@"; }
 
-_module_disable_commit() {
+_module_disable_commit_inner() {
     local _name="$1"
     config_apply || return 1
     st_persist   || { log_error "state.json 写入失败，拒绝同步防火墙以避免状态漂移"; return 1; }
@@ -2092,8 +2322,9 @@ _module_disable_commit() {
     fw_reconcile || return 1
     log_info "${_name} 防火墙端口已从托管规则中删除"
 }
+_module_disable_commit() { _transaction_run "模块禁用提交" _module_disable_commit_inner "$@"; }
 
-_module_enable_commit() {
+_module_enable_commit_inner() {
     local _name="$1"
     config_apply || return 1
     st_persist   || { log_error "state.json 写入失败，拒绝同步防火墙以避免状态漂移"; return 1; }
@@ -2101,6 +2332,7 @@ _module_enable_commit() {
     log_ok "${_name} 已启用"
     config_print_nodes
 }
+_module_enable_commit() { _transaction_run "模块启用提交" _module_enable_commit_inner "$@"; }
 
 _module_apply_if_enabled() {
     local _enabled="$1"
@@ -2114,7 +2346,7 @@ _module_persist_after_optional_apply() {
 }
 
 
-_module_enable_transaction() {
+_module_enable_transaction_inner() {
     local _module_name="$1" _before="${_G_STATE}"
     shift
     "$@" || {
@@ -2125,6 +2357,9 @@ _module_enable_transaction() {
         _G_STATE="${_before}"
         return 1
     fi
+}
+_module_enable_transaction() {
+    _transaction_run "模块启用" _module_enable_transaction_inner "$@"
 }
 
 _module_enable_with_state() {

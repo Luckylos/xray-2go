@@ -659,4 +659,64 @@ AssertionError: failed CF Origin enable must restore pre-commit defaults and pri
 - 状态：`completed-in-worktree`
 - **fixed**：CF Origin enable 的 pre-commit 失败会恢复调用前完整内存 state，不再遗留自动补齐的协议、path、listen 和 edge port 默认值；失败码仍保留，已提交 state 不被覆盖。
 - **deferred**：`_module_enable_transaction` 当前只保证其负责的内存 state 快照边界；若 commit 内部已经部分写入 config/state/service/firewall 等 artifact，跨 artifact 恢复仍需 Phase 3 的统一 transaction/apply/rollback 设计和失败注入测试。
-- 下一切片：继续以最小 RED 覆盖其他 enable 路径或进入统一 transaction 设计；不得把本切片宣称为完整事务回滚。
+- 下一切片：`phase3-slice1-core`，先以最小 RED 证明跨 artifact rollback 缺口，再实现统一事务快照；不得把本切片宣称为完整事务回滚。
+
+## Phase 3 / Slice 1：统一事务快照与回滚核心
+
+### 范围
+
+- 切片：`phase3-slice1-core`
+- 目标：建立可复用的事务边界，快照并恢复内存 state、持久化 state/config、服务单元、Argo/ACME/Tunnel 文件、防火墙 managed artifact、sysctl 及相关 backup 文件；事务失败时只删除事务中新建的路径，并保留原文件内容、权限和存在性。
+- 入口：`_transaction_run`、`_transaction_begin`、`_transaction_rollback`、`_transaction_end`。
+- 集成范围：普通 `_commit`、`_module_enable_commit`、`_module_disable_commit` 与 `_module_enable_transaction` 已通过事务包装接入；本切片不宣称所有 module action 都已在状态修改前建立外层事务。
+
+### RED
+
+- 新增 `test_runtime_transaction_restores_cross_artifact_state_after_commit_failure` 后，旧实现真实失败：commit stub 在失败前写入新 config、state、service、Argo env、Tunnel 与 firewall marker，结果仅返回非零，工件全部保留新值。
+- 初始失败输出：
+
+```text
+rc=1
+memory=false
+config=new-config
+state={"socks":{"enabled":true}}
+service=new-service
+env=new-env
+tunnel=new-tunnel
+fw=iptables:9999/tcp
+ports=9999
+```
+
+- 修正 probe 的 JSON 输出为 `jq -c` 后，确认失败断言表达的是事务行为而非多行输出格式。
+- 新增 `test_runtime_transaction_restores_service_enabled_state_after_commit_failure` 后，旧实现再次形成有效 RED：
+
+```text
+AssertionError: failed commit must restore service active and enabled state: rc=1 active=1 enabled=0
+```
+
+- 该失败隔离了此前快照只记录 active 状态、未记录 service enable 状态的缺口。
+
+### GREEN / REFACTOR / 验证
+
+- 新增 `_transaction_collect_artifacts`、`_transaction_snapshot_files`、`_transaction_restore_files`，使用事务目录 `files/` 与 tab 分隔 `manifest` 保存路径、存在性及 `cp -a` 文件快照；原先不存在的路径在失败回滚时被删除。
+- 新增事务锁获取/释放和嵌套事务复用：事务内 `with_lock` 不重复申请同一锁；事务外继续使用原有 read-modify-write 锁。
+- 新增 firewall managed snapshot 恢复：关闭事务新增规则、重新打开快照缺失规则，并保留失败标记。
+- `_transaction_rollback` 先恢复 firewall managed rules 和文件 artifact，再恢复 state 及服务运行/enable 状态；中断 trap 在活动事务中执行 rollback 后以 `130` 退出。
+- 新增 `svc_is_enabled`：systemd 使用 `systemctl is-enabled --quiet`，OpenRC 使用 `rc-update show default` 解析 enable 状态；服务快照同时记录 active 与 enabled 两个维度。
+- `_commit`、`_module_enable_commit`、`_module_disable_commit` 拆分为 `*_inner` 实现与统一事务包装；`_module_enable_transaction` 复用相同核心。
+- 聚焦 GREEN：
+  - `test_runtime_transaction_restores_cross_artifact_state_after_commit_failure`
+  - `test_runtime_transaction_restores_service_enabled_state_after_commit_failure`
+- 完整 fresh-process 回归：`python3 tests/probe_regressions.py` 返回码 `0`，当前输出共 `95` 项 `PASS`，`0` 项失败。
+- 矩阵分类：`static=47`、`safe=31`、`sandbox=17`、`total=95`。
+- `bash -n xray_2go.sh` 通过。
+- `python3 -m py_compile tests/probe_regressions.py tests/sandbox_runner.py tests/probe_matrix.py` 通过。
+- `git diff --check` 通过；`tests/__pycache__` 已清理。
+- 全部测试仅使用 sandbox/stub；未启动 Xray、cloudflared、systemd/OpenRC，未修改宿主 `/etc/xray2go`、防火墙、`/etc/hosts` 或公网链路。
+
+### 切片结论
+
+- 状态：`completed-in-worktree`（待独立提交）。
+- **fixed**：事务失败时恢复当前覆盖范围内的跨 artifact 文件、managed firewall marker、内存/持久化 state，以及服务 active/enabled 状态；提交辅助函数保持 firewall fail-closed。
+- **deferred**：disable action 目前多数在调用 `_module_disable_commit` 前已修改内存 state，尚未全部由事务在“状态修改前”建立外层快照；Argo Tunnel enable/disable 的完整生命周期、健康检查、interrupt 和并发失败注入仍需独立切片；外部真实 init/service 行为未在宿主验收。
+- 下一切片：`phase3-slice1-integrate`，先以 RED 覆盖 disable/普通 action 在 pre-mutation 边界的统一接入，再补 config/state/service/Tunnel/firewall 失败注入。
