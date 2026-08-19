@@ -251,3 +251,39 @@ bash: 行 1: module_update_listen_action: 未找到命令
 - 本切片未改变 CLI、状态格式、服务名称、生产默认路径或协议行为；只改变 runtime 同构监听地址 action 的内部 ownership/routing。
 - `cforigin:update_listen`、`cforigin:update_path` 保持专用 owner，未被不安全地纳入通用 action。
 - 下一切片：Phase 1 `show/summary` action；仍需先写最小 RED。
+
+## Phase 1 / Slice 4：runtime show canonical owner
+
+### 范围
+
+- 切片：`phase1-slice4-show-action-owner`
+- 目标：将各模块 runtime `show` 路由收敛到一个 canonical action，同时保留 CF Origin 的额外 Cloudflare 提示；全局 `nodes:show` 继续保留安装/运行检查。
+- 验收测试：`test_runtime_show_actions_have_single_canonical_owner`
+
+### RED
+
+- 新增测试后首次执行失败，原因是生产脚本没有统一 show action：
+
+```text
+bash: 行 1: module_show_action: 未找到命令
+```
+
+- 失败来自实际 sourced shell 的 sandbox runtime 调用，而非静态字符串检查。
+
+### GREEN / REFACTOR / 验证
+
+- 新增 `module_show_action()`：普通模块调用 `config_print_nodes`，CF Origin 额外调用 `cforigin_print_cloudflare_hint`，非法模块显式失败。
+- 保留 `module_show_nodes()` 与 `module_cforigin_show()` 作为兼容薄包装；`module_dispatch()` 的七个模块 `show` 路由直接指向 canonical owner。
+- `module_summary()` 已是现有单一 summary owner，本切片没有复制或重写 summary 格式；`nodes:show` 的安装检查语义也未改变。
+- 聚焦 GREEN：`test_runtime_show_actions_have_single_canonical_owner` 通过，实际验证节点输出、CF Origin 提示和 Reality dispatcher 路由。
+- 完整 fresh-process 回归：`python3 tests/probe_regressions.py` 返回码 `0`，共 `83` 项 `PASS`。
+- `bash -n xray_2go.sh` 通过。
+- `python3 -m py_compile tests/probe_regressions.py tests/sandbox_runner.py tests/probe_matrix.py` 通过。
+- `git diff --check` 通过，测试缓存已清理。
+- 本切片测试使用 sandbox/stub，不启动 Xray、cloudflared、systemd/OpenRC，不修改宿主 `/etc/xray2go`、防火墙、`/etc/hosts` 或公网链路。
+
+### 切片结论
+
+- 状态：`completed-in-worktree`
+- 本切片未改变 CLI、状态格式、服务名称、生产默认路径、节点链接内容或 summary 格式；只改变 show action 的内部 ownership/routing。
+- 下一切片：Phase 1 Argo protocol/auth/domain/password 专用 action 统一；继续先写最小 RED，保留 Trojan WS-only 和失败回滚边界。

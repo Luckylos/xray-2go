@@ -3681,13 +3681,30 @@ module_summary() {
     esac
 }
 
+module_show_action() {
+    local _mod="${1:-}"
+    case "${_mod}" in
+        all|argo|ff|reality|vltcp|vlquic|socks)
+            config_print_nodes
+            ;;
+        cforigin)
+            config_print_nodes
+            cforigin_print_cloudflare_hint
+            ;;
+        *)
+            log_error "不支持节点展示的模块: ${_mod}"
+            return 1
+            ;;
+    esac
+    return 0
+}
+
 module_show_nodes() {
-    config_print_nodes
+    module_show_action all
 }
 
 module_cforigin_show() {
-    config_print_nodes
-    cforigin_print_cloudflare_hint
+    module_show_action cforigin
 }
 
 module_nodes_show() {
@@ -3736,13 +3753,13 @@ module_dispatch() {
         vltcp:restart) module_xray_restart ;;
         vlquic:restart) module_xray_restart ;;
         cforigin:restart) module_xray_restart ;;
-        argo:show) module_show_nodes ;;
-        ff:show) module_show_nodes ;;
-        reality:show) module_show_nodes ;;
-        vltcp:show) module_show_nodes ;;
-        vlquic:show) module_show_nodes ;;
-        cforigin:show) module_cforigin_show ;;
-        socks:show) module_show_nodes ;;
+        argo:show) module_show_action argo ;;
+        ff:show) module_show_action ff ;;
+        reality:show) module_show_action reality ;;
+        vltcp:show) module_show_action vltcp ;;
+        vlquic:show) module_show_action vlquic ;;
+        cforigin:show) module_show_action cforigin ;;
+        socks:show) module_show_action socks ;;
 
         # lifecycle actions
         argo:enable) module_argo_enable ;;

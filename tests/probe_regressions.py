@@ -801,6 +801,36 @@ def test_runtime_listen_actions_have_single_canonical_owner():
     assert_true("dispatcher_listen=socks" in cp.stdout, "dispatcher must route update_listen to canonical action")
 
 
+def test_runtime_show_actions_have_single_canonical_owner():
+    from sandbox_runner import XraySandbox
+
+    with XraySandbox() as sandbox:
+        cp = subprocess.run(
+            [
+                "bash",
+                "-lc",
+                "source ./xray_2go.sh; "
+                "set -e; "
+                "config_print_nodes() { printf 'nodes\\n'; }; "
+                "cforigin_print_cloudflare_hint() { printf 'cforigin_hint\\n'; }; "
+                "module_show_action cforigin; "
+                "module_show_action() { printf 'dispatcher_show=%s\\n' \"$1\"; }; "
+                "module_dispatch reality show",
+            ],
+            cwd=ROOT,
+            env=sandbox.environment(),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=20,
+            check=False,
+        )
+
+    assert_true(cp.returncode == 0, f"canonical runtime show action failed: {cp.stdout}")
+    assert_true("nodes" in cp.stdout and "cforigin_hint" in cp.stdout, "canonical show action must preserve CF Origin hint output")
+    assert_true("dispatcher_show=reality" in cp.stdout, "dispatcher must route show to canonical action")
+
+
 def test_runtime_enable_paths_no_longer_depend_on_removed_ask_helpers():
     out = run_bash("""
         source ./xray_2go.sh
