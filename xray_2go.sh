@@ -2215,8 +2215,13 @@ module_socks_action() {
                 || { st_set '.socks.enabled = false' || true; return 1; }
             ;;
         disable)
+            local _old_enabled
+            _old_enabled=$(printf '%s' "${_G_STATE}" | jq -c '.socks.enabled' 2>/dev/null) || return 1
             st_set '.socks.enabled = false' || return 1
-            _module_disable_commit SOCKS5 || return 1
+            if ! _module_disable_commit SOCKS5; then
+                st_set ".socks.enabled = ${_old_enabled}" || true
+                return 1
+            fi
             log_ok "SOCKS5 已禁用"
             ;;
         *)

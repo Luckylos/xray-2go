@@ -387,3 +387,45 @@ AssertionError: restart/status canonical-owner RED/GREEN probe failed: missing_r
 - 未改变 CLI、状态格式、服务名称、生产默认路径、安装计划语义、协议行为或节点输出；只收敛 runtime restart/status 的内部 ownership/routing，并修复 `module_xray_restart()` 吞掉 restart 失败码的边界。
 - 真实服务生命周期、systemd/OpenRC 和公网 Tunnel 仍未在宿主上验收，符合当前安全边界；后续需要在隔离 runtime fixture 中继续覆盖事务失败与跨 action rollback。
 - 下一切片：Phase 1 失败路径与状态回滚；继续先写最小 RED。
+
+## Phase 1 / Slice 7：runtime action failure state rollback
+
+### 范围
+
+- 切片：`phase1-slice7-action-failure-state-rollback`
+- 目标：修复 runtime action 在 commit/apply 失败后只返回错误、却把内存 state 留在新值的问题。
+- 本切片只覆盖 canonical SOCKS action 的 state 边界；配置、服务、Tunnel、firewall 等跨 artifact 事务回滚留到后续统一 transaction 阶段。
+- 验收测试：`test_runtime_socks_disable_failure_restores_previous_state`
+
+### RED
+
+- 新增 sourced-shell sandbox 测试后，旧实现真实失败：
+
+```text
+AssertionError: failed SOCKS disable must restore committed state: rc=1 memory=false disk=true
+```
+
+- 失败语义正确：`_module_disable_commit` 被 stub 为失败后，action 返回非零，磁盘中的已提交 state 仍为 `true`，但 `_G_STATE` 已错误变成 `false`，形成内存/磁盘状态漂移。
+
+### GREEN / REFACTOR / 验证
+
+- `module_socks_action disable` 现在先保存 `.socks.enabled` 的原始 JSON 值，再尝试禁用和 commit。
+- commit 失败时恢复原始 typed state，并返回非零；成功时保持原有禁用成功输出和调用路径。
+- 使用原始 JSON 值而不是字符串参数，避免将 `true`/`false` 类型退化为字符串。
+- 聚焦 GREEN：`test_runtime_socks_disable_failure_restores_previous_state` 通过，确认：
+  - 返回码为 `1`；
+  - 内存 state 仍为 `true`；
+  - 磁盘 `state.json` 仍为 `true`。
+- 完整 fresh-process 回归：`python3 tests/probe_regressions.py` 返回码 `0`，共 `87` 项 `PASS`，`0` 项失败。
+- 探针矩阵统计：`static=46`、`safe=31`、`sandbox=10`。
+- `bash -n xray_2go.sh` 通过。
+- `python3 -m py_compile tests/probe_regressions.py tests/sandbox_runner.py tests/probe_matrix.py` 通过。
+- `git diff --check` 通过；测试缓存已清理。
+- 本切片只使用 sandbox/stub，不启动 Xray、cloudflared、systemd/OpenRC，不修改宿主 `/etc/xray2go`、防火墙、`/etc/hosts` 或公网链路。
+
+### 切片结论
+
+- 状态：`completed-in-worktree`
+- **fixed**：SOCKS disable 在 commit 失败时的内存 state 漂移已修复。
+- **deferred**：如果失败发生在统一 commit 已经写入部分 config/state/artifact 之后，跨文件恢复仍需 Phase 3 transaction/apply/rollback 设计和失败注入测试；本切片没有伪装成完整事务回滚。
+- 下一切片：继续覆盖另一个 canonical runtime action 的失败状态边界，仍需先写最小 RED。

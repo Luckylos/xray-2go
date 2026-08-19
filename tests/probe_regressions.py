@@ -1467,7 +1467,45 @@ printf 'stopped_status=%s stopped_status_rc=%s\\n' "${_stopped}" "${_stopped_rc}
     assert_true("stopped_status=stopped stopped_status_rc=1" in cp.stdout, f"stopped status contract changed: {cp.stdout}")
 
 
-def test_readme_documents_trojan_argo_capability():
+def test_runtime_socks_disable_failure_restores_previous_state():
+    from sandbox_runner import XraySandbox
+
+    with XraySandbox() as sandbox:
+        cp = subprocess.run(
+            [
+                "bash",
+                "-lc",
+                """
+source ./xray_2go.sh
+mkdir -p "${WORK_DIR}"
+st_init >/dev/null 2>&1
+st_set '.socks.enabled = true' >/dev/null
+st_persist >/dev/null 2>&1
+
+_module_disable_commit() { return 1; }
+module_socks_action disable >/dev/null 2>&1
+_rc=$?
+_mem=$(st_get '.socks.enabled')
+_disk=$(jq -r '.socks.enabled' "${STATE_FILE}")
+printf 'rc=%s memory=%s disk=%s\\n' "${_rc}" "${_mem}" "${_disk}"
+""",
+            ],
+            cwd=ROOT,
+            env=sandbox.environment(),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=20,
+            check=False,
+        )
+
+    assert_true(cp.returncode == 0, f"socks disable rollback probe process failed: {cp.stdout}")
+    assert_true(
+        "rc=1 memory=true disk=true" in cp.stdout,
+        f"failed SOCKS disable must restore committed state: {cp.stdout}",
+    )
+
+
     assert_true("Trojan" in README_TEXT, "README must document the Trojan Argo capability")
     assert_true(
         "Trojan + WS" in README_TEXT,
