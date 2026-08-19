@@ -2193,8 +2193,7 @@ module_ff_disable() {
     log_ok "FreeFlow 已禁用"
 }
 
-module_reality_enable() {
-    [ -x "${XRAY_BIN}" ] || { log_error "xray 未就绪"; return 1; }
+_module_reality_enable_prepare() {
     local _pvk
     _pvk=$(st_get '.reality.pvk')
     if [ -z "${_pvk:-}" ] || [ "${_pvk}" = "null" ]; then
@@ -2203,7 +2202,11 @@ module_reality_enable() {
         st_set '.reality.sid = $s' --arg s "$(crypto_gen_reality_sid)" || true
     fi
     st_set '.reality.enabled = true' || return 1
-    _module_enable_commit Reality || { st_set '.reality.enabled = false'; return 1; }
+}
+
+module_reality_enable() {
+    [ -x "${XRAY_BIN}" ] || { log_error "xray 未就绪"; return 1; }
+    _module_enable_transaction Reality _module_reality_enable_prepare
 }
 
 module_reality_disable() {

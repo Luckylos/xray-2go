@@ -1667,6 +1667,59 @@ printf 'rc=%s memory=%s/%s/%s disk=%s/%s/%s\\n' \\
     )
 
 
+def test_runtime_reality_enable_failure_restores_generated_material():
+    from sandbox_runner import XraySandbox
+
+    with XraySandbox() as sandbox:
+        cp = subprocess.run(
+            [
+                "bash",
+                "-lc",
+                """
+source ./xray_2go.sh
+mkdir -p "${WORK_DIR}" "$(dirname "${XRAY_BIN}")"
+printf '%s\\n' \\
+    '#!/bin/sh' \\
+    'case "${1:-}" in' \\
+    '  x25519) printf "%s\\n%s\\n" "Private key: NEWPRIVATEKEY_1234567890" "Public key: NEWPUBLICKEY_1234567890" ;;' \\
+    '  *) exit 1 ;;' \\
+    'esac' > "${XRAY_BIN}"
+chmod 700 "${XRAY_BIN}"
+st_init >/dev/null 2>&1
+st_set '.reality.enabled = false | .reality.pvk = null | .reality.pbk = null | .reality.sid = "oldsid"' >/dev/null
+st_persist >/dev/null 2>&1
+
+_module_enable_commit() { return 1; }
+module_reality_enable >/dev/null 2>&1
+_rc=$?
+printf 'rc=%s memory=%s/%s/%s/%s disk=%s/%s/%s/%s\\n' \\
+    "${_rc}" \\
+    "$(printf '%s' "${_G_STATE}" | jq -r '.reality.enabled')" \\
+    "$(printf '%s' "${_G_STATE}" | jq -r '.reality.pvk')" \\
+    "$(printf '%s' "${_G_STATE}" | jq -r '.reality.pbk')" \\
+    "$(printf '%s' "${_G_STATE}" | jq -r '.reality.sid')" \\
+    "$(jq -r '.reality.enabled' "${STATE_FILE}")" \\
+    "$(jq -r '.reality.pvk' "${STATE_FILE}")" \\
+    "$(jq -r '.reality.pbk' "${STATE_FILE}")" \\
+    "$(jq -r '.reality.sid' "${STATE_FILE}")"
+""",
+            ],
+            cwd=ROOT,
+            env=sandbox.environment(),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=20,
+            check=False,
+        )
+
+    assert_true(cp.returncode == 0, f"Reality enable rollback probe process failed: {cp.stdout}")
+    assert_true(
+        "rc=1 memory=false/null/null/oldsid disk=false/null/null/oldsid" in cp.stdout,
+        f"failed Reality enable must restore generated material and prior state: {cp.stdout}",
+    )
+
+
 def test_readme_documents_trojan_argo_capability():
     assert_true("Trojan" in README_TEXT, "README must document the Trojan Argo capability")
     assert_true(
