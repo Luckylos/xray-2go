@@ -50,3 +50,46 @@
 
 - 若路径注入改变未设置测试变量时的生产默认值，立即回滚本切片代码，只保留失败测试和诊断证据。
 - 若测试需要启动宿主服务、修改防火墙、修改 `/etc/hosts` 或写入 `/etc/xray2go`，停止并改为 stub/fixture；不以降低隔离标准换取通过。
+
+## Phase 0 / Slice 2：state/config/env/tunnel/backup/tmp confinement
+
+### 范围
+
+- 切片：`phase0-slice2-state-config-backup-confinement`
+- 目标：在 fresh sandbox 进程中验证 state、config、Argo env、Tunnel fixture、service unit target、backup 和 temporary workspace 的文件树及权限；禁止任何 service unit 写入宿主路径。
+- 测试：`test_state_backup_and_restore_are_confined_to_sandbox`
+
+### RED
+
+- 首次执行结果为预期失败：
+
+```text
+escaped_service_path=/etc/systemd/system/xray2go.service
+escaped_service_path=/etc/systemd/system/tunnel2go.service
+xray_rc=1
+tunnel_rc=1
+```
+
+- 失败原因已定位为 `svc_apply_xray()` / `svc_apply_tunnel()` 将 service unit 目标硬编码为宿主 `/etc/systemd/system`，sandbox adapter 正确拒绝了越界路径；测试过程未向宿主写入文件。
+- 后续 GREEN 过程中又捕获到 `with_lock()` 在 flock 子 shell 内首次创建 `.tmp_*` 目录，父进程 EXIT trap 无法清理的真实临时目录泄漏。
+
+### GREEN / REFACTOR / 验证
+
+- 新增 `_SVC_SYSTEMD_DIR` 和 `_SVC_OPENRC_DIR`，均从显式测试 root 派生；未设置测试变量时仍分别解析为 `/etc/systemd/system` 和 `/etc/init.d`。
+- `svc_apply_xray()`、`svc_apply_tunnel()` 及 Argo 卸载/安装回滚/整套卸载中的托管 service unit 路径统一使用上述目录，避免通过这些路径触碰宿主 service 文件。
+- `with_lock()` 在进入 flock 子 shell 前调用 `_ensure_tmp_dir`，使临时 workspace 由父进程持有并由 EXIT trap 清理。
+- 新测试实际执行：两次 state 持久化产生 state backup；两次 config 写入产生 config backup；写入 `.argo_env`、Tunnel fixture 和 systemd unit fixture；检查敏感文件及 backup 均为 `0600`；退出 fresh process 后无 `.tmp_*`/探针临时残留。
+- 聚焦 GREEN：`test_state_backup_and_restore_are_confined_to_sandbox` 通过。
+- sandbox 回归：`test_runtime_harness_does_not_touch_host_root` 与切片 2 测试共 `2` 项通过。
+- 静态回归：不调用 `run_bash` / `run_bash_result` / subprocess sandbox 的探针重新执行，`static_cases 47`。
+- Bash 语法：`bash -n xray_2go.sh` 通过。
+- Python 编译：`python3 -m py_compile tests/probe_regressions.py tests/sandbox_runner.py` 通过。
+- `git diff --check` 通过。
+- 生产默认路径：`WORK_DIR=/etc/xray2go`、`CONFIG_FILE=/etc/xray2go/config.json`、`STATE_FILE=/etc/xray2go/state.json`、service dirs 为 `/etc/systemd/system` 与 `/etc/init.d`、`SHORTCUT=/usr/local/bin/s`、sysctl 为 `/etc/sysctl.d/99-xray2go.conf`。
+- 宿主边界：测试前后 `/etc/xray2go` 元数据一致；未启动 systemd/OpenRC、Xray 或 cloudflared，未修改防火墙和宿主 `/etc/hosts`，未执行真实部署。
+
+### 切片结论
+
+- 状态：`completed-in-worktree`
+- 本切片只扩展测试 root 下的 artifact/service target 和临时 workspace 隔离，不改变生产默认路径或公开用户功能。
+- 下一切片：`phase0-slice3-runtime-probe-matrix`，先为 runtime 探针建立 safe/static/sandbox 分类和 fresh-process 执行边界；在其 RED 前不进入 Phase 1。

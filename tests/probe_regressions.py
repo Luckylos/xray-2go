@@ -110,6 +110,89 @@ def test_runtime_harness_does_not_touch_host_root():
     assert_true(metadata(host_root) == host_before, "host /etc/xray2go changed during sandbox path probe")
 
 
+def test_state_backup_and_restore_are_confined_to_sandbox():
+    from sandbox_runner import XraySandbox
+
+    host_root = Path("/etc/xray2go")
+
+    def metadata(path: Path):
+        if not path.exists():
+            return (False, None, None)
+        stat = path.stat()
+        return (True, stat.st_mode, stat.st_mtime_ns)
+
+    host_before = metadata(host_root)
+    with XraySandbox() as sandbox:
+        cp = subprocess.run(
+            [
+                "bash",
+                "-lc",
+                """
+source ./xray_2go.sh
+mkdir -p "${WORK_DIR}"
+st_init
+st_persist
+st_set '.uuid = "11111111-1111-4111-8111-111111111111"'
+st_persist
+atomic_write_secret "${CONFIG_FILE}" '{"version":1}'
+atomic_write_secret_with_backup "${CONFIG_FILE}" '{"version":2}' 2
+atomic_write_secret "${WORK_DIR}/tunnel.yml" 'tunnel: fixture'
+
+is_systemd() { return 0; }
+_svc_write_file() {
+    case "$1" in
+        "${_X2G_ROOT}"/*) atomic_write "$1" "$2" ;;
+        *) printf 'escaped_service_path=%s\\n' "$1" >&2; return 97 ;;
+    esac
+}
+svc_apply_xray
+xray_rc=$?
+svc_apply_tunnel
+tunnel_rc=$?
+printf 'xray_rc=%s\\n' "${xray_rc}"
+printf 'tunnel_rc=%s\\n' "${tunnel_rc}"
+""",
+            ],
+            cwd=ROOT,
+            env=sandbox.environment(),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=20,
+            check=False,
+        )
+        assert_true(cp.returncode == 0, f"sandbox artifact probe process failed: {cp.stdout}")
+        assert_true("xray_rc=0" in cp.stdout, f"xray service artifact escaped sandbox: {cp.stdout}")
+        assert_true("tunnel_rc=0" in cp.stdout, f"tunnel service artifact escaped sandbox: {cp.stdout}")
+
+        expected_files = [
+            sandbox.root / "etc/xray2go/state.json",
+            sandbox.root / "etc/xray2go/config.json",
+            sandbox.root / "etc/xray2go/.argo_env",
+            sandbox.root / "etc/xray2go/tunnel.yml",
+            sandbox.root / "etc/systemd/system/xray2go.service",
+            sandbox.root / "etc/systemd/system/tunnel2go.service",
+        ]
+        for path in expected_files:
+            assert_true(path.is_file(), f"expected sandbox artifact missing: {path}")
+
+        state_backups = sorted((sandbox.root / "etc/xray2go").glob("state.json.*.bak"))
+        config_backups = sorted((sandbox.root / "etc/xray2go").glob("config.json.*.bak"))
+        assert_true(state_backups, "state backup must be retained inside sandbox")
+        assert_true(config_backups, "config backup must be retained inside sandbox")
+        for path in [expected_files[0], expected_files[1], expected_files[2], *state_backups, *config_backups]:
+            assert_true(path.stat().st_mode & 0o777 == 0o600, f"sensitive artifact mode is not 0600: {path}")
+
+        leftovers = [
+            path
+            for path in sandbox.root.rglob("*")
+            if path.name.startswith(".tmp_") or path.name.startswith("probe_")
+        ]
+        assert_true(not leftovers, f"temporary artifacts leaked after fresh process exit: {leftovers}")
+
+    assert_true(metadata(host_root) == host_before, "host /etc/xray2go changed during sandbox artifact probe")
+
+
 def test_function_boundaries_after_source():
     out = run_bash(
         "source ./xray_2go.sh; "

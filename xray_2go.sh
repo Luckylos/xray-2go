@@ -55,6 +55,8 @@ readonly _FW_PORTS_FILE="${WORK_DIR}/.fw_ports"
 readonly _FW_RULES_FILE="${WORK_DIR}/.fw_rules"
 readonly _CONFIG_HASH_FILE="${WORK_DIR}/.config.sha256"
 readonly _SYSCTL_FILE="${_X2G_ROOT}/etc/sysctl.d/99-xray2go.conf"
+readonly _SVC_SYSTEMD_DIR="${_X2G_ROOT}/etc/systemd/system"
+readonly _SVC_OPENRC_DIR="${_X2G_ROOT}/etc/init.d"
 readonly _HOSTS_BAK="${WORK_DIR}/.hosts.bak"
 readonly _ARGO_ENV_FILE="${WORK_DIR}/.argo_env"
 readonly _ACME_ENV_FILE="${WORK_DIR}/.acme_env"
@@ -459,6 +461,7 @@ atomic_write_secret_with_backup() {
 with_lock() {
     local _fn="$1"; shift
     mkdir -p "${WORK_DIR}" 2>/dev/null || true
+    _ensure_tmp_dir || return 1
     if command -v flock >/dev/null 2>&1; then
         ( flock -x 9 || { log_error "获取文件锁失败"; exit 1; }; "${_fn}" "$@" ) \
             9>"${_LOCK_FILE}"
@@ -1894,9 +1897,9 @@ _svc_write_argo_env() {
 
 svc_apply_xray() {
     if is_systemd; then
-        _svc_write_file "/etc/systemd/system/${_SVC_XRAY}.service" "$(_svc_tpl_xray_systemd)" || return 1
+        _svc_write_file "${_SVC_SYSTEMD_DIR}/${_SVC_XRAY}.service" "$(_svc_tpl_xray_systemd)" || return 1
     else
-        local _f="/etc/init.d/${_SVC_XRAY}"
+        local _f="${_SVC_OPENRC_DIR}/${_SVC_XRAY}"
         _svc_write_file "${_f}" "$(_svc_tpl_xray_openrc)" || return 1
         chmod +x "${_f}" 2>/dev/null || true
     fi
@@ -1905,9 +1908,9 @@ svc_apply_xray() {
 svc_apply_tunnel() {
     _svc_write_argo_env || return 1
     if is_systemd; then
-        _svc_write_file "/etc/systemd/system/${_SVC_TUNNEL}.service" "$(_svc_tpl_tunnel_systemd)" || return 1
+        _svc_write_file "${_SVC_SYSTEMD_DIR}/${_SVC_TUNNEL}.service" "$(_svc_tpl_tunnel_systemd)" || return 1
     else
-        local _f="/etc/init.d/${_SVC_TUNNEL}"
+        local _f="${_SVC_OPENRC_DIR}/${_SVC_TUNNEL}"
         _svc_write_file "${_f}" "$(_svc_tpl_tunnel_openrc)" || return 1
         chmod +x "${_f}" 2>/dev/null || true
     fi
@@ -2441,10 +2444,10 @@ module_argo_uninstall() {
     svc_exec_mut stop    "${_SVC_TUNNEL}" 2>/dev/null || true
     svc_exec_mut disable "${_SVC_TUNNEL}" 2>/dev/null || true
     if is_systemd; then
-        rm -f "/etc/systemd/system/${_SVC_TUNNEL}.service" 2>/dev/null || true
+        rm -f "${_SVC_SYSTEMD_DIR}/${_SVC_TUNNEL}.service" 2>/dev/null || true
         systemctl daemon-reload >/dev/null 2>&1 || true
     else
-        rm -f "/etc/init.d/${_SVC_TUNNEL}" 2>/dev/null || true
+        rm -f "${_SVC_OPENRC_DIR}/${_SVC_TUNNEL}" 2>/dev/null || true
     fi
     rm -f "${ARGO_BIN}" "${WORK_DIR}/tunnel.yml" \
           "${WORK_DIR}/tunnel.json" "${_ARGO_ENV_FILE}" 2>/dev/null || true
@@ -3456,11 +3459,11 @@ _install_rollback() {
         svc_exec_mut disable "${_s}" 2>/dev/null || true
     done
     if is_systemd; then
-        rm -f /etc/systemd/system/${_SVC_XRAY}.service \
-              /etc/systemd/system/${_SVC_TUNNEL}.service 2>/dev/null || true
+        rm -f "${_SVC_SYSTEMD_DIR}/${_SVC_XRAY}.service" \
+              "${_SVC_SYSTEMD_DIR}/${_SVC_TUNNEL}.service" 2>/dev/null || true
         systemctl daemon-reload >/dev/null 2>&1 || true
     else
-        rm -f /etc/init.d/${_SVC_XRAY} /etc/init.d/${_SVC_TUNNEL} 2>/dev/null || true
+        rm -f "${_SVC_OPENRC_DIR}/${_SVC_XRAY}" "${_SVC_OPENRC_DIR}/${_SVC_TUNNEL}" 2>/dev/null || true
     fi
     lifecycle_rollback_sysctl
     lifecycle_rollback_hosts
@@ -3545,11 +3548,11 @@ module_xray_uninstall() {
           "${_CONFIG_HASH_FILE}" "${_FW_RULES_FILE}" "${_ARGO_ENV_FILE}" "${WORK_DIR}/tunnel.yml" \
           "${WORK_DIR}/tunnel.json" "${_SVC_LOCK_FILE}" "${_LOCK_FILE}" 2>/dev/null || true
     if is_systemd; then
-        rm -f /etc/systemd/system/${_SVC_XRAY}.service \
-              /etc/systemd/system/${_SVC_TUNNEL}.service 2>/dev/null || true
+        rm -f "${_SVC_SYSTEMD_DIR}/${_SVC_XRAY}.service" \
+              "${_SVC_SYSTEMD_DIR}/${_SVC_TUNNEL}.service" 2>/dev/null || true
         systemctl daemon-reload >/dev/null 2>&1 || true
     else
-        rm -f /etc/init.d/${_SVC_XRAY} /etc/init.d/${_SVC_TUNNEL} 2>/dev/null || true
+        rm -f "${_SVC_OPENRC_DIR}/${_SVC_XRAY}" "${_SVC_OPENRC_DIR}/${_SVC_TUNNEL}" 2>/dev/null || true
     fi
     lifecycle_rollback_sysctl
     lifecycle_rollback_hosts
