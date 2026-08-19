@@ -622,6 +622,44 @@ def test_argo_enable_rolls_back_on_start_failure():
     assert_true("enabled=false" in cp.stdout, "Argo state must roll back after start failure")
 
 
+def test_argo_domain_update_rolls_back_on_apply_failure():
+    cp = run_bash_result("""
+        source ./xray_2go.sh
+        _G_STATE="${_STATE_DEFAULT}"
+        _st_normalize_schema >/dev/null
+        st_set '.argo.enabled = true | .argo.domain = "old.example.com"' >/dev/null
+        prompt() { printf -v "$2" '%s' 'new.example.com'; }
+        argo_apply_fixed_tunnel_from_state() { return 1; }
+        config_print_nodes() { return 0; }
+        module_argo_update_domain
+        rc=$?
+        printf 'module-rc=%s domain=%s\\n' "$rc" "$(st_get '.argo.domain')"
+        exit 0
+    """)
+    assert_true(cp.returncode == 0, "domain rollback probe should complete")
+    assert_true("module-rc=0" not in cp.stdout, "domain update must fail when Argo apply fails")
+    assert_true("domain=old.example.com" in cp.stdout, "Argo domain must roll back after apply failure")
+
+
+def test_argo_domain_update_rolls_back_null_domain_type_on_apply_failure():
+    cp = run_bash_result("""
+        source ./xray_2go.sh
+        _G_STATE="${_STATE_DEFAULT}"
+        _st_normalize_schema >/dev/null
+        st_set '.argo.enabled = true | .argo.domain = null' >/dev/null
+        prompt() { printf -v "$2" '%s' 'new.example.com'; }
+        argo_apply_fixed_tunnel_from_state() { return 1; }
+        config_print_nodes() { return 0; }
+        module_argo_update_domain
+        rc=$?
+        printf 'module-rc=%s domain_type=%s domain=%s\\n' "$rc" "$(printf '%s' "${_G_STATE}" | jq -r '.argo.domain | type')" "$(st_get '.argo.domain')"
+        exit 0
+    """)
+    assert_true(cp.returncode == 0, "null-domain rollback probe should complete")
+    assert_true("module-rc=0" not in cp.stdout, "domain update must fail when Argo apply fails")
+    assert_true("domain_type=null" in cp.stdout, "Argo domain rollback must preserve JSON null type")
+
+
 def test_cforigin_plain_http_does_not_require_certificates():
     cp = run_bash_result("""
         source ./xray_2go.sh

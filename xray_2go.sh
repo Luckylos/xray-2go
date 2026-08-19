@@ -3190,15 +3190,22 @@ argo_apply_fixed_tunnel_from_state() {
 }
 
 module_argo_update_domain() {
-    local _domain
+    local _domain _old_domain _old_domain_json
     [ "$(st_get '.argo.enabled')" = "true" ] || { log_warn "请先启用 Argo"; return 1; }
-    prompt "Argo 域名（回车保持 $(st_get '.argo.domain')): " _domain
+    _old_domain=$(st_get '.argo.domain')
+    _old_domain_json=$(printf '%s' "${_G_STATE}" | jq -c '.argo.domain' 2>/dev/null) \
+        || { log_error "无法读取当前 Argo 域名"; return 1; }
+    prompt "Argo 域名（回车保持 ${_old_domain}）: " _domain
     [ -n "${_domain:-}" ] || return 0
     case "${_domain}" in ''|*' '*|*'/'*|*$'\t'*) log_error "域名格式不合法"; return 1;; esac
     printf '%s' "${_domain}" | grep -qE '^[a-zA-Z0-9]([a-zA-Z0-9._-]*[a-zA-Z0-9])?$' \
         || { log_error "域名格式不合法"; return 1; }
     st_set '.argo.domain = $d' --arg d "${_domain}" || return 1
-    argo_apply_fixed_tunnel_from_state || return 1
+    argo_apply_fixed_tunnel_from_state || {
+        st_set '.argo.domain = $d' --argjson d "${_old_domain_json}" || true
+        log_error "固定隧道同步失败，已回滚 Argo 域名为 ${_old_domain}"
+        return 1
+    }
     config_print_nodes
 }
 
