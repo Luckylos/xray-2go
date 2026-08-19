@@ -688,6 +688,44 @@ def test_cli_reality_port_option_requires_valid_value():
         assert_true('非法端口' in e.stdout or '端口' in e.stdout, 'reality -p should validate port format')
 
 
+def test_socks_runtime_actions_have_single_canonical_owner():
+    from sandbox_runner import XraySandbox
+
+    with XraySandbox() as sandbox:
+        cp = subprocess.run(
+            [
+                "bash",
+                "-lc",
+                "source ./xray_2go.sh; "
+                "set -e; "
+                "mkdir -p \"${WORK_DIR}\"; "
+                "st_init; "
+                "config_apply() { :; }; "
+                "st_persist() { :; }; "
+                "fw_reconcile() { :; }; "
+                "config_print_nodes() { :; }; "
+                "module_socks_action enable; "
+                "printf 'after_enable=%s\\n' \"$(st_get '.socks.enabled')\"; "
+                "module_socks_action disable; "
+                "printf 'after_disable=%s\\n' \"$(st_get '.socks.enabled')\"; "
+                "module_socks_action() { printf 'dispatcher_action=%s\\n' \"$1\"; }; "
+                "module_dispatch socks enable",
+            ],
+            cwd=ROOT,
+            env=sandbox.environment(),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=20,
+            check=False,
+        )
+
+    assert_true(cp.returncode == 0, f"canonical SOCKS action failed: {cp.stdout}")
+    assert_true("after_enable=true" in cp.stdout, "canonical SOCKS action must enable the module")
+    assert_true("after_disable=false" in cp.stdout, "canonical SOCKS action must disable the module")
+    assert_true("dispatcher_action=enable" in cp.stdout, "dispatcher must route SOCKS enable to canonical action")
+
+
 def test_runtime_enable_paths_no_longer_depend_on_removed_ask_helpers():
     out = run_bash("""
         source ./xray_2go.sh

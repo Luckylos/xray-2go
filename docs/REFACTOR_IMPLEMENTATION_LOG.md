@@ -137,3 +137,38 @@ ModuleNotFoundError: No module named 'probe_matrix'
 - 状态：`completed-in-worktree`
 - Phase 0 的三项测试切片均已达到各自验收目标；runtime 回归入口现在默认经过 fresh-process sandbox matrix，不再直接在主进程执行潜在副作用探针。
 - 下一阶段：Phase 1 运行时 Action Layer 统一；必须重新从一个最小 dispatcher/action 行为 RED 开始。
+
+## Phase 1 / Slice 1：SOCKS runtime action canonical owner
+
+### 范围
+
+- 切片：`phase1-slice1-socks-action-owner`
+- 目标：先将一个低耦合模块的 runtime enable/disable 业务逻辑收敛到单一 canonical action owner，同时让 `module_dispatch()` 只负责路由。
+- 验收测试：`test_socks_runtime_actions_have_single_canonical_owner`
+
+### RED
+
+- 新增测试后首次执行失败，原因是生产脚本尚不存在统一 action owner：
+
+```text
+bash: 行 1: module_socks_action: 未找到命令
+```
+
+- 失败发生在实际 sourced shell 的 runtime action 调用中，sandbox root 和 stubbed config/state/firewall 边界已生效。
+
+### GREEN / 验证
+
+- 在 `xray_2go.sh` 新增 `module_socks_action()`，集中处理 SOCKS `enable`、`disable` 和非法 action。
+- 保留原有 `module_socks_enable()` / `module_socks_disable()` 作为无业务逻辑的薄包装，避免破坏既有函数边界测试和内部调用契约。
+- 将 `module_dispatch()` 的 `socks:enable`、`socks:disable` 路由直接指向 `module_socks_action`；dispatcher 不再拥有 SOCKS 状态修改逻辑。
+- 聚焦 GREEN：`test_socks_runtime_actions_have_single_canonical_owner` 通过，实际验证 enable、disable 及 dispatcher 路由。
+- 完整 fresh-process 回归：`python3 tests/probe_regressions.py` 返回码 `0`，`81` 项 `PASS`。
+- `bash -n xray_2go.sh` 通过。
+- `git diff --check` 通过。
+- 测试只使用 sandbox/stub，不启动服务、不触碰宿主 `/etc/xray2go`、防火墙、`/etc/hosts` 或公网链路。
+
+### 切片结论
+
+- 状态：`completed-in-worktree`
+- 本切片只统一 SOCKS enable/disable action ownership，未改变 CLI、状态格式、服务名、生产默认路径或公开协议行为。
+- 下一切片：Phase 1 `update_port`，仍需先写一个最小失败测试；若发现端口更新的外部契约在不同入口不一致，先补 BDD 场景再改实现。

@@ -2172,14 +2172,31 @@ module_vltcp_disable() {
 }
 
 
+module_socks_action() {
+    local _action="${1:-}"
+    case "${_action}" in
+        enable)
+            _module_enable_with_state '.socks.enabled = true' SOCKS5 \
+                || { st_set '.socks.enabled = false' || true; return 1; }
+            ;;
+        disable)
+            st_set '.socks.enabled = false' || return 1
+            _module_disable_commit SOCKS5 || return 1
+            log_ok "SOCKS5 已禁用"
+            ;;
+        *)
+            log_error "SOCKS5 不支持动作: ${_action}"
+            return 1
+            ;;
+    esac
+}
+
 module_socks_enable() {
-    _module_enable_with_state '.socks.enabled = true' SOCKS5         || { st_set '.socks.enabled = false' || true; return 1; }
+    module_socks_action enable
 }
 
 module_socks_disable() {
-    st_set '.socks.enabled = false' || return 1
-    _module_disable_commit SOCKS5 || return 1
-    log_ok "SOCKS5 已禁用"
+    module_socks_action disable
 }
 
 module_cforigin_enable() {
@@ -3729,8 +3746,8 @@ module_dispatch() {
         vlquic:disable) module_vlquic_disable ;;
         cforigin:enable) module_cforigin_enable ;;
         cforigin:disable) module_cforigin_disable ;;
-        socks:enable) module_socks_enable ;;
-        socks:disable) module_socks_disable ;;
+        socks:enable) module_socks_action enable ;;
+        socks:disable) module_socks_action disable ;;
 
         # uninstall/update-port actions
         argo:uninstall) module_argo_uninstall ;;
