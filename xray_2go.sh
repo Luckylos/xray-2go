@@ -580,9 +580,15 @@ val_argo_auth_state() {
     val_argo_token "${_token}" >/dev/null || return 1
 }
 
+# Trojan 密码字符集的单一真相源：只允许 URL-safe 字符，因此密码不会破坏
+# trojan:// 分享链接的 URI 结构（# ? @ & = : / 等都被拒绝）。
+trojan_password_is_valid() {
+    printf '%s' "${1:-}" | grep -qE '^[A-Za-z0-9._~-]{8,128}$'
+}
+
 val_trojan_password() {
     local _password="${1:-}"
-    printf '%s' "${_password}" | grep -qE '^[A-Za-z0-9._~-]{8,128}$' \
+    trojan_password_is_valid "${_password}" \
         || { log_error "Trojan 密码格式异常，需为 8-128 位 URL-safe 字符"; return 1; }
     printf '%s' "${_password}"
 }
@@ -698,7 +704,13 @@ _st_normalize_schema() {
     _c=$(st_get '.argo.auth_protocol')
     case "${_c:-}" in vless|trojan) : ;; *) st_set '.argo.auth_protocol = "vless"' ;; esac
     _c=$(st_get '.argo.trojan_password')
-    { [ -z "${_c:-}" ] || [ "${_c}" = "null" ]; } && st_set '.argo.trojan_password = ""'
+    if [ -z "${_c:-}" ] || [ "${_c}" = "null" ]; then
+        st_set '.argo.trojan_password = ""'
+    elif ! trojan_password_is_valid "${_c}"; then
+        # 非法存量密码会生成结构损坏的 trojan:// 链接，清空后回退使用 UUID
+        log_warn "检测到非法 Trojan 密码，已清空并回退为使用 UUID"
+        st_set '.argo.trojan_password = ""'
+    fi
     # Trojan Argo 仅支持 WS：修复非法组合，避免 inbound fail-closed 锁死 config_apply
     if [ "$(st_get '.argo.auth_protocol')" = "trojan" ] \
        && [ "$(st_get '.argo.protocol')" != "ws" ]; then
@@ -1954,6 +1966,14 @@ crypto_gen_reality_sid() {
     od -An -N8 -tx1 /dev/urandom | tr -d ' \n'
 }
 
+# Trojan 密码：32 位十六进制，字符集是 val_trojan_password 允许集合的子集，
+# 因此生成值永远不会破坏分享链接的 URI 结构。
+crypto_gen_trojan_password() {
+    command -v openssl >/dev/null 2>&1 && { openssl rand -hex 16 2>/dev/null; return; }
+    command -v xxd    >/dev/null 2>&1 && { head -c 16 /dev/urandom | xxd -p | tr -d '\n'; return; }
+    od -An -N16 -tx1 /dev/urandom | tr -d ' \n'
+}
+
 # ==============================================================================
 # Config synthesis and apply
 # ==============================================================================
@@ -2440,18 +2460,34 @@ module_argo_update_protocol() {
 }
 
 module_argo_update_auth_protocol() {
-    local _en _auth
+    local _en _auth _pw
     _en=$(st_get '.argo.enabled')
     [ "${_en}" = "true" ] || { log_warn "请先启用 Argo"; return 1; }
     _auth=$(st_get '.argo.auth_protocol')
+    _pw=$(st_get '.argo.trojan_password')
     install_plan_argo_update_auth_protocol || return 1
     argo_apply_fixed_tunnel_from_state || {
-        st_set '.argo.auth_protocol = $v' --arg v "${_auth}" || true
+        st_set '.argo.auth_protocol = $v | .argo.trojan_password = $p' --arg v "${_auth}" --arg p "${_pw}" || true
         log_error "固定隧道同步失败，已回滚入站认证为 ${_auth}"
         return 1
     }
     config_print_nodes
 }
+
+module_argo_update_trojan_password() {
+    local _en _pw
+    _en=$(st_get '.argo.enabled')
+    [ "${_en}" = "true" ] || { log_warn "请先启用 Argo"; return 1; }
+    _pw=$(st_get '.argo.trojan_password')
+    install_plan_argo_update_trojan_password || return 1
+    argo_apply_fixed_tunnel_from_state || {
+        st_set '.argo.trojan_password = $p' --arg p "${_pw}" || true
+        log_error "固定隧道同步失败，已回滚 Trojan 密码"
+        return 1
+    }
+    config_print_nodes
+}
+
 module_ff_update_mode() {
     install_plan_ff_update_mode || return 1
     [ "$(st_get '.ff.enabled')" = "true" ] || { log_warn "FreeFlow 未启用"; return 1; }
@@ -3685,6 +3721,7 @@ module_dispatch() {
         # field/config update actions
         argo:update_protocol) module_argo_update_protocol ;;
         argo:update_auth_protocol) module_argo_update_auth_protocol ;;
+        argo:update_trojan_password) module_argo_update_trojan_password ;;
         argo:update_domain) module_argo_update_domain ;;
         argo:update_auth) module_argo_update_auth ;;
         ff:update_mode) module_ff_update_mode ;;
@@ -4084,11 +4121,43 @@ install_plan_argo_update_auth_protocol() {
             [ "$(st_get '.argo.protocol')" = "ws" ] || {
                 log_error "Trojan Argo 当前仅支持 WS，请先将传输协议设为 WS"; return 1; }
             st_set '.argo.auth_protocol = "trojan"' || return 1
+            argo_seed_trojan_password || return 1
             log_ok "Argo 入站认证已设置为 Trojan" ;;
         *)
             st_set '.argo.auth_protocol = "vless"' || return 1
             log_ok "Argo 入站认证已设置为 VLESS" ;;
     esac
+}
+
+# 切换到 Trojan 时补齐独立密码，避免状态字段长期为空、被动回退到 UUID
+argo_seed_trojan_password() {
+    local _cur _pw
+    _cur=$(st_get '.argo.trojan_password')
+    trojan_password_is_valid "${_cur:-}" && return 0
+    _pw=$(crypto_gen_trojan_password) || { log_error "Trojan 密码生成失败"; return 1; }
+    val_trojan_password "${_pw}" >/dev/null || return 1
+    st_set '.argo.trojan_password = $p' --arg p "${_pw}" || return 1
+    log_info "已生成独立 Trojan 密码（可在 Argo 工作台“修改 Trojan 密码”中重设）"
+}
+
+install_plan_argo_update_trojan_password() {
+    [ "$(st_get '.argo.auth_protocol')" = "trojan" ] || {
+        log_error "当前 Argo 入站认证不是 Trojan，请先将入站认证设为 Trojan"; return 1; }
+    local _cur _pw
+    _cur=$(st_get '.argo.trojan_password')
+    if trojan_password_is_valid "${_cur:-}"; then
+        prompt_secret "Trojan 密码（回车保持当前，8-128 位 URL-safe 字符）: " _pw
+    else
+        prompt_secret "Trojan 密码（回车自动生成，8-128 位 URL-safe 字符）: " _pw
+    fi
+    if [ -z "${_pw:-}" ]; then
+        trojan_password_is_valid "${_cur:-}" && { log_info "保持当前 Trojan 密码"; return 0; }
+        _pw=$(crypto_gen_trojan_password) || { log_error "Trojan 密码生成失败"; return 1; }
+        log_info "已生成独立 Trojan 密码"
+    fi
+    val_trojan_password "${_pw}" >/dev/null || return 1
+    st_set '.argo.trojan_password = $p' --arg p "${_pw}" || return 1
+    log_ok "Argo Trojan 密码已更新"
 }
 
 install_plan_argo_update_protocol() {
@@ -4706,12 +4775,19 @@ unified_menu_argo() {
     local _mode="${1:-install}" _runtime=0
     _unified_mode_is_runtime "${_mode}" && { _runtime=1; _manage_module_entry_check || return; }
     while true; do
-        local _en _proto _port _domain _xpad _auth_mode _svc _summary
+        local _en _proto _port _domain _xpad _auth_mode _svc _summary _auth_proto _pw_state
         _en=$(st_get '.argo.enabled')
         _proto=$(st_get '.argo.protocol')
         _port=$(port_of argo)
         _domain=$(st_get '.argo.domain')
         _xpad=$(xpad_of argo)
+        _auth_proto=$(st_get '.argo.auth_protocol')
+        if [ "${_auth_proto}" = "trojan" ]; then
+            trojan_password_is_valid "$(st_get '.argo.trojan_password')" \
+                && _pw_state='已设置独立密码' || _pw_state='未设置（回退 UUID）'
+        else
+            _pw_state='不适用'
+        fi
         [ -f "${WORK_DIR}/tunnel.json" ] && _auth_mode='json-cred' || { [ -n "$(st_get '.argo.token')" ] && [ "$(st_get '.argo.token')" != "null" ] && _auth_mode='token' || _auth_mode='未配置'; }
         _svc=$(_unified_runtime_status_for argo)
         _summary=$(_unified_summary_for "${_runtime}" argo)
@@ -4720,6 +4796,7 @@ unified_menu_argo() {
         _unified_render_status "${_runtime}" "${_en}" "${_svc}"
         printf "  协议: ${C_GRN}%s${C_RST}  回源端口: ${C_YLW}%s${C_RST}\n" "${_proto}" "${_port}"
         printf "  域名: ${C_CYN}%s${C_RST}  鉴权: ${C_YLW}%s${C_RST}\n" "${_domain:-未配置}" "${_auth_mode}"
+        printf "  入站认证: ${C_GRN}%s${C_RST}  Trojan 密码: ${C_YLW}%s${C_RST}\n" "${_auth_proto}" "${_pw_state}"
         printf "  xPadding: ${C_YLW}%s${C_RST}\n" "${_xpad}"
         _hr
         _menu_print_action 1 "切换启用状态"
@@ -4728,8 +4805,9 @@ unified_menu_argo() {
         _menu_print_action 4 "修改域名"
         _menu_print_action 5 "修改密钥/凭证"
         _menu_print_action 6 "修改入站认证（VLESS / Trojan）"
-        _menu_print_action 7 "切换 xPadding（仅 XHTTP）"
-        _menu_print_action 8 "查看当前节点摘要"
+        _menu_print_action 7 "修改 Trojan 密码（仅 Trojan）"
+        _menu_print_action 8 "切换 xPadding（仅 XHTTP）"
+        _menu_print_action 9 "查看当前节点摘要"
         if [ "${_runtime}" -eq 1 ]; then
             _hr
             _menu_print_action r "重启隧道服务"
@@ -4739,7 +4817,7 @@ unified_menu_argo() {
         fi
         _menu_print_back
         _hr
-        prompt "请选择操作 $( [ "${_runtime}" -eq 1 ] && printf '(0-8/r/h/v/u)' || printf '(0-8)' ): " _c
+        prompt "请选择操作 $( [ "${_runtime}" -eq 1 ] && printf '(0-9/r/h/v/u)' || printf '(0-9)' ): " _c
         case "${_c:-}" in
             1) _unified_toggle_or_plan "${_runtime}" argo "${_en}" install_plan_argo_toggle || true ;;
             2) _unified_dispatch_or_plan "${_runtime}" argo update_protocol install_plan_argo_update_protocol || true ;;
@@ -4747,8 +4825,9 @@ unified_menu_argo() {
             4) _unified_dispatch_or_plan "${_runtime}" argo update_domain install_plan_argo_update_domain || true ;;
             5) _unified_dispatch_or_plan "${_runtime}" argo update_auth install_plan_argo_update_auth || true ;;
             6) _unified_dispatch_or_plan "${_runtime}" argo update_auth_protocol install_plan_argo_update_auth_protocol || true ;;
-            7) _unified_runtime_fn_or_plan "${_runtime}" install_plan_argo_toggle_xpad _menu_toggle_xpad argo Argo || true ;;
-            8) log_info "Argo: ${_summary}" ;;
+            7) _unified_dispatch_or_plan "${_runtime}" argo update_trojan_password install_plan_argo_update_trojan_password || true ;;
+            8) _unified_runtime_fn_or_plan "${_runtime}" install_plan_argo_toggle_xpad _menu_toggle_xpad argo Argo || true ;;
+            9) log_info "Argo: ${_summary}" ;;
             r) _unified_runtime_only_fn "${_runtime}" _module_action_or_continue argo restart || true ;;
             h) _unified_runtime_only_fn "${_runtime}" argo_check_health || true ;;
             v) _unified_runtime_only_fn "${_runtime}" _module_action_or_continue argo show || true ;;

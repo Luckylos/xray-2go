@@ -10,7 +10,7 @@ Xray-2go 是一个面向 Linux VPS 的交互式 Xray 安装与管理脚本，支
 - 支持 systemd 与 OpenRC
 - 支持 Debian / Ubuntu / RHEL 系 / Alpine
 - 内置协议：
-  - Argo：VLESS + WS / XHTTP + TLS，通过 Cloudflare Tunnel 转发
+  - Argo：VLESS + WS / XHTTP + TLS，或 Trojan + WS + TLS，通过 Cloudflare Tunnel 转发
   - FreeFlow：VLESS + WS / HTTPUpgrade / XHTTP / TCP HTTP 伪装
   - Reality：VLESS + Reality TCP Vision / XHTTP Reality
   - VLESS-TCP：明文落地，可配置监听地址
@@ -19,6 +19,17 @@ Xray-2go 是一个面向 Linux VPS 的交互式 Xray 安装与管理脚本，支
 - xPadding 支持按协议独立开关，可实现 Argo 开启、Reality 关闭等组合
 - 防火墙规则采用托管标记文件记录，只删除脚本实际创建的规则，避免误删其它服务或管理员手动规则
 - 完整卸载会清理服务、配置、状态、插件、Tunnel 文件、锁文件、PID、快捷命令和脚本托管防火墙规则
+
+### Argo 入站认证：VLESS / Trojan
+
+Argo 工作台的“修改入站认证”可在 VLESS 与 Trojan 之间切换：
+
+- Trojan 仅支持 WS 传输。当入站认证为 Trojan 时，脚本会拒绝把传输协议切换为 XHTTP；同样地，传输协议不是 WS 时也拒绝切换为 Trojan
+- 切换到 Trojan 会自动生成一个独立的随机 Trojan 密码，与 VLESS 使用的 UUID 无关
+- 可通过 Argo 工作台的“修改 Trojan 密码”单独设置或重新生成密码；输入时不回显
+- 密码限制为 8-128 位 URL-safe 字符（`A-Z a-z 0-9 . _ ~ -`），避免 `#`、`?`、`@` 等字符破坏 `trojan://` 分享链接结构
+- 若状态中的 Trojan 密码为空，则回退使用 UUID 作为密码；载入状态时检测到非法存量密码会清空并回退为使用 UUID
+- 关闭或卸载 Argo 会把入站认证重置为 VLESS、传输重置为 WS，并清空 Trojan 密码
 
 ## 安全与实现原则
 

@@ -6,6 +6,8 @@ import subprocess
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "xray_2go.sh"
 TEXT = SCRIPT.read_text(encoding="utf-8")
+README = ROOT / "README.md"
+README_TEXT = README.read_text(encoding="utf-8")
 
 
 def assert_true(cond, msg):
@@ -687,17 +689,27 @@ def test_transport_switch_is_guarded_while_trojan_auth_is_active():
 
 
 def test_runtime_argo_updates_roll_back_in_memory_state_on_apply_failure():
-    for fn, field in [
-        ("module_argo_update_protocol", ".argo.protocol"),
-        ("module_argo_update_auth_protocol", ".argo.auth_protocol"),
-    ]:
-        m = re.search(rf"{fn}\(\) \{{(?P<body>.*?)\n\}}", TEXT, re.S)
-        assert_true(m, f"{fn} function missing")
-        body = m.group("body")
-        assert_true(
-            f"st_set '{field} = $v'" in body,
-            f"{fn} must roll back {field} when tunnel apply fails",
-        )
+    # Behavioural probe: a failing fixed-tunnel apply must leave in-memory state untouched.
+    out = run_bash("""
+        source ./xray_2go.sh
+        st_init >/dev/null 2>&1
+        st_set '.argo.enabled = true | .argo.protocol = "ws" | .argo.auth_protocol = "vless" | .argo.trojan_password = ""' >/dev/null
+        argo_apply_fixed_tunnel_from_state() { return 1; }
+        config_print_nodes() { return 0; }
+        prompt() { printf -v "$2" '%s' '2'; }
+        module_argo_update_protocol >/dev/null 2>&1 && echo "proto_unexpected_ok"
+        printf 'proto=%s\n' "$(st_get '.argo.protocol')"
+        st_set '.argo.protocol = "ws"' >/dev/null
+        module_argo_update_auth_protocol >/dev/null 2>&1 && echo "auth_unexpected_ok"
+        printf 'auth=%s pw_empty=%s\n' \
+            "$(st_get '.argo.auth_protocol')" \
+            "$( [ -z "$(st_get '.argo.trojan_password')" ] && printf yes || printf no )"
+    """)
+    assert_true("proto_unexpected_ok" not in out, f"transport update must fail when tunnel apply fails: {out}")
+    assert_true("proto=ws" in out, f"module_argo_update_protocol must roll back .argo.protocol on apply failure: {out}")
+    assert_true("auth_unexpected_ok" not in out, f"auth update must fail when tunnel apply fails: {out}")
+    assert_true("auth=vless" in out, f"module_argo_update_auth_protocol must roll back .argo.auth_protocol on apply failure: {out}")
+    assert_true("pw_empty=yes" in out, f"auth rollback must also revert the seeded Trojan password: {out}")
 
 
 def test_argo_disable_and_uninstall_reset_authentication_state():
@@ -707,6 +719,240 @@ def test_argo_disable_and_uninstall_reset_authentication_state():
         body = m.group("body")
         assert_true('.argo.auth_protocol = "vless"' in body, f"{fn} must reset Argo auth protocol")
         assert_true('.argo.protocol = "ws"' in body, f"{fn} must reset Argo transport protocol")
+
+
+def test_trojan_password_generator_is_random_and_validator_safe():
+    cp = run_bash_result("""
+        source ./xray_2go.sh
+        a=$(crypto_gen_trojan_password) || exit 90
+        b=$(crypto_gen_trojan_password) || exit 91
+        val_trojan_password "${a}" >/dev/null 2>&1 || exit 92
+        val_trojan_password "${b}" >/dev/null 2>&1 || exit 93
+        [ "${a}" != "${b}" ] || exit 94
+    """)
+    assert_true(
+        cp.returncode == 0,
+        f"crypto_gen_trojan_password must emit distinct validator-safe passwords (rc={cp.returncode}): {cp.stdout}",
+    )
+
+
+def test_state_drops_uri_unsafe_trojan_password_and_keeps_valid_one():
+    bad = run_bash_result("""
+        source ./xray_2go.sh
+        _G_STATE='{"uuid":"56b6d850-1e42-48ef-8229-94f5d8292e54","argo":{"enabled":true,"protocol":"ws","auth_protocol":"trojan","trojan_password":"bad#pass?x@y"}}'
+        _st_normalize_schema >/dev/null 2>&1
+        printf '%s' "${_G_STATE}" | jq -e '.argo.trojan_password == ""' >/dev/null
+    """)
+    assert_true(
+        bad.returncode == 0,
+        f"normalization must drop a URI-unsafe stored Trojan password (rc={bad.returncode}): {bad.stdout}",
+    )
+    good = run_bash_result("""
+        source ./xray_2go.sh
+        _G_STATE='{"uuid":"56b6d850-1e42-48ef-8229-94f5d8292e54","argo":{"enabled":true,"protocol":"ws","auth_protocol":"trojan","trojan_password":"Good.pass_x~y-z"}}'
+        _st_normalize_schema >/dev/null 2>&1
+        printf '%s' "${_G_STATE}" | jq -e '.argo.trojan_password == "Good.pass_x~y-z"' >/dev/null
+    """)
+    assert_true(
+        good.returncode == 0,
+        f"normalization must keep a validator-safe stored Trojan password (rc={good.returncode}): {good.stdout}",
+    )
+
+
+TROJAN_STATE_SEED = (
+    "_G_STATE='{\"uuid\":\"56b6d850-1e42-48ef-8229-94f5d8292e54\","
+    "\"argo\":{\"enabled\":true,\"protocol\":\"ws\",\"auth_protocol\":\"trojan\",\"trojan_password\":\"\"}}'"
+)
+
+
+def test_install_plan_trojan_password_entry_generates_and_persists_password():
+    out = run_bash("""
+        source ./xray_2go.sh
+        %s
+        _st_normalize_schema >/dev/null 2>&1
+        prompt_secret() { printf -v "$2" '%%s' ''; }
+        install_plan_argo_update_trojan_password >/dev/null 2>&1 || { echo "rc=fail"; exit 0; }
+        _pw=$(st_get '.argo.trojan_password')
+        printf 'len=%%s uuid_match=%%s valid=%%s\n' \
+            "${#_pw}" \
+            "$( [ "${_pw}" = "$(st_get '.uuid')" ] && printf yes || printf no )" \
+            "$( val_trojan_password "${_pw}" >/dev/null 2>&1 && printf yes || printf no )"
+    """ % TROJAN_STATE_SEED)
+    assert_true("rc=fail" not in out, f"empty input must auto-generate a Trojan password: {out}")
+    assert_true("valid=yes" in out, f"generated Trojan password must pass the validator: {out}")
+    assert_true("uuid_match=no" in out, f"generated Trojan password must be independent from the UUID: {out}")
+
+
+def test_install_plan_trojan_password_entry_requires_trojan_auth():
+    cp = run_bash_result("""
+        source ./xray_2go.sh
+        declare -F install_plan_argo_update_trojan_password >/dev/null || exit 79
+        _G_STATE="${_STATE_DEFAULT}"
+        _st_normalize_schema >/dev/null 2>&1
+        prompt_secret() { printf -v "$2" '%s' 'ValidPass_123'; }
+        install_plan_argo_update_trojan_password >/dev/null 2>&1 && exit 80
+        [ "$(st_get '.argo.trojan_password')" = "" ] || exit 81
+    """)
+    assert_true(
+        cp.returncode == 0,
+        f"Trojan password entry must refuse while Argo auth is VLESS (rc={cp.returncode}): {cp.stdout}",
+    )
+
+
+def test_install_plan_trojan_password_entry_rejects_uri_unsafe_input():
+    cp = run_bash_result("""
+        source ./xray_2go.sh
+        declare -F install_plan_argo_update_trojan_password >/dev/null || exit 79
+        %s
+        _st_normalize_schema >/dev/null 2>&1
+        st_set '.argo.trojan_password = $p' --arg p 'KeepMe_12345' >/dev/null
+        prompt_secret() { printf -v "$2" '%%s' 'bad#pass?x@y'; }
+        install_plan_argo_update_trojan_password >/dev/null 2>&1 && exit 80
+        [ "$(st_get '.argo.trojan_password')" = "KeepMe_12345" ] || exit 81
+    """ % TROJAN_STATE_SEED)
+    assert_true(
+        cp.returncode == 0,
+        f"URI-unsafe input must be rejected without clobbering the stored password (rc={cp.returncode}): {cp.stdout}",
+    )
+
+
+def test_install_plan_trojan_password_entry_accepts_explicit_value():
+    cp = run_bash_result("""
+        source ./xray_2go.sh
+        %s
+        _st_normalize_schema >/dev/null 2>&1
+        prompt_secret() { printf -v "$2" '%%s' 'Explicit.pass_9~x-y'; }
+        install_plan_argo_update_trojan_password >/dev/null 2>&1 || exit 80
+        [ "$(st_get '.argo.trojan_password')" = "Explicit.pass_9~x-y" ] || exit 81
+    """ % TROJAN_STATE_SEED)
+    assert_true(
+        cp.returncode == 0,
+        f"explicit validator-safe password must be persisted (rc={cp.returncode}): {cp.stdout}",
+    )
+
+
+def test_switching_argo_auth_to_trojan_seeds_independent_password():
+    out = run_bash("""
+        source ./xray_2go.sh
+        _G_STATE="${_STATE_DEFAULT}"
+        _st_normalize_schema >/dev/null 2>&1
+        st_set '.argo.enabled = true | .argo.protocol = "ws"' >/dev/null
+        prompt() { printf -v "$2" '%s' '2'; }
+        install_plan_argo_update_auth_protocol >/dev/null 2>&1 || { echo "rc=fail"; exit 0; }
+        _pw=$(st_get '.argo.trojan_password')
+        printf 'auth=%s empty=%s uuid_match=%s valid=%s\n' \
+            "$(st_get '.argo.auth_protocol')" \
+            "$( [ -z "${_pw}" ] && printf yes || printf no )" \
+            "$( [ "${_pw}" = "$(st_get '.uuid')" ] && printf yes || printf no )" \
+            "$( val_trojan_password "${_pw}" >/dev/null 2>&1 && printf yes || printf no )"
+    """)
+    assert_true("rc=fail" not in out, f"switching Argo auth to Trojan must succeed: {out}")
+    assert_true("auth=trojan" in out, f"Argo auth must become Trojan: {out}")
+    assert_true("empty=no" in out and "valid=yes" in out, f"switching to Trojan must seed a stored password: {out}")
+    assert_true("uuid_match=no" in out, f"seeded Trojan password must not reuse the UUID: {out}")
+
+
+def test_trojan_password_entry_is_wired_into_menu_and_uses_secret_prompt():
+    m = re.search(r"install_plan_argo_update_trojan_password\(\) \{(?P<body>.*?)\n\}", TEXT, re.S)
+    assert_true(m, "install_plan_argo_update_trojan_password function missing")
+    body = m.group("body")
+    assert_true("prompt_secret" in body, "Trojan password entry must read the secret without echoing it")
+    assert_true('prompt "Trojan' not in TEXT, "Trojan password must never be read with the echoing prompt helper")
+    assert_true("crypto_gen_trojan_password" in body, "Trojan password entry must support auto-generation")
+    assert_true("val_trojan_password" in body, "Trojan password entry must validate before writing state")
+    menu = re.search(r"unified_menu_argo\(\) \{(?P<body>.*?)\n\}", TEXT, re.S)
+    assert_true(menu, "unified_menu_argo function missing")
+    menu_body = menu.group("body")
+    assert_true("Trojan 密码" in menu_body, "Argo workbench must expose a Trojan password action")
+    assert_true(
+        "install_plan_argo_update_trojan_password" in menu_body,
+        "Argo workbench must route the Trojan password action to the install-plan entry",
+    )
+    assert_true(
+        "update_trojan_password" in menu_body,
+        "Argo workbench must route the Trojan password action to the runtime module action",
+    )
+
+
+def test_runtime_trojan_password_update_is_dispatchable_and_persists():
+    out = run_bash("""
+        source ./xray_2go.sh
+        st_init >/dev/null 2>&1
+        st_set '.argo.enabled = true | .argo.protocol = "ws" | .argo.auth_protocol = "trojan" | .argo.trojan_password = ""' >/dev/null
+        argo_apply_fixed_tunnel_from_state() { return 0; }
+        config_print_nodes() { return 0; }
+        prompt_secret() { printf -v "$2" '%s' 'Runtime.pass_1~x-y'; }
+        module_dispatch argo update_trojan_password >/dev/null 2>&1 || { echo "rc=fail"; exit 0; }
+        printf 'pw=%s\n' "$(st_get '.argo.trojan_password')"
+    """)
+    assert_true("rc=fail" not in out, f"runtime dispatch must support argo:update_trojan_password: {out}")
+    assert_true("pw=Runtime.pass_1~x-y" in out, f"runtime Trojan password update must persist the new value: {out}")
+
+
+def test_runtime_trojan_password_update_rolls_back_on_apply_failure():
+    out = run_bash("""
+        source ./xray_2go.sh
+        declare -F module_argo_update_trojan_password >/dev/null || { echo "rc=missing"; exit 0; }
+        st_init >/dev/null 2>&1
+        st_set '.argo.enabled = true | .argo.protocol = "ws" | .argo.auth_protocol = "trojan" | .argo.trojan_password = $p' --arg p 'Original.pass_1' >/dev/null
+        argo_apply_fixed_tunnel_from_state() { return 1; }
+        config_print_nodes() { return 0; }
+        prompt_secret() { printf -v "$2" '%s' 'Replacement.pass_2'; }
+        module_dispatch argo update_trojan_password >/dev/null 2>&1 && echo "rc=unexpected-ok"
+        printf 'pw=%s\n' "$(st_get '.argo.trojan_password')"
+    """)
+    assert_true("rc=missing" not in out, f"module_argo_update_trojan_password must exist: {out}")
+    assert_true("rc=unexpected-ok" not in out, f"runtime Trojan password update must fail when tunnel apply fails: {out}")
+    assert_true(
+        "pw=Original.pass_1" in out,
+        f"runtime Trojan password update must roll back in-memory state on apply failure: {out}",
+    )
+
+
+def test_runtime_trojan_password_update_requires_enabled_argo():
+    cp = run_bash_result("""
+        source ./xray_2go.sh
+        declare -F module_argo_update_trojan_password >/dev/null || exit 79
+        st_init >/dev/null 2>&1
+        st_set '.argo.enabled = false | .argo.auth_protocol = "trojan"' >/dev/null
+        prompt_secret() { printf -v "$2" '%s' 'Should.not_apply1'; }
+        module_argo_update_trojan_password >/dev/null 2>&1 && exit 80
+        [ "$(st_get '.argo.trojan_password')" = "" ] || exit 81
+    """)
+    assert_true(
+        cp.returncode == 0,
+        f"runtime Trojan password update must refuse while Argo is disabled (rc={cp.returncode}): {cp.stdout}",
+    )
+
+
+def test_stored_trojan_password_is_used_by_inbound_and_share_link():
+    out = run_bash("""
+        source ./xray_2go.sh
+        st_init >/dev/null 2>&1
+        st_set '.argo.enabled = true | .argo.protocol = "ws" | .argo.auth_protocol = "trojan" | .argo.domain = "t.example.com" | .argo.trojan_password = $p' --arg p 'Link.pass_9~x-y' >/dev/null
+        plugin_install_builtins >/dev/null 2>&1
+        plugin_load_all >/dev/null 2>&1
+        _plg_argo_inbound | jq -r '.settings.clients[0].password' | sed 's/^/inbound=/'
+        printf 'link=%s\n' "$(_plg_argo_link)"
+    """)
+    assert_true("inbound=Link.pass_9~x-y" in out, f"stored Trojan password must drive the inbound: {out}")
+    assert_true("link=trojan://Link.pass_9~x-y@" in out, f"stored Trojan password must drive the share link: {out}")
+
+
+def test_readme_documents_trojan_argo_capability():
+    assert_true("Trojan" in README_TEXT, "README must document the Trojan Argo capability")
+    assert_true(
+        "Trojan + WS" in README_TEXT,
+        "README must state that Trojan Argo is limited to WS transport",
+    )
+    assert_true(
+        "8-128" in README_TEXT and "URL-safe" in README_TEXT,
+        "README must document the Trojan password charset/length contract",
+    )
+    assert_true(
+        "UUID" in README_TEXT and "回退" in README_TEXT,
+        "README must document the UUID fallback when no Trojan password is stored",
+    )
 
 
 def main():
