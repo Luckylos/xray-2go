@@ -3927,7 +3927,7 @@ _menu_render() {
     printf "${C_BOLD}${C_PUR}  ║${C_RST}  FF       : %-29s${C_PUR} ${C_RST}\n" "${_MENU_FD}"
     printf "${C_BOLD}${C_PUR}  ║${C_RST}  SOCKS5   : %-29s${C_PUR} ${C_RST}\n" "${_MENU_SD}"
     printf "${C_BOLD}${C_PUR}  ╚══════════════════════════════════════════╝${C_RST}\n\n"
-    printf "  ${C_GRN}1.${C_RST} 开始安装（自定义搭建）\n"
+    printf "  ${C_GRN}1.${C_RST} 开始部署（快速向导）\n"
     printf "  ${C_RED}2.${C_RST} 卸载整套 Xray-2go\n"; _hr
     printf "  ${C_GRN}3.${C_RST} 管理 Argo 固定隧道\n"
     printf "  ${C_GRN}4.${C_RST} 管理 Reality\n"
@@ -3935,12 +3935,12 @@ _menu_render() {
     printf "  ${C_GRN}6.${C_RST} 管理 VLESS-XHTTP-H3\n"
     printf "  ${C_GRN}7.${C_RST} 管理 FreeFlow\n"
     printf "  ${C_GRN}8.${C_RST} 管理 CF Origin 回源\n"
-    printf "  ${C_GRN}11.${C_RST} 管理 SOCKS5 入站\n"; _hr
     printf "  ${C_GRN}9.${C_RST} 查看节点与连接提示\n"
     printf "  ${C_GRN}10.${C_RST} 更新 UUID\n"
+    printf "  ${C_GRN}11.${C_RST} 管理 SOCKS5 入站\n"; _hr
     printf "  ${C_GRN}s.${C_RST} 更新快捷方式/脚本\n"; _hr
     printf "  ${C_RED}0.${C_RST} 退出程序\n\n"
-    printf "  说明: ${C_YLW}无参数默认进入交互菜单${C_RST}；命令行 ${C_CYN}reality${C_RST} 可一键安装 VLESS + Reality (TCP)\n\n"
+    printf "  说明: ${C_YLW}首次部署进入快速向导，已安装时进入管理菜单${C_RST}；命令行 ${C_CYN}reality${C_RST} 可一键安装 VLESS + Reality (TCP)\n\n"
 }
 
 install_plan_reset_defaults() {
@@ -4077,7 +4077,7 @@ install_plan_module_summary() {
 install_plan_render_summary() {
     clear; echo ""
     log_title "══ 自定义安装计划 ══"
-    printf "  说明      : ${C_YLW}无参数默认进入此菜单${C_RST}；命令行 ${C_CYN}reality${C_RST} 可一键安装 VLESS + Reality (TCP)\n"
+    printf "  说明      : ${C_YLW}首次部署默认进入快速向导；需要多入口或完整参数时选择高级自定义部署${C_RST}\n"
     printf "  当前 UUID : ${C_CYN}%s${C_RST}\n" "$(st_get '.uuid')"
     printf "  Argo      : %s\n" "$(install_plan_module_summary argo)"
     printf "  FreeFlow  : %s\n" "$(install_plan_module_summary ff)"
@@ -5204,6 +5204,97 @@ unified_menu_socks() {
     done
 }
 
+install_wizard_render() {
+    clear; echo ""
+    log_title "══ 快速部署向导 ══"
+    printf "  先选择部署目标；需要多入口或逐项调整时，再进入高级自定义部署。\n\n"
+    printf "  ${C_GRN}1.${C_RST} VLESS + Reality TCP ${C_YLW}[推荐，依赖最少]${C_RST}\n"
+    printf "  ${C_GRN}2.${C_RST} Argo Tunnel ${C_YLW}[需要域名与 Cloudflare 凭证]${C_RST}\n"
+    printf "  ${C_GRN}3.${C_RST} 高级自定义部署 ${C_YLW}[多入口/完整参数]${C_RST}\n"
+    _hr
+    _menu_print_action 0 "返回主菜单" "${C_PUR}"
+}
+
+install_wizard_confirm() {
+    clear; echo ""
+    log_title "══ 确认部署 ══"
+    printf "  UUID      : %s\n" "$(st_get '.uuid')"
+    printf "  Argo      : %s\n" "$(install_plan_module_summary argo)"
+    printf "  FreeFlow  : %s\n" "$(install_plan_module_summary ff)"
+    printf "  Reality   : %s\n" "$(install_plan_module_summary reality)"
+    printf "  VLESS-TCP : %s\n" "$(install_plan_module_summary vltcp)"
+    printf "  SOCKS5    : %s\n" "$(install_plan_module_summary socks)"
+    printf "  XHTTP-H3  : %s\n" "$(install_plan_module_summary vlquic)"
+    printf "  CF-Origin : %s\n" "$(install_plan_module_summary cforigin)"
+    _hr
+    printf "  ${C_YLW}安装前会再次执行完整校验；确认后才开始安装。${C_RST}\n"
+    prompt "确认开始部署？(Y/n): " _c
+    case "${_c:-y}" in
+        n|N) log_info "已取消本次部署，当前计划仍可从高级自定义部署继续调整"; return 1 ;;
+        *) install_execute_current_plan ;;
+    esac
+}
+
+install_wizard_require_argo_domain() {
+    local _domain
+    while true; do
+        _domain=$(st_get '.argo.domain')
+        [ -n "${_domain}" ] && [ "${_domain}" != "null" ] && return 0
+        install_plan_argo_update_domain || return 1
+        _domain=$(st_get '.argo.domain')
+        [ -n "${_domain}" ] && [ "${_domain}" != "null" ] && return 0
+        log_error "Argo 域名是必填项，请重新输入"
+    done
+}
+
+install_wizard_require_argo_auth() {
+    local _token _cred
+    while true; do
+        _token=$(st_get '.argo.token')
+        _cred=$(st_get '.argo.cred_b64')
+        { [ -n "${_token}" ] && [ "${_token}" != "null" ]; } || { [ -n "${_cred}" ] && [ "${_cred}" != "null" ]; } && return 0
+        install_plan_argo_update_auth || return 1
+        _token=$(st_get '.argo.token')
+        _cred=$(st_get '.argo.cred_b64')
+        { [ -n "${_token}" ] && [ "${_token}" != "null" ]; } || { [ -n "${_cred}" ] && [ "${_cred}" != "null" ]; } && return 0
+        log_error "Argo 凭证是必填项，请重新输入"
+    done
+}
+
+install_wizard_reality() {
+    preset_apply_reality_tcp_default || return 1
+    install_wizard_confirm
+}
+
+install_wizard_argo() {
+    install_plan_reset_defaults || return 1
+    install_plan_argo_toggle || return 1
+    install_plan_argo_update_protocol || return 1
+    install_wizard_require_argo_domain || return 1
+    install_wizard_require_argo_auth || return 1
+    install_plan_argo_update_auth_protocol || return 1
+    if [ "$(st_get '.argo.auth_protocol')" = "trojan" ]; then
+        install_plan_argo_update_trojan_password || return 1
+    fi
+    install_wizard_confirm
+}
+
+install_wizard_menu() {
+    while true; do
+        install_wizard_render
+        local _c
+        prompt "请选择部署方案 (0-3): " _c
+        case "${_c:-}" in
+            1) install_wizard_reality && return 0 ;;
+            2) install_wizard_argo && return 0 ;;
+            3) install_plan_menu && return 0 ;;
+            0) log_info "已返回主菜单"; return 0 ;;
+            *) log_error "无效选项，请输入 0-3" ;;
+        esac
+        _pause
+    done
+}
+
 install_plan_menu() {
     while true; do
         install_plan_render_summary
@@ -5241,7 +5332,7 @@ module_xray_install() {
         log_warn "Xray-2go 已安装但未运行；如需重装请先卸载 (选项 2)，如需启动请进入对应管理菜单。"; return
     fi
     install_plan_reset_defaults || { log_error "安装计划初始化失败"; return 1; }
-    install_plan_menu
+    install_wizard_menu
 }
 menu() {
     local _MENU_XS="" _MENU_XC="" _MENU_CX=1 _MENU_XI=0
@@ -5280,7 +5371,7 @@ usage() {
   xray_2go.sh reality -p <port>
 
 说明:
-  - 无参数: 默认进入交互式自定义选项搭建菜单
+  - 无参数: 首次部署进入快速向导；已安装时进入管理菜单
   - reality: 非交互一键安装 VLESS + Reality (TCP)
   - reality -p <port>: 使用指定监听端口进行一键安装
 EOF

@@ -239,7 +239,10 @@ def test_single_file_module_dispatch_actions():
     config_uuid_body = TEXT[TEXT.index('module_config_update_uuid()'):TEXT.index('\n}\n', TEXT.index('module_config_update_uuid()'))]
     config_shortcut_body = TEXT[TEXT.index('module_config_update_shortcut()'):TEXT.index('\n}\n', TEXT.index('module_config_update_shortcut()'))]
     assert_true('exec_install()' not in TEXT and 'exec_install' not in xray_install_body, "xray install should call module_xray_install_core, not exec_install")
-    assert_true('module_xray_install_core()' in TEXT and 'install_plan_menu' in xray_install_body, "xray install should route through the install plan menu and ultimately reuse the shared install core")
+    assert_true(
+        'module_xray_install_core()' in TEXT and 'install_wizard_menu' in xray_install_body and 'install_plan_menu' in TEXT,
+        "xray install should enter the deployment wizard, retain the advanced plan menu, and ultimately reuse the shared install core",
+    )
     assert_true('install_execute_current_plan()' in TEXT and 'module_xray_install_core' in TEXT[TEXT.index('install_execute_current_plan()'):TEXT.index('\n}\n', TEXT.index('install_execute_current_plan()'))], "install plan executor should reuse module_xray_install_core")
     assert_true('_menu_do_install()' not in TEXT and '_menu_do_install' not in xray_install_body, "xray install workflow should live in module_xray_install, not a menu helper wrapper")
     assert_true('exec_uninstall()' not in TEXT and 'exec_uninstall' not in xray_uninstall_body, "xray uninstall workflow should live in module_xray_uninstall, not a wrapper")
@@ -386,7 +389,7 @@ def test_socks5_link_is_generated_and_displayed():
     assert_true('protocol:"socks"' in socks_plugin and 'auth:"password"' in socks_plugin, "SOCKS inbound should follow reference socks password-auth implementation")
 
 
-def test_install_plan_menu_becomes_default_install_entry():
+def test_install_plan_menu_is_advanced_install_entry():
     assert_true('install_plan_reset_defaults()' in TEXT, "install plan reset helper missing")
     assert_true('install_plan_render_summary()' in TEXT, "install plan summary renderer missing")
     assert_true('install_plan_validate()' in TEXT, "install plan validator missing")
@@ -395,13 +398,41 @@ def test_install_plan_menu_becomes_default_install_entry():
     for fn in ['unified_menu_argo()', 'unified_menu_freeflow()', 'unified_menu_reality()', 'unified_menu_vltcp()', 'unified_menu_socks()', 'unified_menu_vlquic()', 'unified_menu_cforigin()']:
         assert_true(fn in TEXT, f"unified install/runtime workbench missing: {fn}")
     body = TEXT[TEXT.index('module_xray_install()'):TEXT.index('\n}\n', TEXT.index('module_xray_install()'))]
-    for token in ['install_plan_reset_defaults', 'install_plan_menu']:
-        assert_true(token in body, f"module_xray_install should route through {token}")
+    assert_true('install_plan_reset_defaults' in body, "module_xray_install should initialize the draft plan")
+    assert_true('install_wizard_menu' in body, "first install should enter the deployment wizard")
+    assert_true('install_plan_menu' not in body, "advanced install plan must not be the default first-install entry")
     for forbidden in ['ask_argo_mode', 'ask_freeflow_mode', 'ask_reality_mode', 'ask_vltcp_mode', 'ask_socks_mode', 'ask_vlquic_mode', 'ask_cforigin_mode']:
         assert_true(forbidden not in body, f"default install entry should not directly chain {forbidden}")
     plan_menu = TEXT[TEXT.index('install_plan_menu()'):TEXT.index('\n}\n', TEXT.index('install_plan_menu()'))]
     for marker in ['1) unified_menu_argo install', '2) unified_menu_freeflow install', '3) unified_menu_reality install', '4) unified_menu_vltcp install', '5) unified_menu_socks install', '6) unified_menu_vlquic install', '7) unified_menu_cforigin install', '10) install_plan_validate', '11)', 'install_execute_current_plan && return 0']:
-        assert_true(marker in plan_menu, f"install plan menu route missing: {marker}")
+        assert_true(marker in plan_menu, f"advanced install plan route missing: {marker}")
+
+
+def test_deployment_wizard_gates_argo_required_inputs():
+    assert_true('install_wizard_argo()' in TEXT, "Argo deployment wizard function missing")
+    wizard_argo = TEXT.split('install_wizard_argo() {', 1)[1].split(chr(10) + '}' + chr(10), 1)[0]
+    for marker in ['install_plan_reset_defaults', 'install_plan_argo_toggle', 'install_plan_argo_update_protocol', 'install_wizard_require_argo_domain', 'install_wizard_require_argo_auth', 'install_plan_argo_update_auth_protocol', 'install_wizard_confirm']:
+        assert_true(marker in wizard_argo, f"Argo wizard must include required step: {marker}")
+    for marker in ['install_plan_argo_update_domain', 'install_plan_argo_update_auth', 'install_execute_current_plan']:
+        assert_true(marker in TEXT, f"Argo required-input helper missing: {marker}")
+    assert_true('install_wizard_confirm' in wizard_argo, "Argo wizard should show a final confirmation step")
+
+
+def test_deployment_wizard_exposes_recommended_paths():
+    assert_true('install_wizard_menu()' in TEXT, "first-install deployment wizard function missing")
+    wizard = TEXT.split('install_wizard_menu() {', 1)[1].split(chr(10) + '}' + chr(10), 1)[0]
+    for marker in ['install_wizard_render', 'install_wizard_reality', 'install_wizard_argo', 'install_plan_menu']:
+        assert_true(marker in wizard, f"wizard route missing: {marker}")
+    for marker in ['VLESS + Reality TCP', 'Argo Tunnel', '高级自定义部署']:
+        assert_true(marker in TEXT, f"wizard option label missing: {marker}")
+
+
+
+def test_recommended_wizard_paths_reset_to_single_plan():
+    reality = TEXT.split('install_wizard_reality() {', 1)[1].split(chr(10) + '}' + chr(10), 1)[0]
+    argo = TEXT.split('install_wizard_argo() {', 1)[1].split(chr(10) + '}' + chr(10), 1)[0]
+    assert_true('preset_apply_reality_tcp_default' in reality, "Reality wizard should apply the single-entry preset")
+    assert_true('install_plan_reset_defaults' in argo, "Argo wizard should reset a cancelled/previous draft before collecting fields")
 
 
 def test_install_plan_field_level_submenus_exist_for_common_modules():
@@ -414,9 +445,9 @@ def test_install_plan_field_level_submenus_exist_for_common_modules():
 def test_interactive_menu_copy_is_guided_and_consistent():
     assert_true('_menu_print_action 0 "返回上一级"' in TEXT, "submenu back label should say return to upper level")
     assert_true('Xray-2go 控制台' in TEXT, "main menu title should be localized")
-    assert_true('开始安装（自定义搭建）' in TEXT, "main menu install copy should clarify interactive default")
-    assert_true('自定义安装计划' in TEXT and '命令行 ${C_CYN}reality${C_RST} 可一键安装 VLESS + Reality (TCP)' in TEXT, "install plan summary should explain default interactive path and reality quick install")
-    for token in ['进入 Reality 配置页', '运行安装前检查', '开始安装', 'prompt "请选择操作 (0-11): " _c', '请选择操作 $( [ "${_runtime}" -eq 1 ] && printf', '返回上一级']:
+    assert_true('开始部署（快速向导）' in TEXT, "main menu install copy should name the guided deployment entry")
+    assert_true('快速部署向导' in TEXT and '高级自定义部署' in TEXT, "first-install path should expose guided and advanced modes")
+    for token in ['进入 Reality 配置页', '运行安装前检查', '开始安装', 'prompt "请选择部署方案 (0-3): " _c', '确认开始部署？(Y/n): ', '请选择操作 $( [ "${_runtime}" -eq 1 ] && printf', '返回上一级']:
         assert_true(token in TEXT, f"interactive menu copy token missing: {token}")
 
 
