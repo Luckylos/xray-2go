@@ -4866,21 +4866,78 @@ _menu_collect_status() {
     _MENU_SSD=$(module_summary ss2022)
 }
 
+_menu_display_width() {
+    # 终端显示宽度：ASCII 记 1 列，多字节字符按常见全角 2 列计
+    local LC_ALL=C
+    local _s="$1" _bytes _ascii _wide
+    _bytes=${#_s}
+    _ascii="${_s//[^ -~]/}"
+    _ascii=${#_ascii}
+    _wide=$(( (_bytes - _ascii) / 3 ))
+    printf '%s' "$(( _ascii + _wide * 2 ))"
+}
+
+_menu_fit() {
+    # 超出状态列时截断，避免长摘要把控制台右边框推出去。
+    local LC_ALL=C
+    local _text="$1" _max="$2" _width _out="" _used=0 _i=0 _len _ch _cost _step
+    _width=$(_menu_display_width "${_text}")
+    if [ "${_width}" -le "${_max}" ]; then
+        printf '%s' "${_text}"
+        return 0
+    fi
+    _len=${#_text}
+    while [ "${_i}" -lt "${_len}" ]; do
+        _ch="${_text:_i:1}"
+        if [ "${_ch//[^ -~]/}" = "${_ch}" ]; then
+            _cost=1
+            _step=1
+        else
+            _cost=2
+            _step=3
+            _ch="${_text:_i:3}"
+        fi
+        [ $(( _used + _cost )) -le $(( _max - 2 )) ] || break
+        _out="${_out}${_ch}"
+        _used=$(( _used + _cost ))
+        _i=$(( _i + _step ))
+    done
+    printf '%s..' "${_out}"
+}
+
+_menu_pad() {
+    local _text="$1" _target="$2" _width _pad
+    _width=$(_menu_display_width "${_text}")
+    _pad=$(( _target - _width ))
+    [ "${_pad}" -gt 0 ] || _pad=0
+    printf '%*s' "${_pad}" ''
+}
+
+_menu_status_row() {
+    local _label="$1" _value="$2" _color="${3:-}" _label_pad _value_pad
+    _value=$(_menu_fit "${_value}" 28)
+    _label_pad=$(_menu_pad "${_label}" 10)
+    _value_pad=$(_menu_pad "${_value}" 28)
+    printf "${C_BOLD}${C_PUR}  ║${C_RST}  %s%s: ${_color}%s${C_RST}%s${C_PUR}║${C_RST}\n" \
+        "${_label}" "${_label_pad}" "${_value}" "${_value_pad}"
+}
+
 _menu_render() {
     clear; echo ""
     printf "${C_BOLD}${C_PUR}  ╔══════════════════════════════════════════╗${C_RST}\n"
-    printf "${C_BOLD}${C_PUR}  ║              Xray-2go 控制台            ║${C_RST}\n"
+    printf "${C_BOLD}${C_PUR}  ║%s%s%s║${C_RST}\n" \
+        "$(_menu_pad "" 13)" "Xray-2go 控制台" "$(_menu_pad "Xray-2go 控制台" 29)"
     printf "${C_BOLD}${C_PUR}  ╠══════════════════════════════════════════╣${C_RST}\n"
-    printf "${C_BOLD}${C_PUR}  ║${C_RST}  Xray     : ${_MENU_XC}%-29s${C_RST}${C_PUR} ${C_RST}\n" "${_MENU_XS}"
-    printf "${C_BOLD}${C_PUR}  ║${C_RST}  Argo     : %-29s${C_PUR} ${C_RST}\n" "${_MENU_AD}"
-    printf "${C_BOLD}${C_PUR}  ║${C_RST}  Reality  : %-29s${C_PUR} ${C_RST}\n" "${_MENU_RD}"
-    printf "${C_BOLD}${C_PUR}  ║${C_RST}  VLESS-TCP: %-29s${C_PUR} ${C_RST}\n" "${_MENU_VD}"
-    printf "${C_BOLD}${C_PUR}  ║${C_RST}  XHTTP-H3 : %-29s${C_PUR} ${C_RST}\n" "${_MENU_QD}"
-    printf "${C_BOLD}${C_PUR}  ║${C_RST}  CF-Origin: %-29s${C_PUR} ${C_RST}\n" "${_MENU_CD}"
-    printf "${C_BOLD}${C_PUR}  ║${C_RST}  FF       : %-29s${C_PUR} ${C_RST}\n" "${_MENU_FD}"
-    printf "${C_BOLD}${C_PUR}  ║${C_RST}  SOCKS5   : %-29s${C_PUR} ${C_RST}\n" "${_MENU_SD}"
-    printf "${C_BOLD}${C_PUR}  ║${C_RST}  HTTP代理  : %-29s${C_PUR} ${C_RST}\n" "${_MENU_HD}"
-    printf "  SS2022   : %-29s$C_PUR $C_RST\n" "$_MENU_SSD"
+    _menu_status_row "Xray" "${_MENU_XS}" "${_MENU_XC}"
+    _menu_status_row "Argo" "${_MENU_AD}"
+    _menu_status_row "Reality" "${_MENU_RD}"
+    _menu_status_row "VLESS-TCP" "${_MENU_VD}"
+    _menu_status_row "XHTTP-H3" "${_MENU_QD}"
+    _menu_status_row "CF-Origin" "${_MENU_CD}"
+    _menu_status_row "FF" "${_MENU_FD}"
+    _menu_status_row "SOCKS5" "${_MENU_SD}"
+    _menu_status_row "HTTP代理" "${_MENU_HD}"
+    _menu_status_row "SS2022" "${_MENU_SSD}"
     printf "${C_BOLD}${C_PUR}  ╚══════════════════════════════════════════╝${C_RST}\n\n"
     printf "  ${C_GRN}1.${C_RST} 开始部署（快速向导）\n"
     printf "  ${C_RED}2.${C_RST} 卸载整套 Xray-2go\n"; _hr

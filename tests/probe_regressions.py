@@ -4,6 +4,7 @@ import re
 import subprocess
 import sys
 import time
+import unicodedata
 
 
 TESTS_DIR = Path(__file__).resolve().parent
@@ -2741,6 +2742,49 @@ grep -q 'Shadowsocks 2022 端口已更新: 10007（TCP/UDP）' "$_msg_file" && p
     assert_true("fail_rc=1 mem=8388 file=no" in out, f"port update must roll back in-memory state even without state.json: {out}")
     assert_true("ok_rc=0 mem=10007 disk=10007" in out, f"port update must persist the new port: {out}")
     assert_true("msg=ok" in out, f"port update message should name the module and protocol: {out}")
+
+
+def test_main_menu_status_rows_align_to_box():
+    enabled_prelude = (
+        "st_init >/dev/null 2>&1\n"
+        "st_set '.cforigin.enabled = true | .cforigin.protocol = \"cloudflare\" | .cforigin.domain = \"example.com\"' >/dev/null 2>&1\n"
+        "st_set '.socks.enabled = true' >/dev/null 2>&1\n"
+        "st_set '.ss2022.enabled = true' >/dev/null 2>&1\n"
+        "st_set '.vltcp.enabled = true' >/dev/null 2>&1\n"
+    )
+
+    def dw(text):
+        return sum(2 if unicodedata.east_asian_width(ch) in 'WF' else 1 for ch in text)
+
+    def bar_columns(line):
+        cols, col = [], 0
+        for ch in line:
+            if ch == '║':
+                cols.append(col)
+            col += 2 if unicodedata.east_asian_width(ch) in 'WF' else 1
+        return tuple(cols)
+
+    for label, prelude in (('disabled', ''), ('enabled', enabled_prelude)):
+        out = run_bash(
+            'source ./xray_2go.sh\n'
+            + prelude
+            + '_menu_collect_status >/dev/null 2>&1\n'
+            + '_menu_render 2>/dev/null\n'
+        )
+        plain = re.sub(r'\x1b\[[0-9;]*m', '', out)
+        box = [ln for ln in plain.splitlines() if '║' in ln or '╔' in ln or '╠' in ln or '╚' in ln]
+        assert_true(len(box) >= 13, f'main menu box lines missing ({label}), got {len(box)}')
+
+        widths = sorted({dw(ln) for ln in box})
+        assert_true(
+            len(widths) == 1,
+            f'main menu box lines must share one display width ({label}), got {widths}',
+        )
+        bars = {bar_columns(ln) for ln in box if '║' in ln}
+        assert_true(
+            bars == {(2, widths[0] - 1)},
+            f'main menu box vertical bars must sit on both borders ({label}), got {bars}',
+        )
 
 
 def _function_body(name):
