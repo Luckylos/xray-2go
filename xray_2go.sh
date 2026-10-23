@@ -2,7 +2,7 @@
 # ==============================================================================
 # xray-2go — 插件化代理管理脚本
 # 安全基线：输入校验 · 敏感文件保护 · 原子写入 · 服务互斥 · 可回滚清理
-# 协议支持：Argo · FreeFlow · Reality · VLESS-TCP · SOCKS5 · HTTP · VLESS-XHTTP-H3（均以插件形式加载）
+# 协议支持：Argo · FreeFlow · Reality · VLESS-TCP · SOCKS5 · HTTP · Shadowsocks 2022 · VLESS-XHTTP-H3（均以插件形式加载）
 # 平台支持：Debian/Ubuntu/RHEL系 (systemd) · Alpine (OpenRC；Argo/cloudflared 需用户预装官方 cloudflared)
 # ==============================================================================
 set -uo pipefail  # 交互菜单使用显式返回值处理，避免 set -e 造成误退出
@@ -310,7 +310,7 @@ port_mgr_in_use() {
 }
 
 port_mgr_in_use_udp() {
-    local _p="$1"
+    local _p="${1}"
     if command -v ss >/dev/null 2>&1; then
         ss -ulnH 2>/dev/null | awk -v p="${_p}" \
             'BEGIN{r=0}{split($4,a,":");if(a[length(a)]==p){r=1;exit}}END{exit !r}'
@@ -327,6 +327,14 @@ port_mgr_in_use_udp() {
         /proc/net/udp /proc/net/udp6 2>/dev/null
 }
 
+# SS2022 binds the same number in both TCP and UDP; a port is available only
+# when neither protocol currently has a listener.
+port_mgr_in_use_both() {
+    local _p="${1}"
+    port_mgr_in_use "${_p}" && return 0
+    port_mgr_in_use_udp "${_p}"
+}
+
 port_mgr_random() {
     port_mgr_random_proto tcp
 }
@@ -334,7 +342,7 @@ port_mgr_random() {
 port_mgr_random_proto() {
     local _proto="${1:-tcp}"
     local _i=0 _p
-    case "${_proto}" in tcp|udp) : ;; *) log_error "未知端口协议: ${_proto}"; return 1 ;; esac
+    case "${_proto}" in tcp|udp|both) : ;; *) log_error "未知端口协议: ${_proto}"; return 1 ;; esac
     while true; do
         _p=$(shuf -i 10000-60000 -n 1 2>/dev/null \
              || awk 'BEGIN{srand();print int(rand()*50000)+10000}')
@@ -342,6 +350,7 @@ port_mgr_random_proto() {
         case "${_proto}" in
             udp) port_mgr_in_use_udp "${_p}" || { printf '%s' "${_p}"; return 0; } ;;
             tcp) port_mgr_in_use     "${_p}" || { printf '%s' "${_p}"; return 0; } ;;
+            both) port_mgr_in_use_both "${_p}" || { printf '%s' "${_p}"; return 0; } ;;
         esac
         [ "${_i}" -gt 30 ] && { log_error "无法找到空闲 ${_proto^^} 端口"; return 1; }
     done
@@ -364,7 +373,8 @@ readonly _STATE_DEFAULT='{
     "vlquic":  443,
     "cforigin": 28888,
     "socks":   1080,
-    "http":    1081
+    "http":    1081,
+    "ss2022": 8388
   },
   "argo": {
     "enabled":  true,
@@ -404,6 +414,13 @@ readonly _STATE_DEFAULT='{
     "listen":  "0.0.0.0",
     "user":    "xray2go",
     "pass":    "xray2go"
+  },
+  "ss2022": {
+    "enabled": false,
+    "listen":  "0.0.0.0",
+    "method":  "2022-blake3-aes-256-gcm",
+    "server_key": "",
+    "user_key":   ""
   },
   "vlquic": {
     "enabled": false,
@@ -499,11 +516,17 @@ with_lock() {
 }
 
 
-# 修改端口后需要统一提交配置、持久化、同步防火墙，并回显 state 实际值。
-_commit_port_change() {
+# 修改端口：事务在写 state 之前开始，失败时内存/磁盘状态、配置、服务与防火墙一并回滚。
+_commit_port_change_inner() {
     local _proto="$1" _new_port="$2"
-    _commit || return 1
-    log_ok "${_proto} 端口已更新: ${_new_port}（当前: $(port_of "${_proto}")）"
+    st_set ".ports.${_proto} = (\$p|tonumber)" --arg p "${_new_port}" || return 1
+    _commit_inner
+}
+
+_commit_port_change() {
+    local _proto="$1" _new_port="$2" _net_label="${3:-}"
+    _transaction_run "端口更新" _commit_port_change_inner "${_proto}" "${_new_port}" || return 1
+    log_ok "$(module_label "${_proto}") 端口已更新: $(port_of "${_proto}")${_net_label:+（${_net_label^^}）}"
     config_print_nodes
 }
 
@@ -643,6 +666,44 @@ val_trojan_password() {
     printf '%s' "${_password}"
 }
 
+ss2022_method_is_valid() {
+    case "$1" in
+        2022-blake3-aes-128-gcm|2022-blake3-aes-256-gcm) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+val_ss2022_method() {
+    ss2022_method_is_valid "$1" \
+        || { log_error "SS2022 加密方法不受支持: $1"; return 1; }
+    printf '%s' "$1"
+}
+
+ss2022_key_bytes() {
+    case "$1" in
+        2022-blake3-aes-128-gcm) printf '16' ;;
+        2022-blake3-aes-256-gcm) printf '32' ;;
+        *) return 1 ;;
+    esac
+}
+
+val_ss2022_key() {
+    local _method="$1" _key="$2" _expected _decoded_bytes
+    _expected=$(ss2022_key_bytes "$_method") || {
+        log_error "SS2022 加密方法不受支持"; return 1;
+    }
+    [ -n "$_key" ] && printf '%s' "$_key" | grep -qE '^[A-Za-z0-9+/]+={0,2}$' || {
+        log_error "SS2022 密钥格式异常"; return 1;
+    }
+    _decoded_bytes=$(printf '%s' "$_key" | base64 -d 2>/dev/null | wc -c | tr -d '[:space:]') || {
+        log_error "SS2022 密钥不是合法 Base64"; return 1;
+    }
+    [ "$_decoded_bytes" = "$_expected" ] || {
+        log_error "SS2022 密钥长度异常（需要 $_expected 字节）"; return 1;
+    }
+    printf '%s' "$_key"
+}
+
 cf_edge_port_valid() {
     case "${1:-}" in
         80|8080|8880|2052|2082|2086|2095|443|2053|2083|2087|2096|8443) return 0 ;;
@@ -693,7 +754,7 @@ st_persist() { with_lock _st_persist_inner; }
 _st_normalize_schema() {
 
     # 规范化端口字段到顶层 ports
-    local _ap _rp _vp _qp _fp _cp _sp _hp
+    local _ap _rp _vp _qp _fp _cp _sp _hp _ssp
     _ap=$(st_get '.argo.port    // empty')
     _rp=$(st_get '.reality.port // empty')
     _vp=$(st_get '.vltcp.port   // empty')
@@ -702,11 +763,13 @@ _st_normalize_schema() {
     _cp=$(st_get '.cforigin.port // empty')
     _sp=$(st_get '.socks.port   // empty')
     _hp=$(st_get '.http.port    // empty')
+    _ssp=$(st_get '.ss2022.port  // empty')
 
     # 若 .ports 不存在则初始化
     local _ports; _ports=$(st_get '.ports')
     if [ -z "${_ports:-}" ] || [ "${_ports}" = "null" ]; then
         st_set '.ports = {"argo":18888,"ff":8080,"reality":443,"vltcp":1234,"vlquic":443,"cforigin":28888,"socks":1080,"http":1081}'
+        st_set '.ports.ss2022 = 8388'
     fi
 
     _st_migrate_port() {
@@ -729,6 +792,7 @@ _st_normalize_schema() {
     _st_migrate_port '.cforigin.port' '.ports.cforigin' "${_cp}"
     _st_migrate_port '.socks.port' '.ports.socks' "${_sp}"
     _st_migrate_port '.http.port' '.ports.http' "${_hp}"
+    _st_migrate_port '.ss2022.port' '.ports.ss2022' "$_ssp"
 
     # 补全缺失/损坏端口字段，避免菜单显示 0 或修改端口后写入无效路径
     local _c
@@ -747,7 +811,9 @@ _st_normalize_schema() {
     _c=$(st_get '.ports.socks')
     { [ -z "${_c:-}" ] || [ "${_c}" = "null" ] || [ "${_c}" = "0" ]; } && st_set '.ports.socks = 1080'
     _c=$(st_get '.ports.http')
-    { [ -z "${_c:-}" ] || [ "${_c}" = "null" ] || [ "${_c}" = "0" ]; } && st_set '.ports.http = 1081'
+    { [ -z "$_c" ] || [ "$_c" = "null" ] || [ "$_c" = "0" ]; } && st_set '.ports.http = 1081'
+    _c=$(st_get '.ports.ss2022')
+    { [ -z "$_c" ] || [ "$_c" = "null" ] || [ "$_c" = "0" ]; } && st_set '.ports.ss2022 = 8388'
 
     _c=$(st_get '.reality.network')
     { [ -z "${_c:-}" ] || [ "${_c}" = "null" ]; } && st_set '.reality.network = "tcp"'
@@ -807,6 +873,19 @@ _st_normalize_schema() {
     _c=$(st_get '.http.user')
     { [ -z "${_c:-}" ] || [ "${_c}" = "null" ]; } && st_set '.http.user = "xray2go"'
     _c=$(st_get '.http.pass')
+    _c=$(st_get '.ss2022.enabled')
+    { [ -z "$_c" ] || [ "$_c" = "null" ]; } && st_set '.ss2022.enabled = false'
+    _c=$(st_get '.ss2022.listen')
+    { [ -z "$_c" ] || [ "$_c" = "null" ]; } && st_set '.ss2022.listen = "0.0.0.0"'
+    _c=$(st_get '.ss2022.method')
+    case "$_c" in
+        2022-blake3-aes-128-gcm|2022-blake3-aes-256-gcm) : ;;
+        *) st_set '.ss2022.method = "2022-blake3-aes-256-gcm"' ;;
+    esac
+    _c=$(st_get '.ss2022.server_key')
+    { [ "$_c" = "null" ] || [ -z "$_c" ]; } && st_set '.ss2022.server_key = ""'
+    _c=$(st_get '.ss2022.user_key')
+    { [ "$_c" = "null" ] || [ -z "$_c" ]; } && st_set '.ss2022.user_key = ""'
     { [ -z "${_c:-}" ] || [ "${_c}" = "null" ]; } && st_set '.http.pass = "xray2go"'
     _c=$(st_get '.vlquic.listen')
     { [ -z "${_c:-}" ] || [ "${_c}" = "null" ]; } && st_set '.vlquic.listen = "0.0.0.0"'
@@ -969,7 +1048,8 @@ _plugin_snapshot_rebuild() {
         [ -n "${_p:-}" ] && _PLUGIN_SNAPSHOT_PORTS="${_PLUGIN_SNAPSHOT_PORTS}$(printf '%s\n' "${_p}")"
 
         _l=$(plugin_call "${_name}" link 2>/dev/null) || true
-        [ -n "${_l:-}" ] && _PLUGIN_SNAPSHOT_LINKS="${_PLUGIN_SNAPSHOT_LINKS}$(printf '%s\n' "${_l}" | grep -E '^(vless|trojan|socks|http)://' || true)"$'\n'
+        # Legacy node-link filter prefix: grep -E '^(vless|trojan|socks|http)://'
+        [ -n "${_l:-}" ] && _PLUGIN_SNAPSHOT_LINKS="${_PLUGIN_SNAPSHOT_LINKS}$(printf '%s\n' "${_l}" | grep -E '^(vless|trojan|socks|http|ss)://' || true)"$'\n'
 
         _ib=$(plugin_call "${_name}" inbound 2>/dev/null) || {
             log_error "插件 inbound 失败: ${_name}"; return 1; }
@@ -1033,12 +1113,13 @@ plugin_collect_inbounds() {
 plugin_install_builtins() {
     mkdir -p "${PLUGIN_DIR}"
     # 内置插件属于脚本本体的一部分：每次运行刷新，确保主脚本更新能同步下发。
-    # 用户自定义插件请使用其它文件名，避免与 argo/ff/reality/vltcp/socks/http 重名。
+    # 用户自定义插件请使用其它文件名，避免与 argo/ff/reality/vltcp/socks/http/ss2022 重名。
     _plugin_write_argo
     _plugin_write_ff
     _plugin_write_reality
     _plugin_write_vltcp
     _plugin_write_socks
+    _plugin_write_ss2022
     _plugin_write_http
     _plugin_write_vlquic
     _plugin_write_cforigin
@@ -1367,6 +1448,70 @@ PLUGIN_EOF
     chmod 644 "${PLUGIN_DIR}/vltcp.sh"
 }
 
+
+_plugin_write_ss2022() {
+cat > "$PLUGIN_DIR/ss2022.sh" << 'PLUGIN_EOF'
+# xray-2go plugin: ss2022 (Xray-core built-in Shadowsocks 2022)
+
+_plg_ss2022_enabled() {
+    [ "$(st_get '.ss2022.enabled')" = "true" ]
+}
+
+_plg_ss2022_ports() {
+    _plg_ss2022_enabled || return 0
+    local _port
+    _port=$(port_of ss2022)
+    printf '%s/tcp\n%s/udp\n' "$_port" "$_port"
+}
+
+_plg_ss2022_inbound() {
+    _plg_ss2022_enabled || return 0
+    local _port _listen _method _server _user
+    _port=$(port_of ss2022)
+    _listen=$(st_get '.ss2022.listen')
+    _method=$(st_get '.ss2022.method')
+    _server=$(st_get '.ss2022.server_key')
+    _user=$(st_get '.ss2022.user_key')
+    val_ss2022_method "$_method" >/dev/null || return 1
+    val_ss2022_key "$_method" "$_server" >/dev/null || return 1
+    val_ss2022_key "$_method" "$_user" >/dev/null || return 1
+    jq -n --argjson port "$_port" --arg listen "$_listen" --arg method "$_method" \
+        --arg server "$_server" --arg user "$_user" '{
+        port:$port, listen:$listen, protocol:"shadowsocks",
+        settings:{method:$method, password:$server, network:"tcp,udp",
+            clients:[{password:$user, email:"xray2go-ss2022", level:0}]}
+    }'
+}
+
+_plg_ss2022_link() {
+    _plg_ss2022_enabled || return 0
+    local _listen _host _port _method _server _user _raw _encoded
+    _listen=$(st_get '.ss2022.listen')
+    _method=$(st_get '.ss2022.method')
+    _server=$(st_get '.ss2022.server_key')
+    _user=$(st_get '.ss2022.user_key')
+    _port=$(port_of ss2022)
+    if [ "$_listen" = "0.0.0.0" ] || [ "$_listen" = "::" ]; then
+        _host=$(platform_get_realip)
+    else
+        _host=$_listen
+    fi
+    [ -n "$_host" ] || { log_warn "无法获取服务器 IP，SS2022 节点已跳过"; return 0; }
+    case "$_host" in
+        *:*)
+            case "$_host" in
+                \[*\]*) : ;;
+                *) _host="[$_host]" ;;
+            esac
+            ;;
+    esac
+    _raw=$(printf '%s:%s:%s' "$_method" "$_server" "$_user")
+    _encoded=$(printf '%s' "$_raw" | base64 | tr '+/' '-_' | tr -d '=\n')
+    printf 'ss://%s@%s:%s#Shadowsocks-2022\n' "$_encoded" "$_host" "$_port"
+}
+PLUGIN_EOF
+    chmod 644 "$PLUGIN_DIR/ss2022.sh"
+}
 
 _plugin_write_socks() {
 cat > "${PLUGIN_DIR}/socks.sh" << 'PLUGIN_EOF'
@@ -2113,6 +2258,31 @@ crypto_gen_trojan_password() {
 }
 
 # ==============================================================================
+crypto_gen_ss2022_key() {
+    local _method="${1}" _bytes _key
+    _bytes=$(ss2022_key_bytes "${_method}") || {
+        log_error "无法为未知 SS2022 方法生成密钥"; return 1;
+    }
+    if command -v openssl >/dev/null 2>&1; then
+        _key=$(openssl rand -base64 "${_bytes}" 2>/dev/null) || {
+            log_error "SS2022 密钥生成命令失败"; return 1;
+        }
+    else
+        _key=$(head -c "${_bytes}" /dev/urandom | base64 2>/dev/null) || {
+            log_error "系统随机源不可用，无法生成 SS2022 密钥"; return 1;
+        }
+    fi
+    _key=$(printf '%s' "${_key}" | tr -d '\n') || return 1
+    [ -n "${_key}" ] || {
+        log_error "SS2022 密钥生成结果为空"; return 1;
+    }
+    val_ss2022_key "${_method}" "${_key}" >/dev/null 2>&1 || {
+        log_error "SS2022 密钥生成结果格式无效"; return 1;
+    }
+    printf '%s' "${_key}"
+}
+
+# ==============================================================================
 # Config synthesis and apply
 # ==============================================================================
 
@@ -2396,14 +2566,33 @@ _module_enable_commit_inner() {
 _module_enable_commit() { _transaction_run "模块启用提交" _module_enable_commit_inner "$@"; }
 
 _module_apply_if_enabled() {
-    local _enabled="$1"
-    [ "${_enabled}" = "true" ] && config_apply || return 0
+    local _enabled="${1}"
+    [ "${_enabled}" = "true" ] || return 0
+    config_apply || return 1
 }
-
 _module_persist_after_optional_apply() {
     local _enabled="$1"
     _module_apply_if_enabled "${_enabled}" || return 1
     st_persist || { log_error "state.json 写入失败"; return 1; }
+}
+
+# State mutations must happen inside the transaction callback so the snapshot
+# captures the pre-change state, not the already-mutated in-memory document.
+_module_update_state_transaction() {
+    local _label="${1}"
+    shift
+    _transaction_run "${_label}" "${@}"
+}
+
+_module_update_listen_transaction_inner() {
+    local _proto="${1}" _enabled="${2}" _listen="${3}"
+    st_set ".${_proto}.listen = \$l" --arg l "${_listen}" || return 1
+    _module_apply_if_enabled "${_enabled}" || return 1
+    st_persist || { log_error "state.json 写入失败"; return 1; }
+}
+
+_module_update_listen_transaction() {
+    _module_update_state_transaction "监听地址更新" _module_update_listen_transaction_inner "${@}"
 }
 
 
@@ -2447,7 +2636,7 @@ _module_enable_with_state() {
 module_update_port_action() {
     local _proto="${1:-}" _net="${2:-tcp}" _label_suffix="${3:-}"
     case "${_proto}" in
-        ff|reality|vltcp|vlquic|socks|http)
+        ff|reality|vltcp|vlquic|socks|http|ss2022)
             _menu_update_port "${_proto}" "${_net}" "${_label_suffix}"
             ;;
         *)
@@ -2464,6 +2653,7 @@ module_update_listen_action() {
         http)   _label="HTTP 代理" ;;
         vltcp)  _label="VLESS-TCP" ;;
         vlquic) _label="VLESS-XHTTP-H3" ;;
+        ss2022) _label="Shadowsocks 2022" ;;
         *)
             log_error "不支持统一监听地址更新的模块: ${_proto}"
             return 1
@@ -2473,8 +2663,7 @@ module_update_listen_action() {
     prompt "新监听地址（0.0.0.0=所有，127.0.0.1=仅本地）: " _l
     [ -n "${_l:-}" ] || return 0
     _l=$(val_listen_addr "${_l}") || return 1
-    st_set ".${_proto}.listen = \$l" --arg l "${_l}" || return 1
-    _module_persist_after_optional_apply "${_en}" || return 1
+    _module_update_listen_transaction "${_proto}" "${_en}" "${_l}" || return 1
     log_ok "${_label} 监听地址已更新: ${_l}"
     [ "${_en}" = "true" ] && config_print_nodes
     return 0
@@ -2559,6 +2748,95 @@ module_socks_enable() {
 
 module_socks_disable() {
     module_socks_action disable
+}
+
+_module_ss2022_enable_prepare() {
+    local _method _server _user
+    _method=$(st_get '.ss2022.method')
+    val_ss2022_method "$_method" >/dev/null || return 1
+    _server=$(st_get '.ss2022.server_key')
+    _user=$(st_get '.ss2022.user_key')
+    if [ -z "$_server" ] || ! val_ss2022_key "$_method" "$_server" >/dev/null 2>&1; then
+        _server=$(crypto_gen_ss2022_key "$_method") || return 1
+    fi
+    if [ -z "$_user" ] || ! val_ss2022_key "$_method" "$_user" >/dev/null 2>&1; then
+        _user=$(crypto_gen_ss2022_key "$_method") || return 1
+    fi
+    st_set '.ss2022.enabled = true | .ss2022.server_key = $s | .ss2022.user_key = $u' \
+        --arg s "$_server" --arg u "$_user"
+}
+
+module_ss2022_enable() {
+    _module_enable_transaction "Shadowsocks 2022" _module_ss2022_enable_prepare
+}
+
+module_ss2022_disable() {
+    _module_disable_transaction "Shadowsocks 2022" st_set '.ss2022.enabled = false' || return 1
+    log_ok "Shadowsocks 2022 已禁用"
+}
+
+module_ss2022_uninstall() {
+    _module_disable_transaction "Shadowsocks 2022" st_set '.ss2022.enabled = false | .ss2022.listen = "0.0.0.0" | .ss2022.method = "2022-blake3-aes-256-gcm" | .ss2022.server_key = "" | .ss2022.user_key = "" | .ports.ss2022 = 8388' || return 1
+    log_ok "Shadowsocks 2022 已卸载"
+}
+
+module_ss2022_update_port() {
+    module_update_port_action ss2022 both "TCP/UDP"
+}
+
+module_ss2022_update_listen() {
+    module_update_listen_action ss2022
+}
+
+_module_ss2022_update_method_inner() {
+    local _enabled="${1}" _method="${2}" _server="${3}" _user="${4}"
+    st_set '.ss2022.method = $m | .ss2022.server_key = $s | .ss2022.user_key = $u' \
+        --arg m "${_method}" --arg s "${_server}" --arg u "${_user}" || return 1
+    _module_apply_if_enabled "${_enabled}" || return 1
+    st_persist || { log_error "state.json 写入失败"; return 1; }
+}
+
+module_ss2022_update_method() {
+    local _en _cur _choice _method _server _user
+    _en=$(st_get '.ss2022.enabled')
+    _cur=$(st_get '.ss2022.method')
+    echo ""
+    printf "  1. 2022-blake3-aes-256-gcm [默认，32 字节密钥]\\n"
+    printf "  2. 2022-blake3-aes-128-gcm [16 字节密钥]\\n"
+    prompt "加密方法（回车保持 $_cur）: " _choice
+    [ -n "$_choice" ] || return 0
+    case "$_choice" in
+        1) _method="2022-blake3-aes-256-gcm" ;;
+        2) _method="2022-blake3-aes-128-gcm" ;;
+        *) log_error "无效的 SS2022 加密方法"; return 1 ;;
+    esac
+    _server=$(crypto_gen_ss2022_key "$_method") || return 1
+    _user=$(crypto_gen_ss2022_key "$_method") || return 1
+    _module_update_state_transaction "SS2022 加密方法更新" _module_ss2022_update_method_inner \
+        "${_en}" "${_method}" "${_server}" "${_user}" || return 1
+    log_ok "SS2022 加密方法已更新为 $_method（已重新生成密钥）"
+    [ "$_en" = "true" ] && config_print_nodes
+}
+
+_module_ss2022_regenerate_keys_inner() {
+    local _enabled="${1}" _server="${2}" _user="${3}"
+    st_set '.ss2022.server_key = $s | .ss2022.user_key = $u' \
+        --arg s "${_server}" --arg u "${_user}" || return 1
+    _module_apply_if_enabled "${_enabled}" || return 1
+    st_persist || { log_error "state.json 写入失败"; return 1; }
+}
+
+module_ss2022_regenerate_keys() {
+    local _en _method _server _user
+    _en=$(st_get '.ss2022.enabled')
+    _method=$(st_get '.ss2022.method')
+    val_ss2022_method "$_method" >/dev/null || return 1
+    _server=$(crypto_gen_ss2022_key "$_method") || return 1
+    _user=$(crypto_gen_ss2022_key "$_method") || return 1
+    _module_update_state_transaction "SS2022 密钥轮换" _module_ss2022_regenerate_keys_inner \
+        "${_en}" "${_server}" "${_user}" || return 1
+    log_ok "SS2022 服务端/用户密钥已重新生成"
+    [ "$_en" = "true" ] && config_print_nodes
 }
 
 module_http_action() {
@@ -2751,7 +3029,7 @@ module_cforigin_update_port() {
     local _np
     prompt "新 Origin 回源端口（需与 Cloudflare Origin Rule 的 Destination Port 一致，回车随机）: " _np
     if [ -z "${_np:-}" ]; then
-        _menu_input_port '.ports.cforigin' _np || return 1
+        _menu_select_port tcp _np || return 1
     else
         val_port "${_np}" >/dev/null || return 1
         if port_mgr_in_use "${_np}"; then
@@ -2759,7 +3037,6 @@ module_cforigin_update_port() {
             local _a2; prompt "仍然继续？(y/N): " _a2
             case "${_a2:-n}" in y|Y) :;; *) return 1;; esac
         fi
-        st_set '.ports.cforigin = ($p|tonumber)' --arg p "${_np}" || return 1
     fi
     _commit_port_change cforigin "${_np}" || return 1
     log_warn "如果 Cloudflare Origin Rule 已手动配置，请同步确认 Destination Port Override = ${_np}"
@@ -4078,20 +4355,105 @@ module_config_update_uuid() {
 
 # ── 单文件模块注册表 / 管理子菜单辅助 ─────────────────────────────────────────
 
-_MODULE_IDS="argo ff reality vltcp vlquic cforigin socks http"
+# 集中维护模块 ID 与公共动作处理器；专用字段动作仍在 module_dispatch 中显式列出。
+_MODULE_IDS="argo ff reality vltcp vlquic cforigin socks http ss2022"
+
+declare -A _MODULE_LABELS=(
+    [argo]="Argo"
+    [ff]="FreeFlow"
+    [reality]="Reality"
+    [vltcp]="VLESS-TCP"
+    [vlquic]="VLESS-XHTTP-H3"
+    [cforigin]="CF Origin"
+    [socks]="SOCKS5"
+    [http]="HTTP 代理"
+    [ss2022]="Shadowsocks 2022"
+)
+declare -A _MODULE_MENU_FN=(
+    [argo]=unified_menu_argo
+    [ff]=unified_menu_freeflow
+    [reality]=unified_menu_reality
+    [vltcp]=unified_menu_vltcp
+    [vlquic]=unified_menu_vlquic
+    [cforigin]=unified_menu_cforigin
+    [socks]=unified_menu_socks
+    [http]=unified_menu_http
+    [ss2022]=unified_menu_ss2022
+)
+declare -A _MODULE_RESTART_TARGET=(
+    [argo]=argo
+    [ff]=xray
+    [reality]=xray
+    [vltcp]=xray
+    [vlquic]=xray
+    [cforigin]=xray
+    [socks]=xray
+    [http]=xray
+    [ss2022]=xray
+)
+declare -A _MODULE_ENABLE_FN=(
+    [argo]=module_argo_enable
+    [ff]=module_ff_enable
+    [reality]=module_reality_enable
+    [vltcp]=module_vltcp_enable
+    [vlquic]=module_vlquic_enable
+    [cforigin]=module_cforigin_enable
+    [socks]=module_socks_enable
+    [http]=module_http_enable
+    [ss2022]=module_ss2022_enable
+)
+declare -A _MODULE_DISABLE_FN=(
+    [argo]=module_argo_disable
+    [ff]=module_ff_disable
+    [reality]=module_reality_disable
+    [vltcp]=module_vltcp_disable
+    [vlquic]=module_vlquic_disable
+    [cforigin]=module_cforigin_disable
+    [socks]=module_socks_disable
+    [http]=module_http_disable
+    [ss2022]=module_ss2022_disable
+)
+declare -A _MODULE_UNINSTALL_FN=(
+    [argo]=module_argo_uninstall
+    [ff]=module_ff_uninstall
+    [reality]=module_reality_uninstall
+    [vltcp]=module_vltcp_uninstall
+    [vlquic]=module_vlquic_uninstall
+    [cforigin]=module_cforigin_uninstall
+    [socks]=module_socks_uninstall
+    [http]=module_http_uninstall
+    [ss2022]=module_ss2022_uninstall
+)
+declare -A _MODULE_UPDATE_PORT_FN=(
+    [argo]=module_argo_update_port
+    [ff]=module_ff_update_port
+    [reality]=module_reality_update_port
+    [vltcp]=module_vltcp_update_port
+    [vlquic]=module_vlquic_update_port
+    [cforigin]=module_cforigin_update_port
+    [socks]=module_socks_update_port
+    [http]=module_http_update_port
+    [ss2022]=module_ss2022_update_port
+)
+declare -A _MODULE_UPDATE_LISTEN_FN=(
+    [vltcp]=module_vltcp_update_listen
+    [vlquic]=module_vlquic_update_listen
+    [cforigin]=module_cforigin_update_listen
+    [socks]=module_socks_update_listen
+    [http]=module_http_update_listen
+    [ss2022]=module_ss2022_update_listen
+)
+
+module_registry_has() {
+    local _id="${1:-}"
+    [ -n "${_id}" ] || return 1
+    [ -n "${_MODULE_LABELS[${_id}]-}" ]
+}
 
 module_label() {
-    case "${1:-}" in
-        argo)     printf 'Argo' ;;
-        ff)       printf 'FreeFlow' ;;
-        reality)  printf 'Reality' ;;
-        vltcp)    printf 'VLESS-TCP' ;;
-        vlquic)   printf 'VLESS-XHTTP-H3' ;;
-        cforigin) printf 'CF Origin' ;;
-        socks)    printf 'SOCKS5' ;;
-        http)     printf 'HTTP 代理' ;;
-        *)        printf '%s' "${1:-unknown}" ;;
-    esac
+    local _id="${1:-unknown}" _label
+    _label="${_MODULE_LABELS[${_id}]-}"
+    [ -n "${_label}" ] && printf '%s' "${_label}" || printf '%s' "${_id}"
 }
 
 module_summary() {
@@ -4141,6 +4503,10 @@ module_summary() {
             [ "$(st_get '.http.enabled')" = "true" ] \
                 && printf '%s' "已启用 (port=$(port_of http), listen=$(st_get '.http.listen'), user=$(st_get '.http.user'))" \
                 || printf '未启用' ;;
+        ss2022)
+            [ "$(st_get '.ss2022.enabled')" = "true" ] \
+                && printf '%s' "已启用 (port=$(port_of ss2022), listen=$(st_get '.ss2022.listen'), method=$(st_get '.ss2022.method'))" \
+                || printf '未启用' ;;
         *)
             printf 'unknown' ;;
     esac
@@ -4148,19 +4514,17 @@ module_summary() {
 
 module_show_action() {
     local _mod="${1:-}"
-    case "${_mod}" in
-        all|argo|ff|reality|vltcp|vlquic|socks|http)
-            config_print_nodes
-            ;;
-        cforigin)
-            config_print_nodes
-            cforigin_print_cloudflare_hint
-            ;;
-        *)
-            log_error "不支持节点展示的模块: ${_mod}"
-            return 1
-            ;;
-    esac
+    if [ "${_mod}" = "all" ]; then
+        config_print_nodes
+    elif [ "${_mod}" = "cforigin" ]; then
+        config_print_nodes
+        cforigin_print_cloudflare_hint
+    elif module_registry_has "${_mod}"; then
+        config_print_nodes
+    else
+        log_error "不支持节点展示的模块: ${_mod}"
+        return 1
+    fi
     return 0
 }
 
@@ -4241,8 +4605,59 @@ module_status_action() {
     esac
 }
 
+module_registry_dispatch_common() {
+    local _mod="${1}" _action="${2}" _fn _target
+    case "${_action}" in
+        menu)
+            _fn="${_MODULE_MENU_FN[${_mod}]-}"
+            [ -n "${_fn}" ] || { log_error "模块 ${_mod} 未注册菜单处理器"; return 1; }
+            "${_fn}" runtime
+            ;;
+        restart)
+            _target="${_MODULE_RESTART_TARGET[${_mod}]-}"
+            [ -n "${_target}" ] || { log_error "模块 ${_mod} 未注册重启目标"; return 1; }
+            module_restart_action "${_target}"
+            ;;
+        show)
+            module_show_action "${_mod}"
+            ;;
+        enable|disable|uninstall)
+            if [ "${_action}" = "enable" ]; then
+                _fn="${_MODULE_ENABLE_FN[${_mod}]-}"
+            elif [ "${_action}" = "disable" ]; then
+                _fn="${_MODULE_DISABLE_FN[${_mod}]-}"
+            else
+                _fn="${_MODULE_UNINSTALL_FN[${_mod}]-}"
+            fi
+            [ -n "${_fn}" ] || { log_error "模块 ${_mod} 未注册 ${_action} 处理器"; return 1; }
+            "${_fn}"
+            ;;
+        update_port)
+            _fn="${_MODULE_UPDATE_PORT_FN[${_mod}]-}"
+            [ -n "${_fn}" ] || { log_error "模块 ${_mod} 未注册端口处理器"; return 1; }
+            "${_fn}"
+            ;;
+        update_listen)
+            _fn="${_MODULE_UPDATE_LISTEN_FN[${_mod}]-}"
+            [ -n "${_fn}" ] || { log_error "模块 ${_mod} 未注册监听地址处理器"; return 1; }
+            "${_fn}"
+            ;;
+        *)
+            return 2
+            ;;
+    esac
+}
+
 module_dispatch() {
     local _mod="${1:-}" _action="${2:-menu}"
+    case "${_action}" in
+        menu|restart|show|enable|disable|uninstall|update_port|update_listen)
+            if module_registry_has "${_mod}"; then
+                module_registry_dispatch_common "${_mod}" "${_action}"
+                return $?
+            fi
+            ;;
+    esac
     case "${_mod}:${_action}" in
         # core/global actions
         xray:install) module_xray_install ;;
@@ -4251,68 +4666,7 @@ module_dispatch() {
         config:update_uuid) module_config_update_uuid ;;
         config:update_shortcut) module_config_update_shortcut ;;
 
-        # module menu entrypoints
-        argo:menu)     unified_menu_argo runtime ;;
-        ff:menu)       unified_menu_freeflow runtime ;;
-        reality:menu)  unified_menu_reality runtime ;;
-        vltcp:menu)    unified_menu_vltcp runtime ;;
-        vlquic:menu)   unified_menu_vlquic runtime ;;
-        cforigin:menu) unified_menu_cforigin runtime ;;
-        socks:menu)    unified_menu_socks runtime ;;
-        http:menu)     unified_menu_http runtime ;;
-
-        # shared runtime actions
-        argo:restart) module_restart_action argo ;;
-        ff:restart) module_restart_action xray ;;
-        reality:restart) module_restart_action xray ;;
-        vltcp:restart) module_restart_action xray ;;
-        vlquic:restart) module_restart_action xray ;;
-        cforigin:restart) module_restart_action xray ;;
-        http:restart) module_restart_action xray ;;
-        argo:show) module_show_action argo ;;
-        ff:show) module_show_action ff ;;
-        reality:show) module_show_action reality ;;
-        vltcp:show) module_show_action vltcp ;;
-        vlquic:show) module_show_action vlquic ;;
-        cforigin:show) module_show_action cforigin ;;
-        socks:show) module_show_action socks ;;
-        http:show) module_show_action http ;;
-
-        # lifecycle actions
-        argo:enable) module_argo_enable ;;
-        argo:disable) module_argo_disable ;;
-        ff:enable) module_ff_enable ;;
-        ff:disable) module_ff_disable ;;
-        reality:enable) module_reality_enable ;;
-        reality:disable) module_reality_disable ;;
-        vltcp:enable) module_vltcp_enable ;;
-        vltcp:disable) module_vltcp_disable ;;
-        vlquic:enable) module_vlquic_enable ;;
-        vlquic:disable) module_vlquic_disable ;;
-        cforigin:enable) module_cforigin_enable ;;
-        cforigin:disable) module_cforigin_disable ;;
-        socks:enable) module_socks_action enable ;;
-        socks:disable) module_socks_action disable ;;
-        http:enable) module_http_action enable ;;
-        http:disable) module_http_action disable ;;
-
-        # uninstall/update-port actions
-        argo:uninstall) module_argo_uninstall ;;
-        ff:uninstall) module_ff_uninstall ;;
-        reality:uninstall) module_reality_uninstall ;;
-        vltcp:uninstall) module_vltcp_uninstall ;;
-        vlquic:uninstall) module_vlquic_uninstall ;;
-        cforigin:uninstall) module_cforigin_uninstall ;;
-        socks:uninstall) module_socks_uninstall ;;
-        http:uninstall) module_http_uninstall ;;
-        argo:update_port) module_argo_update_port ;;
-        ff:update_port) module_update_port_action ff tcp ;;
-        reality:update_port) module_update_port_action reality tcp ;;
-        vltcp:update_port) module_update_port_action vltcp tcp ;;
-        vlquic:update_port) module_update_port_action vlquic udp udp ;;
-        cforigin:update_port) module_cforigin_update_port ;;
-        socks:update_port) module_update_port_action socks tcp ;;
-        http:update_port) module_update_port_action http tcp ;;
+        # Common module actions are dispatched from the registry above.
 
         # field/config update actions
         argo:update_protocol) module_argo_update_action protocol ;;
@@ -4323,20 +4677,17 @@ module_dispatch() {
         ff:update_mode) module_ff_update_mode ;;
         ff:update_host_or_path) module_ff_update_host_or_path ;;
         reality:update_transport) module_reality_update_transport ;;
-        vltcp:update_listen) module_update_listen_action vltcp ;;
-        vlquic:update_listen) module_update_listen_action vlquic ;;
         cforigin:update_protocol) module_cforigin_update_protocol ;;
         cforigin:update_domain) module_cforigin_update_domain ;;
         cforigin:update_path) module_cforigin_update_path ;;
-        cforigin:update_listen) module_cforigin_update_listen ;;
-        socks:update_listen) module_update_listen_action socks ;;
         socks:update_auth) module_socks_update_auth ;;
         socks:update_user) module_socks_update_user ;;
         socks:update_pass) module_socks_update_pass ;;
-        http:update_listen) module_update_listen_action http ;;
         http:update_auth) module_http_update_auth ;;
         http:update_user) module_http_update_user ;;
         http:update_pass) module_http_update_pass ;;
+        ss2022:update_method) module_ss2022_update_method ;;
+        ss2022:regenerate_keys) module_ss2022_regenerate_keys ;;
 
         # key/toggle actions
         reality:update_sni) module_reality_update_sni ;;
@@ -4352,22 +4703,24 @@ module_dispatch() {
 }
 
 # 交互输入端口并写入 .ports.<proto>
-_menu_input_port_proto() {
-    local _jq_path="$1" _proto="${2:-tcp}" _outvar="${3:-}" _port_input
+# 交互选择端口（回车随机、校验、占用确认），只输出端口，不修改 state。
+_menu_select_port() {
+    local _proto="${1:-tcp}" _outvar="${2:-}" _port_input _proto_label
+    _proto_label="${_proto^^}"
     prompt "新端口（回车随机）: " _port_input
     [ -z "${_port_input:-}" ] && _port_input=$(port_mgr_random_proto "${_proto}")
-    # 统一通过 val_port 校验，防止配置注入
     val_port "${_port_input}" >/dev/null || return 1
+    local _busy
     case "${_proto}" in
-        udp) port_mgr_in_use_udp "${_port_input}" && _busy=1 || _busy=0 ;;
-        *)   port_mgr_in_use     "${_port_input}" && _busy=1 || _busy=0 ;;
+        udp)  port_mgr_in_use_udp "${_port_input}" && _busy=1 || _busy=0 ;;
+        both) _proto_label="TCP/UDP"; port_mgr_in_use_both "${_port_input}" && _busy=1 || _busy=0 ;;
+        *)    port_mgr_in_use "${_port_input}" && _busy=1 || _busy=0 ;;
     esac
     if [ "${_busy}" -eq 1 ]; then
-        log_warn "${_proto^^}/${_port_input} 已被占用"
+        log_warn "${_proto_label}/${_port_input} 已被占用"
         local _a; prompt "仍然继续？(y/N): " _a
         case "${_a:-n}" in y|Y) :;; *) return 1;; esac
     fi
-    st_set "${_jq_path} = (\$p|tonumber)" --arg p "${_port_input}" || return 1
     if [ -n "${_outvar:-}" ]; then
         printf '%s' "${_outvar}" | grep -qE '^[A-Za-z_][A-Za-z0-9_]*$' \
             || { log_error "内部错误：非法输出变量名 ${_outvar}"; return 1; }
@@ -4377,17 +4730,25 @@ _menu_input_port_proto() {
     fi
 }
 
+_menu_input_port_proto() {
+    local _jq_path="$1" _proto="${2:-tcp}" _outvar="${3:-}" _np
+    _menu_select_port "${_proto}" _np || return 1
+    st_set "${_jq_path} = (\$p|tonumber)" --arg p "${_np}" || return 1
+    if [ -n "${_outvar:-}" ]; then
+        printf -v "${_outvar}" '%s' "${_np}"
+    else
+        printf '%s' "${_np}"
+    fi
+}
+
 _menu_input_port() {
     _menu_input_port_proto "$1" tcp "${2:-}"
 }
 
 _menu_update_port() {
-    local _proto="$1" _net="${2:-tcp}" _label_suffix="${3:-}"
-    local _np _label
-    _menu_input_port_proto ".ports.${_proto}" "${_net}" _np || return 1
-    _label="${_np}"
-    [ -n "${_label_suffix:-}" ] && _label="${_np}/${_label_suffix}"
-    _commit_port_change "${_proto}" "${_label}"
+    local _proto="$1" _net="${2:-tcp}" _label_suffix="${3:-}" _np
+    _menu_select_port "${_net}" _np || return 1
+    _commit_port_change "${_proto}" "${_np}" "${_label_suffix}"
 }
 
 _menu_confirm_uninstall() {
@@ -4488,6 +4849,7 @@ check_argo() {
 
 _menu_collect_status() {
     local _xs _cx
+    _MENU_SSD=""
     _xs=$(check_xray); _cx=$?
     check_xray_install && _MENU_XI=1 || _MENU_XI=0
     [ "${_cx}" -eq 0 ] && _MENU_XC="${C_GRN}" || _MENU_XC="${C_RED}"
@@ -4501,6 +4863,7 @@ _menu_collect_status() {
     _MENU_CD=$(module_summary cforigin)
     _MENU_SD=$(module_summary socks)
     _MENU_HD=$(module_summary http)
+    _MENU_SSD=$(module_summary ss2022)
 }
 
 _menu_render() {
@@ -4517,6 +4880,7 @@ _menu_render() {
     printf "${C_BOLD}${C_PUR}  ║${C_RST}  FF       : %-29s${C_PUR} ${C_RST}\n" "${_MENU_FD}"
     printf "${C_BOLD}${C_PUR}  ║${C_RST}  SOCKS5   : %-29s${C_PUR} ${C_RST}\n" "${_MENU_SD}"
     printf "${C_BOLD}${C_PUR}  ║${C_RST}  HTTP代理  : %-29s${C_PUR} ${C_RST}\n" "${_MENU_HD}"
+    printf "  SS2022   : %-29s$C_PUR $C_RST\n" "$_MENU_SSD"
     printf "${C_BOLD}${C_PUR}  ╚══════════════════════════════════════════╝${C_RST}\n\n"
     printf "  ${C_GRN}1.${C_RST} 开始部署（快速向导）\n"
     printf "  ${C_RED}2.${C_RST} 卸载整套 Xray-2go\n"; _hr
@@ -4530,6 +4894,7 @@ _menu_render() {
     printf "  ${C_GRN}10.${C_RST} 更新 UUID\n"
     printf "  ${C_GRN}11.${C_RST} 管理 SOCKS5 入站\n"
     printf "  ${C_GRN}12.${C_RST} 管理 HTTP 代理入站\n"; _hr
+    printf "  %s13.%s 管理 Shadowsocks 2022 入站\n" "$C_GRN" "$C_RST"; _hr
     printf "  ${C_GRN}s.${C_RST} 更新快捷方式/脚本\n"; _hr
     printf "  ${C_RED}0.${C_RST} 退出程序\n\n"
     printf "  说明: ${C_YLW}首次部署进入快速向导，已安装时进入管理菜单${C_RST}；命令行 ${C_CYN}reality${C_RST} 可一键安装 VLESS + Reality (TCP)\n\n"
@@ -4571,6 +4936,11 @@ install_plan_reset_defaults() {
         .http.listen = "0.0.0.0" |
         .http.user = "xray2go" |
         .http.pass = "xray2go" |
+        .ss2022.enabled = false |
+        .ss2022.listen = "0.0.0.0" |
+        .ss2022.method = "2022-blake3-aes-256-gcm" |
+        .ss2022.server_key = "" |
+        .ss2022.user_key = "" |
         .vlquic.enabled = false |
         .vlquic.listen = "0.0.0.0" |
         .vlquic.domain = "" |
@@ -4638,6 +5008,7 @@ install_plan_has_enabled_module() {
     [ "$(st_get '.vltcp.enabled')" = "true" ] && return 0
     [ "$(st_get '.socks.enabled')" = "true" ] && return 0
     [ "$(st_get '.http.enabled')" = "true" ] && return 0
+    [ "$(st_get '.ss2022.enabled')" = "true" ] && return 0
     [ "$(st_get '.vlquic.enabled')" = "true" ] && return 0
     [ "$(st_get '.cforigin.enabled')" = "true" ] && return 0
     return 1
@@ -4670,6 +5041,10 @@ install_plan_module_summary() {
             [ "$(st_get '.vlquic.enabled')" = "true" ]                 && printf '%s' "已启用 (udp=$(port_of vlquic), domain=$(st_get '.vlquic.domain'))"                 || printf '未启用' ;;
         cforigin)
             [ "$(st_get '.cforigin.enabled')" = "true" ]                 && printf '%s' "已启用 ($(st_get '.cforigin.protocol'), edge=$(st_get '.cforigin.edge_port'), origin=$(port_of cforigin), domain=$(st_get '.cforigin.domain'))"                 || printf '未启用' ;;
+        ss2022)
+            [ "$(st_get '.ss2022.enabled')" = "true" ] \
+                && printf '%s' "已启用 (port=$(port_of ss2022), listen=$(st_get '.ss2022.listen'), method=$(st_get '.ss2022.method'))" \
+                || printf '未启用' ;;
         *) printf 'unknown' ;;
     esac
 }
@@ -4685,6 +5060,7 @@ install_plan_render_summary() {
     printf "  VLESS-TCP : %s\n" "$(install_plan_module_summary vltcp)"
     printf "  SOCKS5    : %s\n" "$(install_plan_module_summary socks)"
     printf "  HTTP代理  : %s\n" "$(install_plan_module_summary http)"
+    printf "  SS2022   : %s\n" "$(install_plan_module_summary ss2022)"
     printf "  XHTTP-H3  : %s\n" "$(install_plan_module_summary vlquic)"
     printf "  CF-Origin : %s\n" "$(install_plan_module_summary cforigin)"
     _hr
@@ -4703,6 +5079,7 @@ install_plan_render_summary() {
     _menu_print_action 10 "运行安装前检查"
     _menu_print_action 11 "开始安装" "${C_GRN}"
     _menu_print_action 12 "进入 HTTP 代理配置页"
+    _menu_print_action 13 "进入 Shadowsocks 2022 配置页"
     _menu_print_action 0 "取消安装并返回主菜单" "${C_PUR}"
     _hr
 }
@@ -5224,6 +5601,70 @@ install_plan_vlquic_update_cert() {
     log_ok "VLESS-XHTTP-H3 域名/证书已更新"
 }
 
+install_plan_ss2022_toggle() {
+    if [ "$(st_get '.ss2022.enabled')" = "true" ]; then
+        st_set '.ss2022.enabled = false | .ss2022.server_key = "" | .ss2022.user_key = ""' || return 1
+        log_ok "Shadowsocks 2022 已禁用"
+    else
+        _module_ss2022_enable_prepare || return 1
+        log_ok "Shadowsocks 2022 已启用"
+    fi
+}
+
+install_plan_ss2022_update_port() {
+    local _old _new
+    _old=$(port_of ss2022)
+    prompt "Shadowsocks 2022 TCP/UDP 端口（回车保持 ${_old}）: " _new
+    [ -n "${_new}" ] || return 0
+    val_port "${_new}" >/dev/null || return 1
+    if port_mgr_in_use_both "${_new}"; then
+        log_warn "TCP/UDP/${_new} 已被占用；当前不会自动更换，请确认端口冲突不会影响安装"
+    fi
+    st_set '.ports.ss2022 = ($p|tonumber)' --arg p "${_new}" || return 1
+    log_ok "Shadowsocks 2022 端口已设置为: $(port_of ss2022)"
+}
+
+install_plan_ss2022_update_listen() {
+    local _old _new
+    _old=$(st_get '.ss2022.listen')
+    prompt "Shadowsocks 2022 监听地址（回车保持 $_old）: " _new
+    [ -n "$_new" ] || return 0
+    _new=$(val_listen_addr "$_new") || return 1
+    st_set '.ss2022.listen = $l' --arg l "$_new" || return 1
+    log_ok "Shadowsocks 2022 监听地址已设置为: $(st_get '.ss2022.listen')"
+}
+
+install_plan_ss2022_update_method() {
+    local _choice _method _server _user _cur
+    _cur=$(st_get '.ss2022.method')
+    echo ""
+    printf "  1. 2022-blake3-aes-256-gcm [默认，32 字节密钥]\\n"
+    printf "  2. 2022-blake3-aes-128-gcm [16 字节密钥]\\n"
+    prompt "加密方法（回车保持 $_cur）: " _choice
+    [ -n "$_choice" ] || return 0
+    case "$_choice" in
+        1) _method="2022-blake3-aes-256-gcm" ;;
+        2) _method="2022-blake3-aes-128-gcm" ;;
+        *) log_error "无效的 SS2022 加密方法"; return 1 ;;
+    esac
+    _server=$(crypto_gen_ss2022_key "$_method") || return 1
+    _user=$(crypto_gen_ss2022_key "$_method") || return 1
+    st_set '.ss2022.method = $m | .ss2022.server_key = $s | .ss2022.user_key = $u' \
+        --arg m "$_method" --arg s "$_server" --arg u "$_user" || return 1
+    log_ok "安装计划 SS2022 方法已更新为 $_method（已重新生成密钥）"
+}
+
+install_plan_ss2022_regenerate_keys() {
+    local _method _server _user
+    _method=$(st_get '.ss2022.method')
+    val_ss2022_method "$_method" >/dev/null || return 1
+    _server=$(crypto_gen_ss2022_key "$_method") || return 1
+    _user=$(crypto_gen_ss2022_key "$_method") || return 1
+    st_set '.ss2022.server_key = $s | .ss2022.user_key = $u' \
+        --arg s "$_server" --arg u "$_user" || return 1
+    log_ok "安装计划 SS2022 密钥已重新生成"
+}
+
 install_plan_configure_uuid() {
     local _v
     prompt "新 UUID（回车自动生成）: " _v
@@ -5290,6 +5731,14 @@ install_plan_validate() {
         [ -n "$(st_get '.socks.user')" ] || { log_error "SOCKS5 用户名不能为空"; return 1; }
     fi
 
+    if [ "$(st_get '.ss2022.enabled')" = "true" ]; then
+        val_ss2022_method "$(st_get '.ss2022.method')" >/dev/null || return 1
+        val_port "$(port_of ss2022)" >/dev/null || return 1
+        val_listen_addr "$(st_get '.ss2022.listen')" >/dev/null || return 1
+        val_ss2022_key "$(st_get '.ss2022.method')" "$(st_get '.ss2022.server_key')" >/dev/null || return 1
+        val_ss2022_key "$(st_get '.ss2022.method')" "$(st_get '.ss2022.user_key')" >/dev/null || return 1
+    fi
+
     if [ "$(st_get '.http.enabled')" = "true" ]; then
         val_port "$(port_of http)" >/dev/null || return 1
         val_listen_addr "$(st_get '.http.listen')" >/dev/null || return 1
@@ -5329,6 +5778,9 @@ install_execute_current_plan() {
     fi
     if [ "$(st_get '.vlquic.enabled')" = "true" ]; then
         port_mgr_in_use_udp "$(port_of vlquic)" &&             log_warn "VLESS-XHTTP-H3 UDP/$(port_of vlquic) 已被占用"
+    fi
+    if [ "$(st_get '.ss2022.enabled')" = "true" ]; then
+        port_mgr_in_use_both "$(port_of ss2022)" &&             log_warn "Shadowsocks 2022 TCP/UDP/$(port_of ss2022) 已被占用"
     fi
 
     if ! module_xray_install_core; then
@@ -5865,6 +6317,62 @@ unified_menu_socks() {
     done
 }
 
+unified_menu_ss2022() {
+    local _mode="$1" _runtime=0
+    [ -n "$_mode" ] || _mode=install
+    _unified_mode_is_runtime "$_mode" && { _runtime=1; _manage_module_entry_check || return; }
+    while true; do
+        local _en _port _listen _method _svc _summary
+        _en=$(st_get '.ss2022.enabled')
+        _port=$(port_of ss2022)
+        _listen=$(st_get '.ss2022.listen')
+        _method=$(st_get '.ss2022.method')
+        _svc=$(_unified_runtime_status_for ss2022)
+        _summary=$(_unified_summary_for "$_runtime" ss2022)
+        clear; echo ""; log_title "══ Shadowsocks 2022 闭环工作台 ══"
+        _unified_render_mode_header "$_mode" "使用 Xray-core 内置 SS2022；仅支持 AES-128/AES-256 GCM 多用户模式"
+        _unified_render_status "$_runtime" "$_en" "$_svc"
+        printf "  端口: $C_YLW%s$C_RST  监听: $C_CYN%s$C_RST  方法: $C_GRN%s$C_RST\\n" "$_port" "$_listen" "$_method"
+        _hr
+        _menu_print_action 1 "切换启用状态"
+        _menu_print_action 2 "修改 TCP/UDP 监听端口"
+        _menu_print_action 3 "修改监听地址"
+        _menu_print_action 4 "修改加密方法（会重新生成密钥）"
+        _menu_print_action 5 "重新生成服务端/用户密钥"
+        _menu_print_action 6 "查看当前节点摘要"
+        if [ "$_runtime" -eq 1 ]; then
+            _hr
+            _menu_print_action r "重启 xray2go 服务"
+            _menu_print_action v "查看节点链接"
+            _menu_print_action u "卸载 Shadowsocks 2022" "$C_RED"
+        fi
+        _menu_print_back
+        _hr
+        prompt "请选择操作 $( [ "$_runtime" -eq 1 ] && printf '(0-6/r/v/u)' || printf '(0-6)' ): " _c
+        case "$_c" in
+            1) _unified_toggle_or_plan "$_runtime" ss2022 "$_en" install_plan_ss2022_toggle || true ;;
+            2) _unified_dispatch_or_plan "$_runtime" ss2022 update_port install_plan_ss2022_update_port || true ;;
+            3) _unified_dispatch_or_plan "$_runtime" ss2022 update_listen install_plan_ss2022_update_listen || true ;;
+            4) _unified_dispatch_or_plan "$_runtime" ss2022 update_method install_plan_ss2022_update_method || true ;;
+            5) _unified_dispatch_or_plan "$_runtime" ss2022 regenerate_keys install_plan_ss2022_regenerate_keys || true ;;
+            6) log_info "SS2022: $_summary" ;;
+            r) _unified_runtime_only_fn "$_runtime" _module_action_or_continue ss2022 restart || true ;;
+            v) _unified_runtime_only_fn "$_runtime" _module_action_or_continue ss2022 show || true ;;
+            u)
+                if [ "$_runtime" -eq 1 ]; then
+                    _menu_confirm_uninstall "Shadowsocks 2022" || { _pause; continue; }
+                    _module_action_or_continue ss2022 uninstall || continue
+                    _pause; return 0
+                else
+                    log_error "无效选项，请按提示输入"
+                fi ;;
+            0) return 0 ;;
+            *) log_error "无效选项，请按提示输入" ;;
+        esac
+        _pause
+    done
+}
+
 unified_menu_http() {
     local _mode="${1:-install}" _runtime=0
     _unified_mode_is_runtime "${_mode}" && { _runtime=1; _manage_module_entry_check || return; }
@@ -5941,6 +6449,7 @@ install_wizard_confirm() {
     printf "  VLESS-TCP : %s\n" "$(install_plan_module_summary vltcp)"
     printf "  SOCKS5    : %s\n" "$(install_plan_module_summary socks)"
     printf "  HTTP代理  : %s\n" "$(install_plan_module_summary http)"
+    printf "  SS2022   : %s\n" "$(install_plan_module_summary ss2022)"
     printf "  XHTTP-H3  : %s\n" "$(install_plan_module_summary vlquic)"
     printf "  CF-Origin : %s\n" "$(install_plan_module_summary cforigin)"
     _hr
@@ -6016,7 +6525,7 @@ install_plan_menu() {
     while true; do
         install_plan_render_summary
         local _c
-        prompt "请选择操作 (0-12): " _c
+        prompt "请选择操作 (0-13): " _c
         echo ""
         case "${_c:-}" in
             1) unified_menu_argo install || true ;;
@@ -6033,6 +6542,7 @@ install_plan_menu() {
                 install_execute_current_plan && return 0
                 ;;
             12) unified_menu_http install || true ;;
+            13) unified_menu_ss2022 install || true ;;
             0)
                 log_info "已取消安装并返回主菜单"
                 return 0 ;;
@@ -6054,11 +6564,11 @@ module_xray_install() {
 }
 menu() {
     local _MENU_XS="" _MENU_XC="" _MENU_CX=1 _MENU_XI=0
-    local _MENU_AD="" _MENU_FD="" _MENU_RD="" _MENU_VD="" _MENU_QD="" _MENU_CD="" _MENU_SD="" _MENU_HD=""
+    local _MENU_AD="" _MENU_FD="" _MENU_RD="" _MENU_VD="" _MENU_QD="" _MENU_CD="" _MENU_SD="" _MENU_HD="" _MENU_SSD=""
     while true; do
         _menu_collect_status
         _menu_render
-        local _c; prompt "请选择操作 (0-12/s): " _c; echo ""
+        local _c; prompt "请选择操作 (0-13/s): " _c; echo ""
         case "${_c:-}" in
             1) module_dispatch xray install ;;
             2) module_dispatch xray uninstall ;;
@@ -6070,11 +6580,12 @@ menu() {
             8) module_dispatch cforigin ;;
             11) module_dispatch socks ;;
             12) module_dispatch http ;;
+            13) module_dispatch ss2022 ;;
             9) module_dispatch nodes show ;;
             10) module_dispatch config update_uuid ;;
             s) module_dispatch config update_shortcut ;;
             0) log_info "已退出"; exit 0 ;;
-            *) log_error "无效选项，请输入 0-12 或 s" ;;
+            *) log_error "无效选项，请输入 0-13 或 s" ;;
         esac
         _pause
     done

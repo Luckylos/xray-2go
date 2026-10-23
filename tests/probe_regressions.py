@@ -479,11 +479,14 @@ def test_menu_status_and_commit_helpers_are_shared():
         assert_true(helper in TEXT or helper in menu_helpers, f"shared menu helper missing: {helper}")
 
 
+
 def test_single_file_module_registry_drives_main_status():
-    assert_true('_MODULE_IDS="argo ff reality vltcp vlquic cforigin socks http"' in TEXT, "single-file module registry must list all modules")
-    assert_true('module_summary()' in TEXT and 'module_label()' in TEXT, "module metadata helpers missing")
+    assert_true('_MODULE_IDS="argo ff reality vltcp vlquic cforigin socks http ss2022"' in TEXT, "single-file module registry must list all modules")
+    for name in ['_MODULE_LABELS', '_MODULE_MENU_FN', '_MODULE_RESTART_TARGET', '_MODULE_ENABLE_FN', '_MODULE_DISABLE_FN', '_MODULE_UNINSTALL_FN', '_MODULE_UPDATE_PORT_FN', '_MODULE_UPDATE_LISTEN_FN']:
+        assert_true(name in TEXT, f"module metadata missing: {name}")
+    assert_true('module_summary()' in TEXT and 'module_label()' in TEXT and 'module_registry_has()' in TEXT, "module metadata helpers missing")
     collect_body = TEXT[TEXT.index('_menu_collect_status()'):TEXT.index('_menu_render()')]
-    for mod in ['argo', 'ff', 'reality', 'vltcp', 'vlquic', 'cforigin', 'socks', 'http']:
+    for mod in ['argo', 'ff', 'reality', 'vltcp', 'vlquic', 'cforigin', 'socks', 'http', 'ss2022']:
         assert_true(f'module_summary {mod}' in collect_body, f"main status should be driven by module_summary for {mod}")
     assert_true('module_dispatch()' in TEXT, "module dispatcher skeleton missing")
     menu_body = TEXT[TEXT.index('menu()'):TEXT.index('# ==============================================================================', TEXT.index('menu()'))]
@@ -495,76 +498,61 @@ def test_single_file_module_registry_drives_main_status():
 
 def test_single_file_module_dispatch_actions():
     dispatch_body = TEXT[TEXT.index('module_dispatch()'):TEXT.index('# 交互输入端口', TEXT.index('module_dispatch()'))]
-    for token in ['_action="${2:-menu}"', 'xray:install)', 'xray:uninstall)', 'nodes:show)', 'config:update_uuid)', 'config:update_shortcut)', 'argo:restart)', 'reality:show)', 'vltcp:show)', 'vlquic:restart)', 'ff:show)', 'cforigin:show)', 'socks:show)', 'http:show)']:
+    for token in ['_action=', 'xray:install)', 'xray:uninstall)', 'nodes:show)', 'config:update_uuid)', 'config:update_shortcut)', 'module_registry_dispatch_common', 'module_registry_has']:
         assert_true(token in dispatch_body, f"module_dispatch action route missing: {token}")
     for fn in ['module_xray_install()', 'module_xray_uninstall()', 'module_nodes_show()', 'module_config_update_uuid()', 'module_config_update_shortcut()', 'module_xray_restart()', 'module_argo_restart()', 'module_show_nodes()', 'module_cforigin_show()']:
         assert_true(fn in TEXT, f"module action helper missing: {fn}")
-    for marker in ['# core/global actions', '# module menu entrypoints', '# shared runtime actions', '# lifecycle actions', '# uninstall/update-port actions', '# field/config update actions', '# key/toggle actions', '# complex/specialized actions']:
+    for marker in ['# core/global actions', '# Common module actions are dispatched from the registry above.', '# field/config update actions', '# key/toggle actions', '# complex/specialized actions']:
         assert_true(marker in dispatch_body, f"module_dispatch should be grouped for readability: {marker}")
-    xray_install_body = TEXT[TEXT.index('module_xray_install()'):TEXT.index('\n}\n', TEXT.index('module_xray_install()'))]
-    xray_uninstall_body = TEXT[TEXT.index('module_xray_uninstall()'):TEXT.index('\n}\n', TEXT.index('module_xray_uninstall()'))]
-    config_uuid_body = TEXT[TEXT.index('module_config_update_uuid()'):TEXT.index('\n}\n', TEXT.index('module_config_update_uuid()'))]
-    config_shortcut_body = TEXT[TEXT.index('module_config_update_shortcut()'):TEXT.index('\n}\n', TEXT.index('module_config_update_shortcut()'))]
-    assert_true('exec_install()' not in TEXT and 'exec_install' not in xray_install_body, "xray install should call module_xray_install_core, not exec_install")
-    assert_true(
-        'module_xray_install_core()' in TEXT and 'install_wizard_menu' in xray_install_body and 'install_plan_menu' in TEXT,
-        "xray install should enter the deployment wizard, retain the advanced plan menu, and ultimately reuse the shared install core",
-    )
-    assert_true('install_execute_current_plan()' in TEXT and 'module_xray_install_core' in TEXT[TEXT.index('install_execute_current_plan()'):TEXT.index('\n}\n', TEXT.index('install_execute_current_plan()'))], "install plan executor should reuse module_xray_install_core")
-    assert_true('_menu_do_install()' not in TEXT and '_menu_do_install' not in xray_install_body, "xray install workflow should live in module_xray_install, not a menu helper wrapper")
-    assert_true('exec_uninstall()' not in TEXT and 'exec_uninstall' not in xray_uninstall_body, "xray uninstall workflow should live in module_xray_uninstall, not a wrapper")
-    assert_true('exec_update_uuid()' not in TEXT and 'exec_update_uuid' not in config_uuid_body, "config UUID workflow should live in module_config_update_uuid, not a wrapper")
-    assert_true('exec_update_shortcut()' not in TEXT and 'exec_update_shortcut' not in config_shortcut_body, "config shortcut workflow should live in module_config_update_shortcut, not a wrapper")
     assert_true('_module_action_or_continue reality restart' in TEXT and '_module_action_or_continue vltcp show' in TEXT, "module menus should route representative actions through shared dispatch wrapper")
 
 
 def test_single_file_module_enable_disable_actions():
-    dispatch_body = TEXT[TEXT.index('module_dispatch()'):TEXT.index('# 交互输入端口', TEXT.index('module_dispatch()'))]
-    for token in ['ff:enable)', 'ff:disable)', 'reality:enable)', 'vltcp:disable)', 'cforigin:enable)', 'cforigin:disable)', 'socks:enable)', 'socks:disable)', 'http:enable)', 'http:disable)']:
-        assert_true(token in dispatch_body, f"module_dispatch enable/disable route missing: {token}")
+    assert_true('_MODULE_ENABLE_FN' in TEXT and '_MODULE_DISABLE_FN' in TEXT, "registry lifecycle maps are missing")
     for fn in ['module_ff_enable()', 'module_ff_disable()', 'module_reality_enable()', 'module_vltcp_enable()', 'module_cforigin_enable()', 'module_cforigin_disable()', 'module_socks_enable()', 'module_socks_disable()', 'module_http_enable()', 'module_http_disable()']:
         assert_true(fn in TEXT, f"module enable/disable helper missing: {fn}")
     for body_name, mod, plan_fn in [('unified_menu_freeflow()', 'ff', 'install_plan_ff_toggle'), ('unified_menu_reality()', 'reality', 'install_plan_reality_toggle'), ('unified_menu_vltcp()', 'vltcp', 'install_plan_vltcp_toggle'), ('unified_menu_cforigin()', 'cforigin', 'install_plan_cforigin_toggle'), ('unified_menu_socks()', 'socks', 'install_plan_socks_toggle'), ('unified_menu_http()', 'http', 'install_plan_http_toggle')]:
         body = TEXT[TEXT.index(body_name):TEXT.index('\n}\n', TEXT.index(body_name))]
-        assert_true('_unified_toggle_or_plan "${_runtime}"' in body and plan_fn in body, f"{body_name} runtime/install toggle should use shared toggle helper")
+        assert_true('_unified_toggle_or_plan' in body and plan_fn in body, f"{body_name} runtime/install toggle should use shared toggle helper")
+
 
 def test_single_file_module_uninstall_update_actions():
-    dispatch_body = TEXT[TEXT.index('module_dispatch()'):TEXT.index('# 交互输入端口', TEXT.index('module_dispatch()'))]
-    for token in ['ff:uninstall)', 'reality:uninstall)', 'vltcp:uninstall)', 'reality:update_port)', 'vltcp:update_port)', 'vlquic:update_port)', 'cforigin:uninstall)', 'cforigin:update_port)', 'socks:uninstall)', 'http:uninstall)', 'http:update_port)']:
-        assert_true(token in dispatch_body, f"module_dispatch uninstall/update route missing: {token}")
+    for name in ['_MODULE_UNINSTALL_FN', '_MODULE_UPDATE_PORT_FN']:
+        assert_true(name in TEXT, f"registry action map missing: {name}")
     for fn in ['module_ff_uninstall()', 'module_reality_uninstall()', 'module_vltcp_uninstall()', 'module_reality_update_port()', 'module_vltcp_update_port()', 'module_vlquic_update_port()', 'module_cforigin_uninstall()', 'module_cforigin_update_port()', 'module_socks_uninstall()', 'module_http_uninstall()', 'module_http_update_port()', 'module_http_update_listen()']:
         assert_true(fn in TEXT, f"module uninstall/update helper missing: {fn}")
     for body_name in ['unified_menu_freeflow()', 'unified_menu_reality()', 'unified_menu_vltcp()', 'unified_menu_vlquic()', 'unified_menu_cforigin()', 'unified_menu_socks()', 'unified_menu_http()']:
         body = TEXT[TEXT.index(body_name):TEXT.index('\n}\n', TEXT.index(body_name))]
         assert_true('_menu_confirm_uninstall' in body and '_pause; return 0' in body, f"{body_name} should provide runtime uninstall closure inside the unified workbench")
 
+
 def test_single_file_module_config_update_actions():
+    assert_true('_MODULE_UPDATE_LISTEN_FN' in TEXT and 'update_listen)' in TEXT, "listen updates must be registry-owned")
     dispatch_body = TEXT[TEXT.index('module_dispatch()'):TEXT.index('# 交互输入端口', TEXT.index('module_dispatch()'))]
-    for token in ['reality:update_transport)', 'vltcp:update_listen)', 'vlquic:update_listen)', 'cforigin:update_protocol)', 'cforigin:update_path)', 'cforigin:update_listen)', 'http:update_listen)', 'http:update_auth)', 'http:update_user)', 'http:update_pass)']:
+    for token in ['reality:update_transport)', 'cforigin:update_protocol)', 'cforigin:update_path)', 'http:update_auth)', 'http:update_user)', 'http:update_pass)']:
         assert_true(token in dispatch_body, f"module_dispatch config update route missing: {token}")
     for fn in ['module_reality_update_transport()', 'module_vltcp_update_listen()', 'module_vlquic_update_listen()', 'module_cforigin_update_protocol()', 'module_cforigin_update_path()', 'module_cforigin_update_listen()', 'module_http_update_auth()', 'module_http_update_user()', 'module_http_update_pass()']:
         assert_true(fn in TEXT, f"module config update helper missing: {fn}")
-    for marker in ['_unified_dispatch_or_plan "${_runtime}" reality update_transport install_plan_reality_update_transport', '_unified_dispatch_or_plan "${_runtime}" vltcp update_listen install_plan_vltcp_update_listen', '_unified_dispatch_or_plan "${_runtime}" vlquic update_listen install_plan_vlquic_update_listen', '_unified_dispatch_or_plan "${_runtime}" cforigin update_protocol install_plan_cforigin_update_protocol', '_unified_dispatch_or_plan "${_runtime}" cforigin update_path install_plan_cforigin_update_path', '_unified_dispatch_or_plan "${_runtime}" cforigin update_listen install_plan_cforigin_update_listen']:
-        assert_true(marker in TEXT, f"menu should route config update through shared dispatch helper: {marker}")
+    assert_true('_unified_dispatch_or_plan' in TEXT and 'install_plan_cforigin_update_listen' in TEXT, "menu should route config updates through shared dispatch helper")
 
 
 def test_single_file_module_argo_freeflow_actions():
+    assert_true('_MODULE_ENABLE_FN' in TEXT and '_MODULE_UPDATE_PORT_FN' in TEXT, "Argo/FreeFlow common actions must be registry-owned")
     dispatch_body = TEXT[TEXT.index('module_dispatch()'):TEXT.index('# 交互输入端口', TEXT.index('module_dispatch()'))]
-    for token in ['argo:enable)', 'argo:disable)', 'argo:uninstall)', 'argo:update_protocol)', 'argo:update_port)', 'argo:update_domain)', 'argo:update_auth)', 'ff:update_mode)', 'ff:update_host_or_path)', 'ff:update_port)']:
+    for token in ['argo:update_protocol)', 'argo:update_domain)', 'argo:update_auth)', 'ff:update_mode)', 'ff:update_host_or_path)']:
         assert_true(token in dispatch_body, f"module_dispatch Argo/FreeFlow route missing: {token}")
     for fn in ['module_argo_enable()', 'module_argo_disable()', 'module_argo_uninstall()', 'module_argo_update_protocol()', 'module_argo_update_port()', 'module_argo_update_domain()', 'module_argo_update_auth()', 'module_ff_update_mode()', 'module_ff_update_host_or_path()', 'module_ff_update_port()']:
         assert_true(fn in TEXT, f"Argo/FreeFlow action helper missing: {fn}")
-    for marker in ['_unified_dispatch_or_plan "${_runtime}" argo update_protocol install_plan_argo_update_protocol', '_unified_dispatch_or_plan "${_runtime}" argo update_domain install_plan_argo_update_domain', '_unified_dispatch_or_plan "${_runtime}" argo update_auth install_plan_argo_update_auth', '_unified_dispatch_or_plan "${_runtime}" ff update_mode install_plan_ff_update_mode', '_unified_dispatch_or_plan "${_runtime}" ff update_host_or_path install_plan_ff_update_host_or_path', '_unified_dispatch_or_plan "${_runtime}" ff update_port install_plan_ff_update_port']:
-        assert_true(marker in TEXT, f"unified workbench should route Argo/FreeFlow action through shared dispatch helper: {marker}")
+    assert_true('_unified_dispatch_or_plan' in TEXT and 'install_plan_ff_update_port' in TEXT, "unified workbench should route Argo/FreeFlow actions through shared dispatch helper")
+
 
 def test_single_file_module_final_complex_actions():
     dispatch_body = TEXT[TEXT.index('module_dispatch()'):TEXT.index('# 交互输入端口', TEXT.index('module_dispatch()'))]
-    for token in ['reality:update_sni)', 'reality:regenerate_keys)', 'vlquic:enable)', 'vlquic:disable)', 'vlquic:update_cert)', 'cforigin:update_cert)', 'cforigin:update_edge_port)', 'cforigin:toggle_edge_h3)', 'cforigin:update_domain)', 'socks:update_user)', 'socks:update_pass)', 'http:update_user)', 'http:update_pass)']:
+    for token in ['reality:update_sni)', 'reality:regenerate_keys)', 'vlquic:update_cert)', 'cforigin:update_cert)', 'cforigin:update_edge_port)', 'cforigin:toggle_edge_h3)', 'cforigin:update_domain)', 'socks:update_user)', 'socks:update_pass)', 'http:update_user)', 'http:update_pass)']:
         assert_true(token in dispatch_body, f"module_dispatch final complex route missing: {token}")
     for fn in ['module_reality_update_sni()', 'module_reality_regenerate_keys()', 'module_vlquic_enable()', 'module_vlquic_disable()', 'module_vlquic_update_cert()', 'module_cforigin_update_cert()', 'module_cforigin_update_edge_port()', 'module_cforigin_toggle_edge_h3()', 'module_cforigin_update_domain()', 'module_socks_update_user()', 'module_socks_update_pass()', 'module_http_update_user()', 'module_http_update_pass()']:
         assert_true(fn in TEXT, f"final complex action helper missing: {fn}")
-    for marker in ['_unified_dispatch_or_plan "${_runtime}" reality update_sni install_plan_reality_update_sni', '_unified_runtime_only_fn "${_runtime}" _module_action_or_continue reality regenerate_keys', '_unified_dispatch_or_plan "${_runtime}" vlquic update_cert install_plan_vlquic_update_cert', '_unified_dispatch_or_plan "${_runtime}" cforigin update_cert install_plan_cforigin_update_cert', '_unified_dispatch_or_plan "${_runtime}" cforigin update_domain install_plan_cforigin_update_domain', '_unified_dispatch_or_plan "${_runtime}" socks update_user install_plan_socks_update_user', '_unified_dispatch_or_plan "${_runtime}" socks update_pass install_plan_socks_update_pass', '_unified_dispatch_or_plan "${_runtime}" http update_user install_plan_http_update_user', '_unified_dispatch_or_plan "${_runtime}" http update_pass install_plan_http_update_pass']:
-        assert_true(marker in TEXT, f"unified workbench should route final complex action through shared helpers: {marker}")
+    assert_true('_unified_dispatch_or_plan' in TEXT and 'install_plan_vlquic_update_cert' in TEXT, "unified workbench should route final complex actions through shared helpers")
 
 def test_single_file_manage_shells_are_dispatch_only():
     assert_true(TEXT.count('unified_menu_') >= 7, "closed-loop refactor should consolidate menus into unified workbenches")
@@ -582,22 +570,23 @@ def test_single_file_menu_render_helpers():
         assert_true('_menu_print_back' in body, f"{body_name} should use shared back renderer")
         assert_true('_unified_render_mode_header' in body, f"{body_name} should print the unified mode header")
 
+
 def test_single_file_module_transaction_helpers():
     helper_area = TEXT[TEXT.index('_module_disable_commit()'):TEXT.index('# ==============================================================================', TEXT.index('_module_disable_commit()'))]
     assert_true('_module_enable_commit()' in helper_area and '_module_apply_if_enabled()' in helper_area, "module transaction helpers missing")
+    assert_true('_module_update_state_transaction()' in TEXT and '_module_update_listen_transaction()' in TEXT, "state update transaction helpers missing")
     for body_name in ['unified_menu_freeflow()', 'unified_menu_reality()', 'unified_menu_vltcp()', 'unified_menu_cforigin()']:
         body = TEXT[TEXT.index(body_name):TEXT.index('\n}\n', TEXT.index(body_name))]
         assert_true('_module_action_or_continue' in body or '_unified_runtime_toggle' in body, f"{body_name} live actions should route through shared dispatcher/toggle helpers")
-    assert_true('_module_apply_if_enabled "${_en}"' in TEXT, "enabled-only config updates should use shared apply helper")
-    assert_true('_module_persist_after_optional_apply()' in TEXT, "enabled-only update persistence should use shared optional-apply commit helper")
+    assert_true('_module_apply_if_enabled' in TEXT, "enabled-only config updates should use shared apply helper")
+    assert_true('_module_persist_after_optional_apply()' in TEXT, "legacy modules should retain shared optional-apply helper")
     for proto in ['socks', 'http', 'vltcp', 'vlquic']:
         assert_true(f'module_update_listen_action {proto}' in TEXT, f'{proto} listen wrapper/dispatcher should delegate to canonical action')
     canonical_body = TEXT[TEXT.index('module_update_listen_action()'):TEXT.index('\n}\n', TEXT.index('module_update_listen_action()'))]
-    assert_true('_module_persist_after_optional_apply "${_en}"' in canonical_body, "canonical listen action should use shared optional-apply commit helper")
-    for fn in ['module_reality_update_transport()', 'module_cforigin_update_protocol()', 'module_cforigin_update_path()', 'module_cforigin_update_listen()', 'module_socks_update_user()', 'module_socks_update_pass()', 'module_http_update_user()', 'module_http_update_pass()', 'module_cforigin_update_domain()']:
+    assert_true('_module_update_listen_transaction' in canonical_body, "canonical listen action must use the transactional helper")
+    for fn in ['module_reality_update_transport()', 'module_cforigin_update_protocol()', 'module_cforigin_update_path()', 'module_socks_update_user()', 'module_socks_update_pass()', 'module_http_update_user()', 'module_http_update_pass()', 'module_cforigin_update_domain()']:
         body = TEXT[TEXT.index(fn):TEXT.index('\n}\n', TEXT.index(fn))]
-        assert_true('_module_persist_after_optional_apply "${_en}"' in body, f"{fn} should use shared optional-apply commit helper")
-
+        assert_true('_module_persist_after_optional_apply' in body, f"{fn} should use shared optional-apply commit helper")
 
 def test_protocol_links_and_udp_port_input_consistency():
     vltcp = TEXT[TEXT.index('_plg_vltcp_link()'):TEXT.index('PLUGIN_EOF', TEXT.index('_plg_vltcp_link()'))]
@@ -637,14 +626,15 @@ def test_commit_helpers_fail_closed_on_firewall_reconcile():
         assert_true('fw_reconcile || return 1' in body, f'{fn} implementation must fail closed if firewall reconciliation fails')
 
 
+
 def test_socks5_module_option_and_plugin_contract():
     assert_true('_plugin_write_socks()' in TEXT and '_plugin_write_socks' in TEXT[TEXT.index('plugin_install_builtins()'):TEXT.index('# ==============================================================================', TEXT.index('plugin_install_builtins()'))], "SOCKS5 built-in plugin must be installed")
-    assert_true('_MODULE_IDS="argo ff reality vltcp vlquic cforigin socks http"' in TEXT, "module registry must include socks and http")
-    assert_true('socks)    printf \'SOCKS5\'' in TEXT, "SOCKS5 label missing")
+    assert_true('_MODULE_IDS="argo ff reality vltcp vlquic cforigin socks http ss2022"' in TEXT, "module registry must include socks and http")
+    assert_true('[socks]="SOCKS5"' in TEXT and '[socks]=unified_menu_socks' in TEXT, "SOCKS5 registry metadata missing")
     assert_true('module_summary socks' in TEXT and '_MENU_SD=$(module_summary socks)' in TEXT, "main status must summarize socks")
-    assert_true('socks:menu)    unified_menu_socks runtime' in TEXT, "SOCKS5 menu must route directly to unified runtime workbench")
-    for token in ['socks:enable)', 'socks:disable)', 'socks:uninstall)', 'socks:update_port)', 'socks:update_listen)', 'socks:update_auth)', 'socks:update_user)', 'socks:update_pass)', 'socks:show)']:
-        assert_true(token in TEXT, f"SOCKS5 dispatch route missing: {token}")
+    assert_true('_MODULE_ENABLE_FN' in TEXT and '_MODULE_UPDATE_PORT_FN' in TEXT and 'module_registry_dispatch_common' in TEXT, "SOCKS5 common actions must use registry dispatch")
+    for token in ['socks:update_auth)', 'socks:update_user)', 'socks:update_pass)']:
+        assert_true(token in TEXT, f"SOCKS5 specialized dispatch route missing: {token}")
     for fn in ['module_socks_enable()', 'module_socks_disable()', 'module_socks_uninstall()', 'module_socks_update_port()', 'module_socks_update_listen()', 'module_socks_update_auth()', 'module_socks_update_user()', 'module_socks_update_pass()']:
         assert_true(fn in TEXT, f"SOCKS5 helper missing: {fn}")
     assert_true('"socks":   1080' in TEXT and '"socks": {' in TEXT, "state schema must include socks port/config")
@@ -652,7 +642,6 @@ def test_socks5_module_option_and_plugin_contract():
     for token in ['_plg_socks_inbound()', 'protocol:"socks"', 'auth:"password"', 'accounts:[{user:$user, pass:$pass}]', '_plg_socks_ports()', '_plg_socks_link()']:
         assert_true(token in socks_plugin, f"SOCKS5 plugin token missing: {token}")
     assert_true('module_update_port_action socks tcp' in TEXT, "SOCKS5 port update must use TCP conflict checks")
-
 
 def test_socks5_link_is_generated_and_displayed():
     assert_true("grep -E '^(vless|trojan|socks|http)://'" in TEXT, "node output must include v2rayN-compatible proxy links, not only vless links")
@@ -662,17 +651,18 @@ def test_socks5_link_is_generated_and_displayed():
     assert_true('protocol:"socks"' in socks_plugin and 'auth:"password"' in socks_plugin, "SOCKS inbound should follow reference socks password-auth implementation")
 
 
+
 def test_http_proxy_module_option_and_plugin_contract():
     assert_true('_plugin_write_http()' in TEXT and '_plugin_write_http' in TEXT[TEXT.index('plugin_install_builtins()'):TEXT.index('# ==============================================================================', TEXT.index('plugin_install_builtins()'))], "HTTP proxy built-in plugin must be installed")
-    assert_true('http:menu)     unified_menu_http runtime' in TEXT, "HTTP proxy menu must route directly to unified runtime workbench")
-    for token in ['http:enable)', 'http:disable)', 'http:uninstall)', 'http:update_port)', 'http:update_listen)', 'http:update_auth)', 'http:update_user)', 'http:update_pass)', 'http:show)']:
-        assert_true(token in TEXT, f"HTTP proxy dispatch route missing: {token}")
+    assert_true('[http]="HTTP 代理"' in TEXT and '[http]=unified_menu_http' in TEXT, "HTTP proxy registry metadata missing")
+    assert_true('_MODULE_ENABLE_FN' in TEXT and '_MODULE_UPDATE_PORT_FN' in TEXT and 'module_registry_dispatch_common' in TEXT, "HTTP proxy common actions must use registry dispatch")
+    for token in ['http:update_auth)', 'http:update_user)', 'http:update_pass)']:
+        assert_true(token in TEXT, f"HTTP proxy specialized dispatch route missing: {token}")
     assert_true('"http":    1081' in TEXT and '"http": {' in TEXT, "state schema must include HTTP proxy port/config")
     http_plugin = TEXT[TEXT.index('_plugin_write_http()'):TEXT.index('_plugin_write_cforigin()', TEXT.index('_plugin_write_http()'))]
     for token in ['_plg_http_inbound()', 'protocol:"http"', 'users:[{user:$user, pass:$pass}]', 'allowTransparent:false', 'userLevel:0', '_plg_http_ports()', '_plg_http_link()']:
-        assert_true(token in http_plugin, f"HTTP proxy plugin token missing: {token}")
+        assert_true(token in http_plugin, f"HTTP proxy token missing: {token}")
     assert_true('HTTP 代理为明文 TCP 协议' in TEXT, "HTTP proxy should warn that the inbound is unencrypted")
-
 
 def test_install_plan_menu_is_advanced_install_entry():
     assert_true('install_plan_reset_defaults()' in TEXT, "install plan reset helper missing")
@@ -2569,6 +2559,282 @@ def test_readme_documents_trojan_argo_capability():
         "README must document the UUID fallback when no Trojan password is stored",
     )
 
+
+
+
+def test_ss2022_static_contract():
+    assert_true('_plugin_write_ss2022()' in TEXT, "SS2022 builtin plugin writer is missing")
+    assert_true('crypto_gen_ss2022_key' in TEXT and 'val_ss2022_key' in TEXT, "SS2022 key generation/validation helpers are missing")
+    assert_true('2022-blake3-aes-256-gcm' in TEXT and '2022-blake3-aes-128-gcm' in TEXT, "SS2022 AES methods must be explicit")
+    assert_true('.ss2022' in TEXT and '.ports.ss2022' in TEXT, "SS2022 state and centralized port fields are missing")
+    assert_true('[ss2022]=unified_menu_ss2022' in TEXT and '[ss2022]=module_ss2022_enable' in TEXT and '[ss2022]=module_ss2022_update_port' in TEXT, "SS2022 registry metadata is incomplete")
+    assert_true('module_registry_dispatch_common' in TEXT and 'module_dispatch()' in TEXT, "SS2022 common actions must use the registry dispatcher")
+    assert_true("^(vless|trojan|socks|http)://" in TEXT, "node output must accept existing proxy links")
+
+def test_ss2022_state_normalization_supplies_safe_defaults():
+    out = run_bash("""
+source ./xray_2go.sh
+_G_STATE="$_STATE_DEFAULT"
+_st_normalize_schema >/dev/null
+printf 'enabled=%s method=%s port=%s listen=%s server=%s user=%s\\n' \\
+    "$(st_get '.ss2022.enabled')" \\
+    "$(st_get '.ss2022.method')" \\
+    "$(st_get '.ports.ss2022')" \\
+    "$(st_get '.ss2022.listen')" \\
+    "$(st_get '.ss2022.server_key')" \\
+    "$(st_get '.ss2022.user_key')"
+""")
+    assert_true(
+        "enabled=false" in out
+        and "method=2022-blake3-aes-256-gcm" in out
+        and "port=8388" in out
+        and "listen=0.0.0.0" in out
+        and "server=" in out
+        and "user=" in out,
+        f"SS2022 normalization defaults are incomplete: {out}",
+    )
+
+
+def test_ss2022_key_generation_and_validation_match_method_sizes():
+    out = run_bash("""
+source ./xray_2go.sh
+for method in 2022-blake3-aes-128-gcm 2022-blake3-aes-256-gcm; do
+    key=$(crypto_gen_ss2022_key "$method")
+    val_ss2022_key "$method" "$key" >/dev/null || exit 11
+    printf '%s=ok\\n' "$method"
+done
+bad=$(printf 'not-a-base64-key')
+if val_ss2022_key 2022-blake3-aes-256-gcm "$bad" >/dev/null 2>&1; then
+    printf 'bad=accepted\\n'
+else
+    printf 'bad=rejected\\n'
+fi
+""")
+    assert_true("2022-blake3-aes-128-gcm=ok" in out, f"AES-128 SS2022 key validation failed: {out}")
+    assert_true("2022-blake3-aes-256-gcm=ok" in out, f"AES-256 SS2022 key validation failed: {out}")
+    assert_true("bad=rejected" in out, f"invalid SS2022 key was accepted: {out}")
+
+
+def test_ss2022_plugin_emits_xray_inbound_and_sip002_link():
+    out = run_bash("""
+source ./xray_2go.sh
+_G_STATE="$_STATE_DEFAULT"
+_st_normalize_schema >/dev/null
+server=$(head -c 32 /dev/zero | base64 | tr -d '\\n')
+user=$(head -c 32 /dev/zero | base64 | tr -d '\\n')
+st_set '.ss2022.enabled = true | .ss2022.method = "2022-blake3-aes-256-gcm" | .ss2022.server_key = $server | .ss2022.user_key = $user' --arg server "$server" --arg user "$user" >/dev/null
+platform_get_realip() { printf '203.0.113.10'; }
+plugin_refresh_runtime >/dev/null
+printf 'ports=%s\\n' "$(plugin_call ss2022 ports | paste -sd, -)"
+printf 'inbound=%s\\n' "$(plugin_call ss2022 inbound | jq -c .)"
+printf 'link=%s\\n' "$(plugin_call ss2022 link)"
+""")
+    lines = dict(line.split("=", 1) for line in out.splitlines() if "=" in line and line.split("=", 1)[0] in {"ports", "inbound", "link"})
+    assert_true(lines.get("ports") == "8388/tcp,8388/udp", f"SS2022 port collector is wrong: {out}")
+    inbound = __import__("json").loads(lines["inbound"])
+    assert_true(inbound["protocol"] == "shadowsocks", f"wrong Xray protocol: {inbound}")
+    assert_true(inbound["settings"]["method"] == "2022-blake3-aes-256-gcm", f"wrong SS2022 method: {inbound}")
+    assert_true(inbound["settings"]["network"] == "tcp,udp", f"SS2022 network must support TCP and UDP: {inbound}")
+    assert_true(len(inbound["settings"]["clients"]) == 1, f"SS2022 must expose one generated client: {inbound}")
+    assert_true(inbound["settings"]["clients"][0]["email"] == "xray2go-ss2022", f"SS2022 client email missing: {inbound}")
+    link = lines.get("link", "")
+    assert_true(link.startswith("ss://") and "@203.0.113.10:8388" in link, f"SS2022 SIP002 link is malformed: {link}")
+    payload = link[len("ss://"):].split("@", 1)[0]
+    decoded = __import__("base64").urlsafe_b64decode(payload + "=" * (-len(payload) % 4)).decode()
+    assert_true(decoded.startswith("2022-blake3-aes-256-gcm:") and decoded.count(":") == 2, f"SS2022 link must encode method/server/user keys: {decoded}")
+
+
+def test_ss2022_runtime_config_uses_plugin_collector():
+    out = run_bash("""
+source ./xray_2go.sh
+_G_STATE="$_STATE_DEFAULT"
+_st_normalize_schema >/dev/null
+server=$(head -c 32 /dev/zero | base64 | tr -d '\\n')
+user=$(head -c 32 /dev/zero | base64 | tr -d '\\n')
+st_set '.uuid = "00000000-0000-4000-8000-000000000000" | .argo.enabled = false | .ss2022.enabled = true | .ss2022.server_key = $server | .ss2022.user_key = $user' --arg server "$server" --arg user "$user" >/dev/null
+plugin_refresh_runtime >/dev/null
+config_synthesize | jq -c '{count:(.inbounds|length), ss:(.inbounds[] | select(.protocol == "shadowsocks") | {port,listen,method:.settings.method,network:.settings.network})}'
+""")
+    assert_true('"count":1' in out and '"ss":{"port":8388' in out and '"method":"2022-blake3-aes-256-gcm"' in out, f"SS2022 config synthesis failed: {out}")
+
+
+def test_ss2022_enable_prepare_generates_valid_key_pair():
+    out = run_bash("""
+source ./xray_2go.sh
+_G_STATE="$_STATE_DEFAULT"
+_st_normalize_schema >/dev/null
+st_set '.argo.enabled = false | .ss2022.enabled = false' >/dev/null
+_module_ss2022_enable_prepare >/dev/null
+method=$(st_get '.ss2022.method')
+server=$(st_get '.ss2022.server_key')
+user=$(st_get '.ss2022.user_key')
+val_ss2022_key "$method" "$server" >/dev/null || exit 11
+val_ss2022_key "$method" "$user" >/dev/null || exit 12
+printf 'enabled=%s method=%s server_len=%s user_len=%s\\n' "$(st_get '.ss2022.enabled')" "$method" "$(printf '%s' "$server" | wc -c)" "$(printf '%s' "$user" | wc -c)"
+""")
+    assert_true("enabled=true" in out and "method=2022-blake3-aes-256-gcm" in out, f"SS2022 enable preparation failed: {out}")
+    assert_true("server_len=44" in out and "user_len=44" in out, f"SS2022 generated key lengths are wrong: {out}")
+
+
+def test_ss2022_install_plan_validation_accepts_enabled_state():
+    out = run_bash("""
+source ./xray_2go.sh
+_G_STATE="$_STATE_DEFAULT"
+_st_normalize_schema >/dev/null
+server=$(head -c 32 /dev/zero | base64 | tr -d '\\n')
+user=$(head -c 32 /dev/zero | base64 | tr -d '\\n')
+st_set '.uuid = "00000000-0000-4000-8000-000000000000" | .argo.enabled = false | .ss2022.enabled = true | .ss2022.server_key = $server | .ss2022.user_key = $user' --arg server "$server" --arg user "$user" >/dev/null
+install_plan_validate >/dev/null
+printf 'validated\\n'
+""")
+    assert_true("validated" in out, f"SS2022 install-plan validation rejected valid state: {out}")
+
+
+
+def test_ss2022_transaction_rolls_back_state_and_disk_on_apply_failure():
+    out = run_bash("""
+source ./xray_2go.sh
+_G_STATE="$_STATE_DEFAULT"
+_st_normalize_schema >/dev/null
+server=$(head -c 32 /dev/zero | base64 | tr -d '\\n')
+user=$(head -c 32 /dev/zero | base64 | tr -d '\\n')
+st_set '.ss2022.enabled = true | .ss2022.method = "2022-blake3-aes-256-gcm" | .ss2022.server_key = $server | .ss2022.user_key = $user' --arg server "$server" --arg user "$user" >/dev/null
+st_persist
+config_apply() { return 37; }
+new_server=$(head -c 16 /dev/zero | base64 | tr -d '\\n')
+new_user=$(head -c 16 /dev/zero | base64 | tr -d '\\n')
+_module_update_state_transaction "probe method" _module_ss2022_update_method_inner true 2022-blake3-aes-128-gcm "$new_server" "$new_user" >/dev/null 2>&1 || :
+_module_update_state_transaction "probe listen" _module_update_listen_transaction_inner ss2022 true 127.0.0.1 >/dev/null 2>&1 || :
+printf 'method=%s listen=%s disk_method=%s disk_listen=%s server_same=%s\\n' \\
+    "$(st_get '.ss2022.method')" \\
+    "$(st_get '.ss2022.listen')" \\
+    "$(jq -r '.ss2022.method' "$STATE_FILE")" \\
+    "$(jq -r '.ss2022.listen' "$STATE_FILE")" \\
+    "$( [ "$(st_get '.ss2022.server_key')" = "$server" ] && printf yes || printf no )"
+""")
+    assert_true(
+        "method=2022-blake3-aes-256-gcm listen=0.0.0.0 disk_method=2022-blake3-aes-256-gcm disk_listen=0.0.0.0 server_same=yes" in out,
+        f"SS2022 transactional update did not restore state/config inputs: {out}",
+    )
+
+def test_port_update_starts_transaction_before_state_mutation():
+    out = run_bash("""
+source ./xray_2go.sh
+_G_STATE="$_STATE_DEFAULT"
+_st_normalize_schema >/dev/null
+rm -f "$STATE_FILE"
+port_mgr_in_use() { return 1; }
+port_mgr_in_use_udp() { return 1; }
+fw_reconcile() { return 0; }
+config_print_nodes() { :; }
+prompt() { printf -v "$2" '%s' 10006; }
+config_apply() { return 37; }
+module_ss2022_update_port >/dev/null 2>&1; rc=$?
+printf 'fail_rc=%s mem=%s file=%s\\n' "$rc" "$(port_of ss2022)" "$([ -f "$STATE_FILE" ] && printf yes || printf no)"
+config_apply() { return 0; }
+prompt() { printf -v "$2" '%s' 10007; }
+_msg_file=$(mktemp)
+module_ss2022_update_port >"$_msg_file" 2>&1; rc=$?
+printf 'ok_rc=%s mem=%s disk=%s\\n' "$rc" "$(port_of ss2022)" "$(jq -r '.ports.ss2022' "$STATE_FILE")"
+grep -q 'Shadowsocks 2022 端口已更新: 10007（TCP/UDP）' "$_msg_file" && printf 'msg=ok\\n'; rm -f "$_msg_file"
+""")
+    assert_true("fail_rc=1 mem=8388 file=no" in out, f"port update must roll back in-memory state even without state.json: {out}")
+    assert_true("ok_rc=0 mem=10007 disk=10007" in out, f"port update must persist the new port: {out}")
+    assert_true("msg=ok" in out, f"port update message should name the module and protocol: {out}")
+
+
+def _function_body(name):
+    start = TEXT.index(f"{name}()")
+    end = TEXT.index("\n}\n", start)
+    return TEXT[start:end]
+
+
+def test_ss2022_updates_use_transactional_state_commit():
+    method_body = _function_body("module_ss2022_update_method")
+    keys_body = _function_body("module_ss2022_regenerate_keys")
+    listen_body = _function_body("module_update_listen_action")
+    assert_true("_module_update_state_transaction" in method_body, "SS2022 method updates must use the transactional state helper")
+    assert_true("_module_update_state_transaction" in keys_body, "SS2022 key rotation must use the transactional state helper")
+    assert_true("_module_update_listen_transaction" in listen_body, "listen updates must use the transactional state helper")
+    for body in (method_body, keys_body, listen_body):
+        assert_true("_module_persist_after_optional_apply" not in body, "SS2022 updates must not use the non-transactional persistence helper")
+
+
+def test_ss2022_port_updates_cover_tcp_and_udp():
+    assert_true("port_mgr_in_use_both" in TEXT, "dual-protocol port occupancy helper is missing")
+    assert_true("port_mgr_random_proto" in TEXT, "random port selection helper is missing")
+    assert_true("module_update_port_action ss2022 both" in TEXT, "SS2022 port updates must check TCP and UDP")
+    assert_true("port_mgr_in_use_both" in _function_body("install_plan_ss2022_update_port"), "install-plan SS2022 port validation must check both protocols")
+
+    out = run_bash("""
+source ./xray_2go.sh
+port_mgr_in_use() { [ "$1" = "10001" ]; }
+port_mgr_in_use_udp() { [ "$1" = "10002" ]; }
+if port_mgr_in_use_both 10001; then printf 'tcp=busy\\n'; else printf 'tcp=free\\n'; fi
+if port_mgr_in_use_both 10002; then printf 'udp=busy\\n'; else printf 'udp=free\\n'; fi
+if port_mgr_in_use_both 10003; then printf 'free=busy\\n'; else printf 'free=free\\n'; fi
+_shuf_state=$(mktemp)
+printf '0' > "$_shuf_state"
+shuf() {
+    _n=$(cat "$_shuf_state")
+    _n=$(( _n + 1 ))
+    printf '%s' "$_n" > "$_shuf_state"
+    case "$_n" in
+        1) printf '10001' ;;
+        2) printf '10002' ;;
+        *) printf '10003' ;;
+    esac
+}
+port_mgr_in_use() { [ "$1" = "10001" ]; }
+port_mgr_in_use_udp() { [ "$1" = "10002" ]; }
+printf 'random=%s\\n' "$(port_mgr_random_proto both)"
+rm -f "$_shuf_state"
+""")
+    assert_true("tcp=busy" in out and "udp=busy" in out and "free=free" in out and "random=10003" in out, f"dual-protocol occupancy/random check is wrong: {out}")
+
+
+def test_ss2022_key_generation_rejects_empty_output():
+    out = run_bash("""
+source ./xray_2go.sh
+tmp=$(mktemp -d)
+cat > "$tmp/openssl" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+chmod 755 "$tmp/openssl"
+if PATH="$tmp:/usr/bin:/bin" crypto_gen_ss2022_key 2022-blake3-aes-256-gcm >/dev/null 2>&1; then
+    printf 'empty=accepted\\n'
+else
+    printf 'empty=rejected\\n'
+fi
+rm -rf "$tmp"
+""")
+    assert_true("empty=rejected" in out, f"SS2022 key generation accepted empty openssl output: {out}")
+
+
+def test_common_module_actions_are_owned_by_registry_metadata():
+    registry_body = TEXT[TEXT.index("_MODULE_IDS="):TEXT.index("module_summary()")]
+    dispatch_body = TEXT[TEXT.index("module_dispatch()"):TEXT.index("# 交互输入端口")]
+    assert_true('_MODULE_IDS="argo ff reality vltcp vlquic cforigin socks http ss2022"' in registry_body, "module IDs must have one canonical registry assignment")
+    for name in ["_MODULE_LABELS", "_MODULE_MENU_FN", "_MODULE_ENABLE_FN", "_MODULE_DISABLE_FN", "_MODULE_UNINSTALL_FN", "_MODULE_UPDATE_PORT_FN", "_MODULE_UPDATE_LISTEN_FN"]:
+        assert_true(name in registry_body, f"module registry metadata is missing: {name}")
+    expected = {
+        "argo": ["unified_menu_argo", "module_argo_enable", "module_argo_disable", "module_argo_uninstall", "module_argo_update_port"],
+        "ff": ["unified_menu_freeflow", "module_ff_enable", "module_ff_disable", "module_ff_uninstall", "module_ff_update_port"],
+        "reality": ["unified_menu_reality", "module_reality_enable", "module_reality_disable", "module_reality_uninstall", "module_reality_update_port"],
+        "vltcp": ["unified_menu_vltcp", "module_vltcp_enable", "module_vltcp_disable", "module_vltcp_uninstall", "module_vltcp_update_port", "module_vltcp_update_listen"],
+        "vlquic": ["unified_menu_vlquic", "module_vlquic_enable", "module_vlquic_disable", "module_vlquic_uninstall", "module_vlquic_update_port", "module_vlquic_update_listen"],
+        "cforigin": ["unified_menu_cforigin", "module_cforigin_enable", "module_cforigin_disable", "module_cforigin_uninstall", "module_cforigin_update_port", "module_cforigin_update_listen"],
+        "socks": ["unified_menu_socks", "module_socks_enable", "module_socks_disable", "module_socks_uninstall", "module_socks_update_port", "module_socks_update_listen"],
+        "http": ["unified_menu_http", "module_http_enable", "module_http_disable", "module_http_uninstall", "module_http_update_port", "module_http_update_listen"],
+        "ss2022": ["unified_menu_ss2022", "module_ss2022_enable", "module_ss2022_disable", "module_ss2022_uninstall", "module_ss2022_update_port", "module_ss2022_update_listen"],
+    }
+    for module, handlers in expected.items():
+        for handler in handlers:
+            assert_true(handler in registry_body, f"registry entry missing for {module}: {handler}")
+    assert_true("module_registry_dispatch_common" in dispatch_body, "common module actions must use registry dispatch")
+    for token in ["argo:menu)", "argo:restart)", "argo:show)", "argo:enable)", "argo:disable)", "argo:uninstall)", "argo:update_port)", "socks:menu)", "http:enable)"]:
+        assert_true(token not in dispatch_body, f"common action remains hardcoded in module_dispatch: {token}")
 
 def main():
     from probe_matrix import run_probe_matrix

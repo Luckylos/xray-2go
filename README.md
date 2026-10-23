@@ -16,6 +16,7 @@ Xray-2go 是一个面向 Linux VPS 的交互式 Xray 安装与管理脚本，支
   - VLESS-TCP：明文落地，可配置监听地址
   - SOCKS5：账号密码认证，可配置监听端口与地址
   - HTTP 代理：账号密码认证，可配置监听端口与地址；协议本身为明文 TCP，公开监听前请确认防火墙与网络边界
+  - Shadowsocks 2022：复用 Xray-core 内置实现，支持 AES-128/AES-256 GCM、TCP/UDP 与单用户分享链接
 - 自动生成并打印分享链接
 - 支持修改 UUID、端口、路径、域名、Reality 目标站点等常用参数
 - xPadding 支持按协议独立开关，可实现 Argo 开启、Reality 关闭等组合
@@ -32,6 +33,15 @@ Argo 工作台的“修改入站认证”可在 VLESS 与 Trojan 之间切换：
 - 密码限制为 8-128 位 URL-safe 字符（`A-Z a-z 0-9 . _ ~ -`），避免 `#`、`?`、`@` 等字符破坏 `trojan://` 分享链接结构
 - 若状态中的 Trojan 密码为空，则回退使用 UUID 作为密码；载入状态时检测到非法存量密码会清空并回退为使用 UUID
 - 关闭或卸载 Argo 会把入站认证重置为 VLESS、传输重置为 WS，并清空 Trojan 密码
+
+### Shadowsocks 2022
+
+Shadowsocks 2022 通过 Xray-core 的 shadowsocks inbound 提供服务，不额外安装独立 Shadowsocks 二进制：
+
+- 默认监听 8388，同时开放 TCP 与 UDP；可在安装计划或运行时工作台修改端口和监听地址
+- 默认方法为 2022-blake3-aes-256-gcm，另支持 2022-blake3-aes-128-gcm；首版不启用 ChaCha20 多用户模式，以匹配当前 Xray-core 的多用户能力
+- 启用时自动生成服务端 PSK 与用户 PSK；切换方法或手动轮换密钥会同时重新生成两者
+- 节点链接使用 SS2022 的双密钥 ss:// 分享格式，链接中的敏感密钥请按密码处理，不要公开发布
 
 ## 安全与实现原则
 
