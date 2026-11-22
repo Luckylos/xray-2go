@@ -53,7 +53,7 @@ Shadowsocks 2022 通过 Xray-core 的 shadowsocks inbound 提供服务，不额�
 - 服务状态变更通过统一互斥接口执行，避免并发操作造成状态竞争
 - 配置生成前校验端口、UUID、域名、路径、监听地址等输入，降低配置注入风险
 - 不内置执行第三方 root 网络调优脚本
-- 内置自更新已禁用，请通过 GitHub 仓库或其它可校验渠道更新脚本
+- 主菜单 `s` 从官方仓库的 `main` 分支通过 HTTPS 下载管理脚本，并检查 Bash 语法。`main` 的内容会以 root 权限运行，请在信任该仓库的情况下使用。
 
 ## 支持系统
 
@@ -67,9 +67,11 @@ Shadowsocks 2022 通过 Xray-core 的 shadowsocks inbound 提供服务，不额�
 
 ### 首次部署：快速向导
 
-无参数运行时，首次部署会先进入快速向导，可选择推荐的 Reality、Argo Tunnel，或进入高级自定义部署。需要多入口或逐项调整时选择高级自定义部署即可。
+无参数运行时，在主菜单选择 `1` 打开部署向导。向导中回车默认选用 VLESS + Reality TCP，优先使用 `443/tcp`，占用时会选择一个可用的随机 TCP 端口。也可选择 Argo Tunnel，或在高级自定义部署中配置多个入站。安装前会预览监听端口和占用情况，输入 `y` 确认后开始。
 
-请在 root 用户下执行；如果当前不是 root，请先切换到 root，或使用下面的“下载后运行”方式配合 `sudo`。
+服务启动并保存配置后，复制相应的分享链接，在支持该模块协议及传输方式的客户端中从剪贴板导入。启用节点后，用自己的设备访问一个网页来确认连接。可在向导中确认结果，或稍后通过主菜单 `9` 再查看节点与连接提示。
+
+安装需要 root 权限。可切换到 root，或使用下面的“下载后运行”方式配合 `sudo`。用 `bash xray_2go.sh --help` 或已安装的 `xray2go --help` 查看命令帮助，无需 root 权限。
 
 ```bash
 bash <(curl -Ls https://raw.githubusercontent.com/Luckylos/xray-2go/refs/heads/main/xray_2go.sh)
@@ -101,6 +103,12 @@ chmod +x xray_2go.sh
 sudo ./xray_2go.sh
 ```
 
+### 创建快捷命令并更新管理脚本
+
+在主菜单选择 `s`（更新快捷方式/脚本）。脚本会下载官方 `main` 的最新内容，安装为 `/usr/local/bin/xray2go`，并创建 `/usr/local/bin/s`。成功后同一终端会进入新版菜单，重新读取现有状态并加载插件。以后可用 `sudo s` 打开管理菜单。
+
+旧版本的 `s` 若提示自更新已禁用，先按上面的下载方式运行当前 `main`，再在菜单里选择 `s`。如果快捷命令路径已被其他文件占用，菜单会提示冲突。更新已有脚本时，上一版保存在 `/usr/local/bin/xray2go.bak`。
+
 ## 安装后的主要路径
 
 - 工作目录：`/etc/xray2go`
@@ -111,6 +119,10 @@ sudo ./xray_2go.sh
 - 插件目录：`/etc/xray2go/plugins`
 - 快捷命令：`/usr/local/bin/s`
 - 主脚本安装位置：`/usr/local/bin/xray2go`
+
+当 `state.json` 无法读取为 JSON 对象时，交互启动会列出可读取的备份。选择一个编号恢复，损坏文件会保留为 `state.json.corrupt.*`。回车退出可保留现场。
+
+插件的 `ports` 接口每行返回一个 `端口` 或 `端口/tcp`、`端口/udp`，省略协议时按 TCP 处理。`link` 接口每行返回一个 `scheme://…` 分享链接，支持插件自定义的 scheme。诊断信息写到标准错误。模块页仅显示对应插件的链接，主菜单 `9` 汇总所有模块。
 
 ## 服务名称
 
@@ -139,7 +151,7 @@ rc-service tunnel2go status
 - 删除 systemd 或 OpenRC 服务文件
 - 删除 `/etc/xray2go` 工作目录
 - 删除配置、状态、备份、Tunnel env、Tunnel credentials、PID、锁文件、配置 hash
-- 删除快捷命令和已安装脚本
+- 删除已安装脚本和指向该脚本的 `s` 快捷链接
 - 删除脚本托管防火墙规则
 - 回滚脚本写入的 sysctl / hosts 相关文件
 

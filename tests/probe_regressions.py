@@ -55,6 +55,233 @@ def run_bash_result(script: str) -> subprocess.CompletedProcess[str]:
         )
 
 
+def test_runtime_script_update_installs_and_runs_main_branch():
+    out = run_bash(r'''
+        source ./xray_2go.sh
+        mkdir -p "$(dirname "${SELF_DEST}")" "${WORK_DIR}"
+        printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "${SELF_DEST}"
+        printf '%s\n' '{"custom_plugin":{"enabled":true}}' > "${STATE_FILE}"
+        curl() {
+            local target="" url=""
+            while [ "$#" -gt 0 ]; do
+                case "$1" in
+                    -o) target="$2"; shift ;;
+                    https://*) url="$1" ;;
+                esac
+                shift
+            done
+            [ "$url" = 'https://raw.githubusercontent.com/Luckylos/xray-2go/main/xray_2go.sh' ] || return 1
+            cat > "$target" <<'NEW_SCRIPT'
+#!/usr/bin/env bash
+set -eu
+[ "$0" = "$X2G_TEST_ROOT/usr/local/bin/xray2go" ]
+[ -x "$0" ]
+[ "$(readlink -f "$X2G_TEST_ROOT/usr/local/bin/s")" = "$0" ]
+grep -qx 'exit 0' "$0.bak"
+grep -Fxq '{"custom_plugin":{"enabled":true}}' "$X2G_TEST_ROOT/etc/xray2go/state.json"
+printf '%s\n' 'new menu loaded'
+NEW_SCRIPT
+        }
+        module_dispatch config update_shortcut || exit 1
+        echo 'old menu resumed'
+    ''')
+    assert_true('new menu loaded' in out and 'old menu resumed' not in out, out)
+
+
+def test_runtime_script_update_leaves_existing_files_on_failure():
+    out = run_bash(r'''
+        source ./xray_2go.sh
+        mkdir -p "$(dirname "${SELF_DEST}")"
+        printf '%s\n' 'old script' > "${SELF_DEST}"
+        ln -s "${SELF_DEST}" "${SHORTCUT}"
+        curl() {
+            while [ "$1" != -o ]; do shift; done
+            case "$scenario" in
+                download) printf partial > "$2"; return 1 ;;
+                syntax) printf '%s\n' '#!/usr/bin/env bash' 'if' > "$2" ;;
+                *) printf '%s\n' '#!/usr/bin/env bash' 'exit 42' > "$2" ;;
+            esac
+        }
+        for scenario in download syntax; do
+            if module_dispatch config update_shortcut; then exit 1; fi
+            grep -qx 'old script' "${SELF_DEST}" || exit 1
+            [ "$(readlink "${SHORTCUT}")" = "${SELF_DEST}" ] || exit 1
+            [ ! -e "${SELF_DEST}.bak" ] || exit 1
+        done
+        rm "${SHORTCUT}"
+        printf '%s\n' 'unrelated command' > "${SHORTCUT}"
+        scenario=conflict
+        if module_dispatch config update_shortcut; then exit 1; fi
+        grep -qx 'old script' "${SELF_DEST}" || exit 1
+        grep -qx 'unrelated command' "${SHORTCUT}" || exit 1
+
+        rm "${SHORTCUT}" "${SELF_DEST}"
+        scenario=replace
+        mv() {
+            [ "${@: -1}" != "${SELF_DEST}" ] || return 1
+            command mv "$@"
+        }
+        if module_dispatch config update_shortcut; then exit 1; fi
+        [ ! -e "${SELF_DEST}" ] && [ ! -L "${SHORTCUT}" ] || exit 1
+        [ -z "$(find "$(dirname "${SELF_DEST}")" -name '.xray2go-update.*' -print)" ] || exit 1
+        echo 'existing files retained'
+    ''')
+    assert_true('existing files retained' in out, out)
+
+
+def test_plugin_ports_and_links_preserve_module_boundaries():
+    out = run_bash(r'''
+        source ./xray_2go.sh
+        set -e
+        _G_STATE='{"uuid":"00000000-0000-4000-8000-000000000001"}'
+        _PLUGIN_REGISTRY=(audit_a audit_b)
+        _plg_audit_a_ports() { printf '%s\n' 24101/tcp; }
+        _plg_audit_b_ports() { printf '%s\n' 24102/tcp 24102/udp; }
+        _plg_audit_a_link() { printf '%s\n' example://alpha 'example://bad whitespace' 'plugin status'; }
+        _plg_audit_b_link() { printf '%s\n' example://beta; }
+        _plg_audit_a_inbound() { :; }
+        _plg_audit_b_inbound() { :; }
+        [ "$(fw_desired_rules)" = $'24101/tcp\n24102/tcp\n24102/udp' ]
+        [ "$(plugin_collect_links audit_a)" = example://alpha ]
+        [ "$(plugin_collect_links)" = $'example://alpha\nexample://beta' ]
+        _PLUGIN_REGISTRY+=(socks)
+        _plg_socks_ports() { :; }
+        _plg_socks_link() { printf '%s\n' 'socks://example.invalid:1080'; }
+        _plg_socks_inbound() { :; }
+        scoped=$(module_dispatch socks show)
+        [[ "$scoped" == *'socks://example.invalid:1080'* && "$scoped" != *example://* ]]
+        exported=$(module_show_nodes)
+        [[ "$exported" == *'example://alpha'* && "$exported" == *'socks://example.invalid:1080'* ]]
+        config_apply() { :; }
+        st_persist() { :; }
+        fw_reconcile() { :; }
+        enabled=$(_module_enable_commit_inner socks)
+        [[ "$enabled" == *'socks://example.invalid:1080'* && "$enabled" != *example://* ]]
+        _plg_socks_link() { :; }
+        _module_enable_commit_inner socks >/dev/null
+        _PLUGIN_REGISTRY=(audit_b)
+        [ "$(fw_desired_rules)" = $'24102/tcp\n24102/udp' ]
+        _PLUGIN_REGISTRY=(audit_a)
+        [ "$(fw_desired_rules)" = 24101/tcp ]
+        echo 'plugin boundaries verified'
+    ''')
+    assert_true('plugin boundaries verified' in out, out)
+
+
+def test_uninstall_only_removes_managed_shortcut():
+    out = run_bash(r'''
+        source ./xray_2go.sh
+        set -e
+        mkdir -p "$(dirname "${SHORTCUT}")"
+        prompt() { printf -v "$2" 'y'; }
+        svc_exec_mut() { :; }
+        fw_force_cleanup() { :; }
+        rm() {
+            local _arg _safe=()
+            for _arg in "$@"; do
+                case "${_arg}" in /var/run/*) continue ;; esac
+                _safe+=("${_arg}")
+            done
+            command rm "${_safe[@]}"
+        }
+        is_systemd() { return 1; }
+        lifecycle_rollback_sysctl() { :; }
+        lifecycle_rollback_hosts() { :; }
+        lifecycle_cleanup_cloudflared() { :; }
+        printf '%s\n' 'existing command' > "${SHORTCUT}"
+        module_xray_uninstall
+        grep -qx 'existing command' "${SHORTCUT}"
+        rm -- "${SHORTCUT}"
+        ln -s unrelated "${SHORTCUT}"
+        module_xray_uninstall
+        [ "$(readlink "${SHORTCUT}")" = unrelated ]
+        rm -- "${SHORTCUT}"
+        ln -s xray2go "${SHORTCUT}"
+        module_xray_uninstall
+        [ ! -L "${SHORTCUT}" ]
+        echo 'shortcut ownership verified'
+    ''')
+    assert_true('shortcut ownership verified' in out, out)
+
+
+def test_state_schema_preserves_existing_http_password():
+    out = run_bash(r'''
+        source ./xray_2go.sh
+        _G_STATE='{"http":{"pass":"audit-original"},"ss2022":{"user_key":""}}'
+        _st_normalize_schema
+        [ "$(st_get '.http.pass')" = audit-original ] || exit 1
+        echo 'HTTP password preserved'
+    ''')
+    assert_true('HTTP password preserved' in out, out)
+
+
+def test_transaction_reloads_restored_config_after_persist_failure():
+    out = run_bash(r'''
+        source ./xray_2go.sh
+        set -e
+        mkdir -p "${WORK_DIR}"
+        printf '%s\n' 'old config' > "${CONFIG_FILE}"
+        printf '%s\n' 'old config' > "${WORK_DIR}/running"
+        _fw_restore_managed_snapshot() { :; }
+        svc_exec() { [ "$1" = status ] && [ "$2" = "${_SVC_XRAY}" ]; }
+        svc_is_enabled() { return 1; }
+        svc_apply_xray() { :; }
+        svc_reload_daemon() { :; }
+        svc_exec_mut() {
+            [ "$1" = restart ] && [ "$2" = "${_SVC_XRAY}" ] || return 1
+            cp "${CONFIG_FILE}" "${WORK_DIR}/running"
+        }
+        config_apply() {
+            printf '%s\n' 'new config' > "${CONFIG_FILE}"
+            svc_reload_xray
+        }
+        st_persist() { grep -qx 'new config' "${WORK_DIR}/running" && return 1; return 2; }
+        if _commit; then exit 1; fi
+        grep -qx 'old config' "${CONFIG_FILE}"
+        grep -qx 'old config' "${WORK_DIR}/running"
+        echo 'rollback reloaded previous config'
+    ''')
+    assert_true('rollback reloaded previous config' in out, out)
+
+
+def test_damaged_state_and_backup_are_preserved_until_recovery():
+    out = run_bash(r'''
+        source ./xray_2go.sh
+        set -e
+        mkdir -p "${WORK_DIR}"
+        printf '%s\n' 'damaged' > "${STATE_FILE}"
+        backup="${STATE_FILE}.previous.bak"
+        printf '%s\n' '{"extension":{"enabled":true}}' > "$backup"
+        if st_init; then exit 1; fi
+        grep -qx 'damaged' "${STATE_FILE}"
+        _st_offer_recovery() { with_lock _st_restore_backup "$backup"; }
+        st_init
+        [ "$(st_get '.extension.enabled')" = true ]
+        jq -e '.extension.enabled' "${STATE_FILE}" >/dev/null
+        jq -e '.extension.enabled' "$backup" >/dev/null
+        grep -qx 'damaged' "${STATE_FILE}".corrupt.*
+        echo 'backup restored with damaged copy retained'
+    ''')
+    assert_true('backup restored with damaged copy retained' in out, out)
+
+
+def test_custom_plugin_passes_install_preflight_and_survives_plan_reset():
+    out = run_bash(r'''
+        source ./xray_2go.sh
+        set -e
+        _G_STATE='{"uuid":"00000000-0000-4000-8000-000000000001","extension":{"enabled":true},"ports":{"extension":45678}}'
+        _PLUGIN_REGISTRY=(extension)
+        _plg_extension_enabled() { [ "$(st_get '.extension.enabled')" = true ]; }
+        install_plan_reset_defaults
+        [ "$(port_of extension)" = 45678 ]
+        install_plan_validate
+        st_set '.extension.enabled = false'
+        if install_plan_has_enabled_module; then exit 1; fi
+        echo 'custom plugin checked by preflight'
+    ''')
+    assert_true('custom plugin checked by preflight' in out, out)
+
+
 def test_runtime_harness_does_not_touch_host_root():
     from sandbox_runner import XraySandbox
 
@@ -254,7 +481,7 @@ def test_commit_fails_closed_on_state_persist():
 
 def test_install_port_conflict_uses_plugin_rules_and_udp():
     assert_true('for _proto in argo reality vltcp' not in TEXT, "install port check must not use hard-coded protocol list")
-    assert_true('_rules=$(fw_desired_rules)' in TEXT and 'while IFS= read -r _rule; do' in TEXT, "install port check should derive from desired firewall rules")
+    assert_true('_rules=$(fw_desired_rules "${_preview}")' in TEXT and 'while IFS= read -r _rule; do' in TEXT, "install port check should derive from desired firewall rules")
     assert_true('port_mgr_in_use_udp' in TEXT, "install port check must cover UDP")
 
 
@@ -332,7 +559,6 @@ def test_config_detects_wildcard_listen_conflicts_and_filters_links():
     assert_true('_used_wild_ports' in TEXT and '_used_exact_keys' in TEXT, "config build must track wildcard ports and exact listen keys separately")
     assert_true('printf \'%s\\n\' "${_used_wild_ports}" | grep -qxF "${_port}"' in TEXT, "specific listen must conflict with existing wildcard same-port listener")
     assert_true('printf \'%s\\n\' "${_used_exact_keys}" | grep -qE ":${_port}$"' in TEXT, "wildcard listen must conflict with existing specific same-port listener")
-    assert_true("^(vless|trojan|socks|http)://" in TEXT and "grep -E" in TEXT, "node output should filter plugin link noise and print supported share links")
 
 
 def test_plugin_loader_validates_before_source_and_loads_in_subshell():
@@ -399,6 +625,7 @@ def test_argo_install_tunnel_failure_rolls_back_before_state_commit():
         _install_check_port_conflicts() { :; }
         download_xray() { :; }
         download_cloudflared() { :; }
+        _argo_prepare_fixed_tunnel_from_state() { :; }
         config_apply() { :; }
         svc_apply_xray() { :; }
         svc_apply_tunnel() { :; }
@@ -645,7 +872,6 @@ def test_socks5_module_option_and_plugin_contract():
     assert_true('module_update_port_action socks tcp' in TEXT, "SOCKS5 port update must use TCP conflict checks")
 
 def test_socks5_link_is_generated_and_displayed():
-    assert_true("grep -E '^(vless|trojan|socks|http)://'" in TEXT, "node output must include v2rayN-compatible proxy links, not only vless links")
     socks_plugin = TEXT[TEXT.index('_plugin_write_socks()'):TEXT.index('_plugin_write_cforigin()', TEXT.index('_plugin_write_socks()'))]
     assert_true("socks://%s@%s:%s#SOCKS5" in socks_plugin, "SOCKS plugin should generate v2rayN-compatible socks:// base64(user:pass) links")
     assert_true("base64" in socks_plugin and "tr -d '=\\n'" in socks_plugin, "SOCKS credentials must be URL-safe base64(user:pass) without padding")
@@ -680,7 +906,7 @@ def test_install_plan_menu_is_advanced_install_entry():
     for forbidden in ['ask_argo_mode', 'ask_freeflow_mode', 'ask_reality_mode', 'ask_vltcp_mode', 'ask_socks_mode', 'ask_vlquic_mode', 'ask_cforigin_mode']:
         assert_true(forbidden not in body, f"default install entry should not directly chain {forbidden}")
     plan_menu = TEXT[TEXT.index('install_plan_menu()'):TEXT.index('\n}\n', TEXT.index('install_plan_menu()'))]
-    for marker in ['1) unified_menu_argo install', '2) unified_menu_freeflow install', '3) unified_menu_reality install', '4) unified_menu_vltcp install', '5) unified_menu_socks install', '6) unified_menu_vlquic install', '7) unified_menu_cforigin install', '10) install_plan_validate', '11)', '12) unified_menu_http install', 'install_execute_current_plan && return 0']:
+    for marker in ['1) unified_menu_argo install', '2) unified_menu_freeflow install', '3) unified_menu_reality install', '4) unified_menu_vltcp install', '5) unified_menu_socks install', '6) unified_menu_vlquic install', '7) unified_menu_cforigin install', '10) install_plan_validate', '11)', '12) unified_menu_http install', 'install_wizard_confirm && return 0']:
         assert_true(marker in plan_menu, f"advanced install plan route missing: {marker}")
 
 
@@ -723,7 +949,7 @@ def test_interactive_menu_copy_is_guided_and_consistent():
     assert_true('Xray-2go 控制台' in TEXT, "main menu title should be localized")
     assert_true('开始部署（快速向导）' in TEXT, "main menu install copy should name the guided deployment entry")
     assert_true('快速部署向导' in TEXT and '高级自定义部署' in TEXT, "first-install path should expose guided and advanced modes")
-    for token in ['进入 Reality 配置页', '运行安装前检查', '开始安装', 'prompt "请选择部署方案 (0-3): " _c', '确认开始部署？(Y/n): ', '请选择操作 $( [ "${_runtime}" -eq 1 ] && printf', '返回上一级']:
+    for token in ['进入 Reality 配置页', '运行安装前检查', '预览并确认安装', 'prompt "请选择部署方案 (0-3，回车选 1): " _c', '确认开始部署？(y/N): ', '请选择操作 $( [ "${_runtime}" -eq 1 ] && printf', '返回上一级']:
         assert_true(token in TEXT, f"interactive menu copy token missing: {token}")
 
 
@@ -744,7 +970,7 @@ def test_cli_reality_tcp_preset_entry_exists_and_uses_shared_executor():
     for token in ['local _preferred=443', 'port_mgr_in_use "${_preferred}"', 'port_mgr_random_proto tcp', '自动改用随机端口']:
         assert_true(token in pick_body, f"reality default port helper token missing: {token}")
     main_body = TEXT[TEXT.index('main()'):TEXT.index('if [ "${BASH_SOURCE[0]}" = "$0" ]; then', TEXT.index('main()'))]
-    assert_true('cli_dispatch "$@"' in main_body, "main should route through cli_dispatch")
+    assert_true('parse_args "$@"' in main_body and 'cli_dispatch' in main_body, "main should route through cli_dispatch")
     out = run_bash("""
         source ./xray_2go.sh
         st_init
@@ -1023,12 +1249,13 @@ def test_install_plan_argo_auth_is_state_only_before_execution():
     assert_true('cred_b64=' in out and 'token=' in out, 'install-plan argo auth should persist state fields')
 
 
-def test_install_execute_current_plan_uses_state_based_argo_apply():
-    m = re.search(r"install_execute_current_plan\(\) \{(?P<body>.*?)\n\}", TEXT, re.S)
-    assert_true(m, 'install_execute_current_plan function missing')
-    body = m.group('body')
-    assert_true('argo_apply_fixed_tunnel_from_state' in body, 'install execution should use state-based argo apply path')
-    assert_true('argo_apply_fixed_tunnel ||' not in body, 'install execution should not fall back to interactive argo apply path')
+def test_install_prepares_argo_before_starting_tunnel():
+    start = TEXT.index('module_xray_install_core()')
+    body = TEXT[start:TEXT.index('\n}\n', start)]
+    prepare = body.index('_argo_prepare_fixed_tunnel_from_state && svc_apply_tunnel')
+    launch = body.index('svc_enable_start_verify "${_SVC_TUNNEL}"')
+    persist = body.index('st_persist ||')
+    assert_true(prepare < launch < persist, 'prepare Tunnel, verify startup, then commit state')
 
 
 def test_state_get_preserves_false_and_zero_values():
@@ -1055,27 +1282,65 @@ def test_install_plan_rejects_unconfigured_argo():
         source ./xray_2go.sh
         _G_STATE="${_STATE_DEFAULT}"
         _st_normalize_schema >/dev/null
+        plugin_refresh_runtime || exit 1
         install_plan_validate
     """)
     assert_true(cp.returncode != 0, "an enabled but unconfigured Argo plan must fail validation")
     assert_true("Argo" in cp.stdout and ("域名" in cp.stdout or "token" in cp.stdout), "Argo validation should explain the missing configuration")
 
 
-def test_install_execute_fails_when_argo_apply_fails():
-    cp = run_bash_result("""
+def test_install_completion_only_reports_success_after_core_commit():
+    cp = run_bash_result(r'''
         source ./xray_2go.sh
-        _G_STATE="${_STATE_DEFAULT}"
-        _st_normalize_schema >/dev/null
-        st_set '.argo.enabled = true | .argo.domain = "origin.example.com" | .argo.token = "aaaaaaaaaaaaaaaaaaaa"' >/dev/null
         install_plan_validate() { return 0; }
-        module_xray_install_core() { return 0; }
-        st_persist() { return 0; }
-        argo_apply_fixed_tunnel_from_state() { return 1; }
+        module_xray_install_core() { return 1; }
+        if install_execute_current_plan; then exit 1; fi
+        module_xray_install_core() { echo 'state committed'; }
         config_print_nodes() { return 0; }
-        cforigin_print_cloudflare_hint() { return 0; }
-        install_execute_current_plan
-    """)
-    assert_true(cp.returncode != 0, "install must fail when selected Argo application fails")
+        cforigin_print_cloudflare_hint() { :; }
+        prompt() { printf -v "$2" 'y'; }
+        install_execute_current_plan interactive
+    ''')
+    assert_true(cp.returncode == 0, cp.stdout)
+    assert_true(cp.stdout.count('安装完成，服务已启动') == 1, cp.stdout)
+    assert_true(cp.stdout.index('state committed') < cp.stdout.index('安装完成，服务已启动'), cp.stdout)
+    assert_true('客户端连接已由你确认' in cp.stdout, cp.stdout)
+
+
+def test_wizard_default_previews_ports_before_confirming_install():
+    out = run_bash(r'''
+        source ./xray_2go.sh
+        set -e
+        st_init
+        _PLUGIN_REGISTRY=(reality)
+        _plg_reality_ports() { port_of reality; }
+        _plg_reality_link() { :; }
+        _plg_reality_inbound() { :; }
+        port_mgr_in_use() { return 1; }
+        clear() { :; }
+        install_execute_current_plan() { echo 'install invoked'; }
+        prompt() {
+            case "$1" in
+                请选择部署方案*) printf -v "$2" '' ;;
+                确认开始部署*) printf -v "$2" 'y' ;;
+                *) return 1 ;;
+            esac
+        }
+        install_wizard_menu
+    ''')
+    assert_true(out.index('443/tcp') < out.index('install invoked'), out)
+
+
+def test_help_runs_before_privileged_setup():
+    out = run_bash(r'''
+        source ./xray_2go.sh
+        check_root() { exit 11; }
+        platform_preflight() { exit 12; }
+        st_init() { exit 13; }
+        plugin_refresh_runtime() { exit 14; }
+        main --help
+    ''')
+    assert_true('xray2go --help' in out, out)
 
 
 def test_argo_enable_rolls_back_on_start_failure():
@@ -1480,6 +1745,7 @@ def test_cforigin_plain_http_does_not_require_certificates():
         _G_STATE="${_STATE_DEFAULT}"
         _st_normalize_schema >/dev/null
         st_set '.argo.enabled = false | .cforigin.enabled = true | .cforigin.domain = "origin.example.com" | .cforigin.origin_tls = false | .cforigin.cert = "" | .cforigin.key = ""' >/dev/null
+        plugin_refresh_runtime || exit 1
         install_plan_validate
     """)
     assert_true(cp.returncode == 0, "plain HTTP CF Origin should validate without certificate files")
@@ -2570,7 +2836,6 @@ def test_ss2022_static_contract():
     assert_true('.ss2022' in TEXT and '.ports.ss2022' in TEXT, "SS2022 state and centralized port fields are missing")
     assert_true('[ss2022]=unified_menu_ss2022' in TEXT and '[ss2022]=module_ss2022_enable' in TEXT and '[ss2022]=module_ss2022_update_port' in TEXT, "SS2022 registry metadata is incomplete")
     assert_true('module_registry_dispatch_common' in TEXT and 'module_dispatch()' in TEXT, "SS2022 common actions must use the registry dispatcher")
-    assert_true("^(vless|trojan|socks|http)://" in TEXT, "node output must accept existing proxy links")
 
 def test_ss2022_state_normalization_supplies_safe_defaults():
     out = run_bash("""

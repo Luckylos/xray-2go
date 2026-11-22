@@ -90,6 +90,7 @@ _TXN_LOCK_FD=""
 _TXN_PRE_STATE=""
 _TXN_PRE_STATE_FILE=0
 _TXN_PRE_XRAY_ACTIVE=0
+_TXN_XRAY_RESTART_ATTEMPTED=0
 _TXN_PRE_TUNNEL_ACTIVE=0
 _TXN_PRE_XRAY_ENABLED=0
 _TXN_PRE_TUNNEL_ENABLED=0
@@ -527,13 +528,14 @@ _commit_port_change() {
     local _proto="$1" _new_port="$2" _net_label="${3:-}"
     _transaction_run "端口更新" _commit_port_change_inner "${_proto}" "${_new_port}" || return 1
     log_ok "$(module_label "${_proto}") 端口已更新: $(port_of "${_proto}")${_net_label:+（${_net_label^^}）}"
-    config_print_nodes
+    config_print_nodes "${_proto}" || true
 }
 
 # ── State 读/写 ───────────────────────────────────────────────────────────────
 st_get() {
-    local _v
-    _v=$(printf '%s' "${_G_STATE}" | jq -r "if (${1}) == null then empty else (${1}) end" 2>/dev/null) || true
+    local _f="$1" _v
+    shift
+    _v=$(printf '%s' "${_G_STATE}" | jq -r "$@" "if (${_f}) == null then empty else (${_f}) end" 2>/dev/null) || true
     printf '%s' "${_v}"
 }
 
@@ -564,7 +566,7 @@ xpad_of() {
 # 所有模块禁止硬编码端口，必须调用此函数
 port_of() {
     # 用法：port_of argo / ff / reality / vltcp / vlquic / cforigin / socks / http
-    local _v; _v=$(st_get ".ports.${1}")
+    local _v; _v=$(st_get '.ports[$name]' --arg name "$1")
     [ -n "${_v:-}" ] && [ "${_v}" != "null" ] && printf '%s' "${_v}" || printf '0'
 }
 
@@ -873,6 +875,7 @@ _st_normalize_schema() {
     _c=$(st_get '.http.user')
     { [ -z "${_c:-}" ] || [ "${_c}" = "null" ]; } && st_set '.http.user = "xray2go"'
     _c=$(st_get '.http.pass')
+    { [ -z "${_c:-}" ] || [ "${_c}" = "null" ]; } && st_set '.http.pass = "xray2go"'
     _c=$(st_get '.ss2022.enabled')
     { [ -z "$_c" ] || [ "$_c" = "null" ]; } && st_set '.ss2022.enabled = false'
     _c=$(st_get '.ss2022.listen')
@@ -886,7 +889,6 @@ _st_normalize_schema() {
     { [ "$_c" = "null" ] || [ -z "$_c" ]; } && st_set '.ss2022.server_key = ""'
     _c=$(st_get '.ss2022.user_key')
     { [ "$_c" = "null" ] || [ -z "$_c" ]; } && st_set '.ss2022.user_key = ""'
-    { [ -z "${_c:-}" ] || [ "${_c}" = "null" ]; } && st_set '.http.pass = "xray2go"'
     _c=$(st_get '.vlquic.listen')
     { [ -z "${_c:-}" ] || [ "${_c}" = "null" ]; } && st_set '.vlquic.listen = "0.0.0.0"'
     _c=$(st_get '.vlquic.domain')
@@ -927,23 +929,69 @@ _st_normalize_schema() {
     return 0
 }
 
+_st_read_object() {
+    jq -ces 'if length == 1 and (.[0] | type == "object") then .[0] else error("invalid state") end' "$1" 2>/dev/null
+}
+
+_st_restore_backup() {
+    local _backup="$1" _restored _damaged
+    if _st_read_object "${STATE_FILE}" >/dev/null; then
+        log_error "状态文件已被其他进程恢复，请重新运行"
+        return 1
+    fi
+    _restored=$(_st_read_object "${_backup}") || { log_error "备份读取失败"; return 1; }
+    _damaged=$(mktemp "${STATE_FILE}.corrupt.XXXXXX") || return 1
+    if ! cat -- "${STATE_FILE}" > "${_damaged}"; then
+        rm -f -- "${_damaged}"
+        log_error "无法保留损坏的状态文件"
+        return 1
+    fi
+    atomic_write_secret "${STATE_FILE}" "${_restored}" || { log_error "恢复状态文件失败"; return 1; }
+    log_ok "状态已从备份恢复，损坏文件保存在 ${_damaged}"
+}
+
+_st_offer_recovery() {
+    local _file _choice _backups=()
+    log_error "state.json 损坏，已保留原文件"
+    for _file in "${STATE_FILE}".*.bak "${STATE_FILE}.bak"; do
+        [ -f "${_file}" ] && _st_read_object "${_file}" >/dev/null || continue
+        _backups+=("${_file}")
+        printf '  %s. %s\n' "${#_backups[@]}" "${_file}"
+    done
+    if [ "${#_backups[@]}" -eq 0 ]; then
+        log_error "没有找到可读取的状态备份"
+        return 1
+    fi
+    [ -t 0 ] && [ -t 1 ] || return 1
+    prompt "输入备份编号以确认恢复（回车退出）: " _choice || return 1
+    [[ "${_choice:-}" =~ ^[1-9][0-9]{0,5}$ ]] && [ "${_choice}" -le "${#_backups[@]}" ] || return 1
+    with_lock _st_restore_backup "${_backups[_choice - 1]}"
+}
+
 st_init() {
-    if [ -f "${STATE_FILE}" ]; then
-        local _raw; _raw=$(cat "${STATE_FILE}" 2>/dev/null || true)
-        if printf '%s' "${_raw}" | jq -e . >/dev/null 2>&1; then
-            _G_STATE="${_raw}"
-            _st_normalize_schema
-            local _u; _u=$(st_get '.uuid')
-            [ -z "${_u:-}" ] && st_set '.uuid = $u' --arg u "$(crypto_gen_uuid)"
-            return 0
+    local _u
+    if [ -e "${STATE_FILE}" ] || [ -L "${STATE_FILE}" ]; then
+        if ! _G_STATE=$(_st_read_object "${STATE_FILE}"); then
+            _st_offer_recovery || return 1
+            _G_STATE=$(_st_read_object "${STATE_FILE}") || { log_error "无法读取恢复后的状态文件"; return 1; }
         fi
-        log_warn "state.json 损坏，重置为默认值..."
+        _st_normalize_schema
+        _u=$(st_get '.uuid')
+        if [ -z "${_u:-}" ]; then
+            _u=$(crypto_gen_uuid) && st_set '.uuid = $u' --arg u "${_u}" || return 1
+        fi
+        return 0
     fi
     _G_STATE="${_STATE_DEFAULT}"
     _st_normalize_schema
-    local _u; _u=$(st_get '.uuid')
-    [ -z "${_u:-}" ] && st_set '.uuid = $u' --arg u "$(crypto_gen_uuid)"
-    [ -d "${WORK_DIR}" ] && { st_persist 2>/dev/null || true; log_info "状态已初始化"; }
+    _u=$(st_get '.uuid')
+    if [ -z "${_u:-}" ]; then
+        _u=$(crypto_gen_uuid) && st_set '.uuid = $u' --arg u "${_u}" || return 1
+    fi
+    if [ -d "${WORK_DIR}" ]; then
+        st_persist || { log_error "状态初始化写入失败"; return 1; }
+        log_info "状态已初始化"
+    fi
 }
 
 # ==============================================================================
@@ -951,8 +999,8 @@ st_init() {
 # ==============================================================================
 # 插件接口契约（每个插件文件必须实现）：
 #   plugin_inbound  — 输出单个 inbound JSON（或空字符串表示禁用）
-#   plugin_link     — 输出分享链接字符串（或空）
-#   plugin_ports    — 每行输出一个端口号（当前协议占用的端口）
+#   plugin_link     — 每行输出一个无空白或控制字符的 scheme:// 分享链接（或空）
+#   plugin_ports    — 每行输出一个端口号或 port/tcp、port/udp（或空）
 #   plugin_enabled  — 返回 0=启用 / 1=禁用
 #
 # 插件文件约定：
@@ -1016,6 +1064,21 @@ plugin_call() {
     "${_fn}" "$@"
 }
 
+plugin_filter_links() {
+    local _name="$1" _line _invalid=0 _uri='^[a-zA-Z][a-zA-Z0-9+.-]*://[^[:space:][:cntrl:]]+$'
+    while IFS= read -r _line; do
+        [ -n "${_line}" ] || continue
+        if [[ "${_line}" =~ ${_uri} ]]; then
+            printf '%s\n' "${_line}"
+        else
+            _invalid=1
+        fi
+    done
+    if [ "${_invalid}" -eq 1 ]; then
+        log_warn "插件 ${_name} 返回了无效的分享链接格式"
+    fi
+}
+
 plugin_refresh_runtime() {
     plugin_install_builtins || return 1
     plugin_load_all || return 1
@@ -1045,12 +1108,11 @@ _plugin_snapshot_rebuild() {
 
     for _name in "${_PLUGIN_REGISTRY[@]}"; do
         _p=$(plugin_call "${_name}" ports 2>/dev/null) || true
-        [ -n "${_p:-}" ] && _PLUGIN_SNAPSHOT_PORTS="${_PLUGIN_SNAPSHOT_PORTS}$(printf '%s\n' "${_p}")"
+        [ -n "${_p:-}" ] && _PLUGIN_SNAPSHOT_PORTS+="${_p}"$'\n'
 
-        _l=$(plugin_call "${_name}" link 2>/dev/null) || true
-        # Legacy node-link filter prefix: grep -E '^(vless|trojan|socks|http)://'
-        [ -n "${_l:-}" ] && _PLUGIN_SNAPSHOT_LINKS="${_PLUGIN_SNAPSHOT_LINKS}$(printf '%s\n' "${_l}" | grep -E '^(vless|trojan|socks|http|ss)://' || true)"$'\n'
-
+        _l=$(plugin_call "${_name}" link 2>/dev/null) || _l=""
+        _links=$(plugin_filter_links "${_name}" <<< "${_l}")
+        [ -n "${_links}" ] && _PLUGIN_SNAPSHOT_LINKS+="${_links}"$'\n'
         _ib=$(plugin_call "${_name}" inbound 2>/dev/null) || {
             log_error "插件 inbound 失败: ${_name}"; return 1; }
         [ -n "${_ib:-}" ] || continue
@@ -1095,11 +1157,34 @@ _plugin_snapshot_ensure() {
 }
 
 plugin_collect_ports_raw() {
+    local _name _ports
+    if [ "${1:-}" = preview ]; then
+        for _name in "${_PLUGIN_REGISTRY[@]}"; do
+            _ports=$(plugin_call "${_name}" ports) || return 1
+            [ -z "${_ports}" ] || printf '%s\n' "${_ports}"
+        done
+        return 0
+    fi
     _plugin_snapshot_ensure || return 1
     printf '%s' "${_PLUGIN_SNAPSHOT_PORTS}"
 }
 
+plugin_is_loaded() {
+    local _name
+    for _name in "${_PLUGIN_REGISTRY[@]}"; do
+        [ "${_name}" = "$1" ] && return 0
+    done
+    return 1
+}
+
 plugin_collect_links() {
+    local _mod="${1:-}" _links
+    if [ -n "${_mod}" ]; then
+        plugin_is_loaded "${_mod}" || return 0
+        _links=$(plugin_call "${_mod}" link) || return 1
+        plugin_filter_links "${_mod}" <<< "${_links}"
+        return
+    fi
     _plugin_snapshot_ensure || return 1
     printf '%s' "${_PLUGIN_SNAPSHOT_LINKS}"
 }
@@ -1741,7 +1826,7 @@ PLUGIN_EOF
 # 汇总所有插件的期望防火墙规则（格式：port/proto）
 fw_desired_rules() {
     local _p _port _proto
-    plugin_collect_ports_raw | while IFS= read -r _p; do
+    plugin_collect_ports_raw "$@" | while IFS= read -r _p; do
         [ -n "${_p:-}" ] || continue
         case "${_p}" in
             */udp) _port=${_p%/*}; _proto=udp ;;
@@ -1895,7 +1980,7 @@ fw_reconcile() {
     log_step "同步防火墙规则..."
     mkdir -p "${WORK_DIR}"
     local _expected_rules _expected_ports _rule _rp _rb _rproto _want _failed=0
-    _expected_rules=$(fw_desired_rules)
+    _expected_rules=$(fw_desired_rules) || return 1
     _expected_ports=$(printf '%s\n' "${_expected_rules}" | cut -d/ -f1 | grep -E '^[0-9]+$' | sort -un || true)
 
     for _rule in $(_fw_read_managed_rules); do
@@ -2096,6 +2181,9 @@ svc_reload_xray() {
     # 因此每次重载配置前都先确保托管服务单元存在并刷新 daemon。
     svc_apply_xray || { log_error "xray2go 服务单元写入失败"; return 1; }
     svc_reload_daemon
+    if [ "${_TXN_ACTIVE}" -eq 1 ]; then
+        _TXN_XRAY_RESTART_ATTEMPTED=1
+    fi
     svc_exec_mut restart "${_SVC_XRAY}" || { log_error "xray restart 失败"; return 1; }
     printf '%s' "${_new_hash}" > "${_CONFIG_HASH_FILE}" 2>/dev/null || true
     log_ok "xray 已重启并加载新配置"
@@ -2349,7 +2437,7 @@ config_apply() { with_lock _config_apply_inner; }
 
 config_print_nodes() {
     local _links
-    _links=$(plugin_collect_links)
+    _links=$(plugin_collect_links "${1:-}") || return 1
 
     if [ -z "${_links:-}" ]; then
         echo ""; log_warn "暂无可用节点"; return 1
@@ -2448,6 +2536,7 @@ _transaction_begin() {
     _TXN_PRE_FW_FILE="${_TXN_DIR}/firewall.rules"
     _fw_read_managed_rules > "${_TXN_PRE_FW_FILE}" 2>/dev/null || :
     _TXN_PRE_XRAY_ACTIVE=0
+    _TXN_XRAY_RESTART_ATTEMPTED=0
     _TXN_PRE_TUNNEL_ACTIVE=0
     _TXN_PRE_XRAY_ENABLED=0
     _TXN_PRE_TUNNEL_ENABLED=0
@@ -2477,7 +2566,7 @@ _transaction_restore_files() {
 }
 
 _transaction_restore_service() {
-    local _name="$1" _was_active="$2" _was_enabled="$3" _is_active=0 _is_enabled=0
+    local _name="$1" _was_active="$2" _was_enabled="$3" _reload="${4:-0}" _is_active=0 _is_enabled=0
     svc_exec status "${_name}" >/dev/null 2>&1 && _is_active=1 || true
     svc_is_enabled "${_name}" >/dev/null 2>&1 && _is_enabled=1 || true
     if [ "${_was_enabled}" = 1 ] && [ "${_is_enabled}" = 0 ]; then
@@ -2487,22 +2576,31 @@ _transaction_restore_service() {
     fi
     if [ "${_was_active}" = 1 ] && [ "${_is_active}" = 0 ]; then
         svc_exec_mut start "${_name}" >/dev/null 2>&1 || return 1
+    elif [ "${_was_active}" = 1 ] && [ "${_reload}" = 1 ]; then
+        svc_exec_mut restart "${_name}" >/dev/null 2>&1 || return 1
+        svc_exec status "${_name}" >/dev/null 2>&1 || return 1
     elif [ "${_was_active}" = 0 ] && [ "${_is_active}" = 1 ]; then
         svc_exec_mut stop "${_name}" >/dev/null 2>&1 || return 1
     fi
 }
 
 _transaction_rollback() {
-    local _failed=0 _restored_state
+    local _failed=0 _restored_state _reload=0
     _fw_restore_managed_snapshot "${_TXN_PRE_FW_FILE}" || _failed=1
-    _transaction_restore_files || _failed=1
+    if _transaction_restore_files; then
+        _reload="${_TXN_XRAY_RESTART_ATTEMPTED}"
+        _G_SYSD_DIRTY=1
+        svc_reload_daemon
+    else
+        _failed=1
+    fi
     if [ -f "${STATE_FILE}" ]; then
         _restored_state=$(cat "${STATE_FILE}" 2>/dev/null) || _restored_state=""
         printf '%s' "${_restored_state}" | jq -e . >/dev/null 2>&1 && _G_STATE="${_restored_state}"
     elif [ "${_TXN_PRE_STATE_FILE}" -eq 0 ]; then
         _G_STATE="${_TXN_PRE_STATE}"
     fi
-    _transaction_restore_service "${_SVC_XRAY}" "${_TXN_PRE_XRAY_ACTIVE}" "${_TXN_PRE_XRAY_ENABLED}" || _failed=1
+    _transaction_restore_service "${_SVC_XRAY}" "${_TXN_PRE_XRAY_ACTIVE}" "${_TXN_PRE_XRAY_ENABLED}" "${_reload}" || _failed=1
     _transaction_restore_service "${_SVC_TUNNEL}" "${_TXN_PRE_TUNNEL_ACTIVE}" "${_TXN_PRE_TUNNEL_ENABLED}" || _failed=1
     [ "${_failed}" -eq 0 ]
 }
@@ -2556,12 +2654,12 @@ _module_disable_commit_inner() {
 _module_disable_commit() { _transaction_run "模块禁用提交" _module_disable_commit_inner "$@"; }
 
 _module_enable_commit_inner() {
-    local _name="$1"
+    local _id="$1"
     config_apply || return 1
     st_persist   || { log_error "state.json 写入失败，拒绝同步防火墙以避免状态漂移"; return 1; }
     fw_reconcile || return 1
-    log_ok "${_name} 已启用"
-    config_print_nodes
+    log_ok "$(module_label "${_id}") 已启用"
+    config_print_nodes "${_id}" || true
 }
 _module_enable_commit() { _transaction_run "模块启用提交" _module_enable_commit_inner "$@"; }
 
@@ -2597,13 +2695,13 @@ _module_update_listen_transaction() {
 
 
 _module_enable_transaction_inner() {
-    local _module_name="$1" _before="${_G_STATE}"
+    local _id="$1" _before="${_G_STATE}"
     shift
     "$@" || {
         _G_STATE="${_before}"
         return 1
     }
-    if ! _module_enable_commit "${_module_name}"; then
+    if ! _module_enable_commit "${_id}"; then
         _G_STATE="${_before}"
         return 1
     fi
@@ -2629,8 +2727,8 @@ _module_disable_transaction() {
 }
 
 _module_enable_with_state() {
-    local _jq_expr="$1" _module_name="$2"
-    _module_enable_transaction "${_module_name}" st_set "${_jq_expr}"
+    local _jq_expr="$1" _id="$2"
+    _module_enable_transaction "${_id}" st_set "${_jq_expr}"
 }
 
 module_update_port_action() {
@@ -2665,7 +2763,7 @@ module_update_listen_action() {
     _l=$(val_listen_addr "${_l}") || return 1
     _module_update_listen_transaction "${_proto}" "${_en}" "${_l}" || return 1
     log_ok "${_label} 监听地址已更新: ${_l}"
-    [ "${_en}" = "true" ] && config_print_nodes
+    [ "${_en}" = "true" ] && { config_print_nodes "${_proto}" || true; }
     return 0
 }
 
@@ -2686,7 +2784,7 @@ _module_ff_enable_prepare() {
 }
 
 module_ff_enable() {
-    _module_enable_transaction FreeFlow _module_ff_enable_prepare
+    _module_enable_transaction ff _module_ff_enable_prepare
 }
 
 module_ff_disable() {
@@ -2707,7 +2805,7 @@ _module_reality_enable_prepare() {
 
 module_reality_enable() {
     [ -x "${XRAY_BIN}" ] || { log_error "xray 未就绪"; return 1; }
-    _module_enable_transaction Reality _module_reality_enable_prepare
+    _module_enable_transaction reality _module_reality_enable_prepare
 }
 
 module_reality_disable() {
@@ -2716,7 +2814,7 @@ module_reality_disable() {
 }
 
 module_vltcp_enable() {
-    _module_enable_with_state '.vltcp.enabled = true' "VLESS-TCP"
+    _module_enable_with_state '.vltcp.enabled = true' vltcp
 }
 
 module_vltcp_disable() {
@@ -2729,7 +2827,7 @@ module_socks_action() {
     local _action="${1:-}"
     case "${_action}" in
         enable)
-            _module_enable_with_state '.socks.enabled = true' SOCKS5 || return 1
+            _module_enable_with_state '.socks.enabled = true' socks || return 1
             ;;
         disable)
             _module_disable_transaction SOCKS5 st_set '.socks.enabled = false' || return 1
@@ -2767,7 +2865,7 @@ _module_ss2022_enable_prepare() {
 }
 
 module_ss2022_enable() {
-    _module_enable_transaction "Shadowsocks 2022" _module_ss2022_enable_prepare
+    _module_enable_transaction ss2022 _module_ss2022_enable_prepare
 }
 
 module_ss2022_disable() {
@@ -2815,7 +2913,7 @@ module_ss2022_update_method() {
     _module_update_state_transaction "SS2022 加密方法更新" _module_ss2022_update_method_inner \
         "${_en}" "${_method}" "${_server}" "${_user}" || return 1
     log_ok "SS2022 加密方法已更新为 $_method（已重新生成密钥）"
-    [ "$_en" = "true" ] && config_print_nodes
+    [ "$_en" = "true" ] && { config_print_nodes ss2022 || true; }
 }
 
 _module_ss2022_regenerate_keys_inner() {
@@ -2836,7 +2934,7 @@ module_ss2022_regenerate_keys() {
     _module_update_state_transaction "SS2022 密钥轮换" _module_ss2022_regenerate_keys_inner \
         "${_en}" "${_server}" "${_user}" || return 1
     log_ok "SS2022 服务端/用户密钥已重新生成"
-    [ "$_en" = "true" ] && config_print_nodes
+    [ "$_en" = "true" ] && { config_print_nodes ss2022 || true; }
 }
 
 module_http_action() {
@@ -2846,7 +2944,7 @@ module_http_action() {
             case "$(st_get '.http.listen')" in
                 0.0.0.0|::) log_warn "HTTP 代理为明文协议，当前监听所有接口，请确认防火墙与网络边界" ;;
             esac
-            _module_enable_with_state '.http.enabled = true' "HTTP 代理" || return 1
+            _module_enable_with_state '.http.enabled = true' http || return 1
             ;;
         disable)
             _module_disable_transaction "HTTP 代理" st_set '.http.enabled = false' || return 1
@@ -2881,7 +2979,7 @@ _module_cforigin_enable_prepare() {
 }
 
 module_cforigin_enable() {
-    _module_enable_transaction "CF Origin" _module_cforigin_enable_prepare || return 1
+    _module_enable_transaction cforigin _module_cforigin_enable_prepare || return 1
     cforigin_print_cloudflare_hint
 }
 
@@ -2935,7 +3033,7 @@ module_socks_update_auth() {
     st_set '.socks.user = $u | .socks.pass = $p' --arg u "${_user}" --arg p "${_pass}" || return 1
     _module_persist_after_optional_apply "${_en}" || return 1
     log_ok "SOCKS5 账号已更新: ${_user}"
-    [ "${_en}" = "true" ] && config_print_nodes
+    [ "${_en}" = "true" ] && { config_print_nodes socks || true; }
 }
 
 
@@ -2948,7 +3046,7 @@ module_socks_update_user() {
     st_set '.socks.user = $u' --arg u "${_user}" || return 1
     _module_persist_after_optional_apply "${_en}" || return 1
     log_ok "SOCKS5 用户名已更新: ${_user}"
-    [ "${_en}" = "true" ] && config_print_nodes
+    [ "${_en}" = "true" ] && { config_print_nodes socks || true; }
 }
 
 module_socks_update_pass() {
@@ -2959,7 +3057,7 @@ module_socks_update_pass() {
     st_set '.socks.pass = $p' --arg p "${_pass}" || return 1
     _module_persist_after_optional_apply "${_en}" || return 1
     log_ok "SOCKS5 密码已更新"
-    [ "${_en}" = "true" ] && config_print_nodes
+    [ "${_en}" = "true" ] && { config_print_nodes socks || true; }
 }
 
 module_http_uninstall() {
@@ -2986,7 +3084,7 @@ module_http_update_auth() {
     st_set '.http.user = $u | .http.pass = $p' --arg u "${_user}" --arg p "${_pass}" || return 1
     _module_persist_after_optional_apply "${_en}" || return 1
     log_ok "HTTP 代理账号已更新: ${_user}"
-    [ "${_en}" = "true" ] && config_print_nodes
+    [ "${_en}" = "true" ] && { config_print_nodes http || true; }
 }
 
 module_http_update_user() {
@@ -2998,7 +3096,7 @@ module_http_update_user() {
     st_set '.http.user = $u' --arg u "${_user}" || return 1
     _module_persist_after_optional_apply "${_en}" || return 1
     log_ok "HTTP 代理用户名已更新: ${_user}"
-    [ "${_en}" = "true" ] && config_print_nodes
+    [ "${_en}" = "true" ] && { config_print_nodes http || true; }
 }
 
 module_http_update_pass() {
@@ -3009,7 +3107,7 @@ module_http_update_pass() {
     st_set '.http.pass = $p' --arg p "${_pass}" || return 1
     _module_persist_after_optional_apply "${_en}" || return 1
     log_ok "HTTP 代理密码已更新"
-    [ "${_en}" = "true" ] && config_print_nodes
+    [ "${_en}" = "true" ] && { config_print_nodes http || true; }
 }
 module_vlquic_uninstall() {
     _module_disable_transaction VLESS-XHTTP-H3 st_set '.vlquic.enabled = false | .vlquic.listen = "0.0.0.0" | .vlquic.domain = "" | .vlquic.cert = "" | .vlquic.key = "" | .vlquic.acme_method = "manual"' || return 1
@@ -3051,7 +3149,7 @@ module_reality_update_transport() {
     st_set '.reality.network = $n' --arg n "${_nn}" || return 1
     _module_persist_after_optional_apply "${_en}" || return 1
     log_ok "传输方式已切换: ${_nn}"
-    [ "${_en}" = "true" ] && config_print_nodes
+    [ "${_en}" = "true" ] && { config_print_nodes reality || true; }
 }
 
 module_vltcp_update_listen() {
@@ -3077,7 +3175,7 @@ module_cforigin_update_protocol() {
     esac
     _module_persist_after_optional_apply "${_en}" || return 1
     log_ok "CF Origin 协议已更新: $(st_get '.cforigin.protocol')"
-    [ "${_en}" = "true" ] && config_print_nodes
+    [ "${_en}" = "true" ] && { config_print_nodes cforigin || true; }
 }
 
 
@@ -3102,7 +3200,7 @@ module_cforigin_update_path() {
     st_set '.cforigin.path = $p' --arg p "${_vp}" || return 1
     _module_persist_after_optional_apply "${_en}" || return 1
     log_ok "path 已更新: ${_vp}"
-    [ "${_en}" = "true" ] && config_print_nodes
+    [ "${_en}" = "true" ] && { config_print_nodes cforigin || true; }
 }
 
 module_cforigin_update_listen() {
@@ -3199,7 +3297,7 @@ _module_argo_update_protocol_impl() {
         log_error "固定隧道同步失败，已回滚传输协议为 ${_proto}"
         return 1
     }
-    config_print_nodes
+    config_print_nodes argo || true
 }
 
 _module_argo_update_auth_protocol_impl() {
@@ -3214,7 +3312,7 @@ _module_argo_update_auth_protocol_impl() {
         log_error "固定隧道同步失败，已回滚入站认证为 ${_auth}"
         return 1
     }
-    config_print_nodes
+    config_print_nodes argo || true
 }
 
 _module_argo_update_trojan_password_impl() {
@@ -3228,13 +3326,13 @@ _module_argo_update_trojan_password_impl() {
         log_error "固定隧道同步失败，已回滚 Trojan 密码"
         return 1
     }
-    config_print_nodes
+    config_print_nodes argo || true
 }
 
 module_ff_update_mode() {
     install_plan_ff_update_mode || return 1
     [ "$(st_get '.ff.enabled')" = "true" ] || { log_warn "FreeFlow 未启用"; return 1; }
-    _module_enable_commit FreeFlow || return 1
+    _module_enable_commit ff || return 1
 }
 module_ff_update_port() {
     module_update_port_action ff tcp
@@ -3252,7 +3350,7 @@ module_ff_update_host_or_path() {
         [ -n "${_h:-}" ] || return 0
         st_set '.ff.host = $h' --arg h "${_h}" || return 1
         config_apply && st_persist || { log_error "state.json 写入失败"; return 1; }
-        log_ok "Host 已更新: ${_h}"; config_print_nodes
+        log_ok "Host 已更新: ${_h}"; config_print_nodes ff || true
     else
         prompt "新 path（回车保持 ${_path}）: " _p
         [ -n "${_p:-}" ] || return 0
@@ -3262,7 +3360,7 @@ module_ff_update_host_or_path() {
         fi
         st_set '.ff.path = $p' --arg p "${_vp2}" || return 1
         config_apply && st_persist || { log_error "state.json 写入失败"; return 1; }
-        log_ok "path 已更新: ${_p}"; config_print_nodes
+        log_ok "path 已更新: ${_p}"; config_print_nodes ff || true
     fi
 }
 
@@ -3279,7 +3377,7 @@ module_reality_update_sni() {
     _module_apply_if_enabled "${_en}" || return 1
     st_persist || { log_error "state.json 写入失败"; return 1; }
     log_ok "SNI 已更新: ${_s}"
-    [ "${_en}" = "true" ] && config_print_nodes
+    [ "${_en}" = "true" ] && { config_print_nodes reality || true; }
 }
 
 module_reality_regenerate_keys() {
@@ -3291,7 +3389,7 @@ module_reality_regenerate_keys() {
     [ "${_en}" = "true" ] && { config_apply || return 1; }
     st_persist || { log_error "state.json 写入失败"; return 1; }
     log_ok "密钥对已更新"
-    [ "${_en}" = "true" ] && config_print_nodes
+    [ "${_en}" = "true" ] && { config_print_nodes reality || true; }
 }
 
 _module_vlquic_enable_prepare() {
@@ -3306,7 +3404,7 @@ _module_vlquic_enable_prepare() {
 }
 
 module_vlquic_enable() {
-    _module_enable_transaction "VLESS-XHTTP-H3" _module_vlquic_enable_prepare || return 1
+    _module_enable_transaction vlquic _module_vlquic_enable_prepare || return 1
     log_ok "VLESS-XHTTP-H3 已启用 (UDP/$(port_of vlquic))"
 }
 
@@ -3320,7 +3418,7 @@ module_vlquic_update_cert() {
     _en=$(st_get '.vlquic.enabled')
     vlquic_config_cert || return 1
     st_persist || { log_error "state.json 写入失败"; return 1; }
-    [ "${_en}" = "true" ] && { fw_reconcile; config_apply || return 1; config_print_nodes; }
+    [ "${_en}" = "true" ] && { fw_reconcile; config_apply || return 1; config_print_nodes vlquic || true; }
 }
 
 module_cforigin_update_cert() {
@@ -3330,7 +3428,7 @@ module_cforigin_update_cert() {
     [ "${_en}" = "true" ] && { config_apply || return 1; }
     st_persist || { log_error "state.json 写入失败"; return 1; }
     log_ok "CF Origin 域名/证书已更新"
-    [ "${_en}" = "true" ] && { config_print_nodes; cforigin_print_cloudflare_hint; }
+    [ "${_en}" = "true" ] && { config_print_nodes cforigin; cforigin_print_cloudflare_hint; }
 }
 
 module_cforigin_update_edge_port() {
@@ -3341,7 +3439,7 @@ module_cforigin_update_edge_port() {
     val_port "${_ep}" >/dev/null && cf_edge_port_valid "${_ep}" || return 1
     st_set '.cforigin.edge_port = ($p|tonumber)' --arg p "${_ep}" || return 1
     st_persist || { log_error "state.json 写入失败"; return 1; }
-    log_ok "Edge 入口端口已更新: ${_ep}"; config_print_nodes; cforigin_print_cloudflare_hint
+    log_ok "Edge 入口端口已更新: ${_ep}"; config_print_nodes cforigin; cforigin_print_cloudflare_hint
 }
 
 module_cforigin_toggle_edge_h3() {
@@ -3359,7 +3457,7 @@ module_cforigin_toggle_edge_h3() {
     fi
     st_persist || { log_error "state.json 写入失败"; return 1; }
     log_ok "客户端到 Cloudflare Edge HTTP/3 实验性参数已更新: $(st_get '.cforigin.edge_h3')"
-    config_print_nodes; cforigin_print_cloudflare_hint
+    config_print_nodes cforigin; cforigin_print_cloudflare_hint
 }
 
 # ==============================================================================
@@ -3891,7 +3989,7 @@ argo_apply_fixed_tunnel() {
 }
 
 
-argo_apply_fixed_tunnel_from_state() {
+_argo_prepare_fixed_tunnel_from_state() {
     local _domain _token _cred _tid _cred_b64
     _domain=$(st_get '.argo.domain')
     case "${_domain:-}" in ''|null|*' '*|*'/'*|*$'\t'*)
@@ -3923,14 +4021,17 @@ argo_apply_fixed_tunnel_from_state() {
         st_set '.argo.mode = "fixed"' || return 1
     fi
 
-    _svc_write_argo_env || return 1
+}
+
+argo_apply_fixed_tunnel_from_state() {
+    _argo_prepare_fixed_tunnel_from_state || return 1
     svc_apply_tunnel || return 1
     svc_reload_daemon
     svc_exec_mut enable "${_SVC_TUNNEL}" 2>/dev/null || true
     config_apply || return 1
     st_persist || { log_error "state.json 写入失败"; return 1; }
     svc_exec_mut restart "${_SVC_TUNNEL}" || { log_error "tunnel 重启失败"; return 1; }
-    log_ok "固定隧道已同步 (domain=${_domain})"
+    log_ok "固定隧道已同步 (domain=$(st_get '.argo.domain'))"
     argo_check_health || true
 }
 
@@ -3951,14 +4052,14 @@ _module_argo_update_domain_impl() {
         log_error "固定隧道同步失败，已回滚 Argo 域名为 ${_old_domain}"
         return 1
     }
-    config_print_nodes
+    config_print_nodes argo || true
 }
 
 _module_argo_update_auth_impl() {
     [ "$(st_get '.argo.enabled')" = "true" ] || { log_warn "请先启用 Argo"; return 1; }
     install_plan_argo_update_auth || return 1
     argo_apply_fixed_tunnel_from_state || return 1
-    config_print_nodes
+    config_print_nodes argo || true
 }
 
 module_argo_update_action() {
@@ -4030,7 +4131,7 @@ module_argo_update_port() {
     svc_exec_mut restart "${_SVC_TUNNEL}" || log_warn "tunnel 重启失败，请手动重启"
     fw_reconcile
     log_ok "Argo 端口已更新: ${_p}（当前: $(port_of argo)；xray inbound 已同步；cred/local-managed tunnel.yml 已同步，token/remote-managed 模式需在 Cloudflare Zero Trust 远端确认 Public Hostname 指向 http://localhost:${_p}）"
-    config_print_nodes
+    config_print_nodes argo || true
 }
 
 # ==============================================================================
@@ -4179,12 +4280,19 @@ _install_detect_existing_xray() {
 }
 
 _install_check_port_conflicts() {
-    log_step "检测端口冲突..."
-    local _rules _rule _port _proto
-    _rules=$(fw_desired_rules)
+    local _preview="${1:-}" _rules _rule _port _proto
+    _rules=$(fw_desired_rules "${_preview}") || return 1
+    if [ "${_preview}" = preview ]; then
+        printf '  计划监听端口（端口/协议）\n'
+    else
+        log_step "检测端口冲突..."
+    fi
     while IFS= read -r _rule; do
         [ -n "${_rule:-}" ] || continue
         _port=${_rule%/*}; _proto=${_rule#*/}
+        if [ "${_preview}" = preview ]; then
+            printf '    %s\n' "${_rule}"
+        fi
         case "${_proto}" in
             udp)
                 port_mgr_in_use_udp "${_port}" && \
@@ -4206,7 +4314,7 @@ _install_rollback() {
     fw_force_cleanup
     [ "${_xray_was}" -eq 0 ] && rm -f "${XRAY_BIN}" 2>/dev/null || true
     [ "${_argo_was}" -eq 0 ] && rm -f "${ARGO_BIN}" 2>/dev/null || true
-    rm -f "${CONFIG_FILE}" "${CONFIG_FILE}".*.bak "${STATE_FILE}".*.bak \
+    rm -f "${CONFIG_FILE}" "${CONFIG_FILE}".*.bak \
           "${_CONFIG_HASH_FILE}" "${_FW_RULES_FILE}" "${_ARGO_ENV_FILE}" "${WORK_DIR}/tunnel.yml" \
           "${WORK_DIR}/tunnel.json" "${WORK_DIR}/xray.pid" \
           /var/run/xray2go.pid /var/run/tunnel2go.pid 2>/dev/null || true
@@ -4263,7 +4371,10 @@ module_xray_install_core() {
 
     svc_apply_xray || { _install_rollback "${_xray_was}" "${_argo_was}"; return 1; }
     if [ "$(st_get '.argo.enabled')" = "true" ]; then
-        svc_apply_tunnel || { _install_rollback "${_xray_was}" "${_argo_was}"; return 1; }
+        _argo_prepare_fixed_tunnel_from_state && svc_apply_tunnel || {
+            _install_rollback "${_xray_was}" "${_argo_was}"
+            return 1
+        }
     fi
     svc_reload_daemon
 
@@ -4291,8 +4402,17 @@ module_xray_install_core() {
 
     log_info "网络调优未内置执行：为避免运行未签名第三方 root 脚本，请按需参考可信来源手动配置。"
 
-    st_persist || { log_error "state.json 写入失败"; return 1; }
-    log_ok "══ 安装完成 ══"
+    st_persist || {
+        log_error "state.json 写入失败"
+        _install_rollback "${_xray_was}" "${_argo_was}"
+        return 1
+    }
+}
+
+shortcut_is_managed() {
+    local _target
+    _target=$(readlink -- "${SHORTCUT}") || return 1
+    [ "${_target}" = xray2go ] || [ "${_target}" = "${SELF_DEST}" ]
 }
 
 module_xray_uninstall() {
@@ -4324,13 +4444,73 @@ module_xray_uninstall() {
             && log_warn "${WORK_DIR} 未能完全删除，请手动: rm -rf ${WORK_DIR}" \
             || log_ok "${WORK_DIR} 已清除"
     fi
-    rm -f "${SHORTCUT}" "${SELF_DEST}" "${SELF_DEST}.bak" 2>/dev/null || true
+    if shortcut_is_managed; then
+        rm -f -- "${SHORTCUT}" || { log_error "快捷命令清理失败"; return 1; }
+    fi
+    rm -f -- "${SELF_DEST}" "${SELF_DEST}.bak" || { log_error "管理脚本清理失败"; return 1; }
     log_ok "xray2go 卸载完成"
 }
 
+_install_main_script() (
+    local _bin_dir _stage _header _created_shortcut=0
+    _bin_dir=$(dirname "${SELF_DEST}")
+    mkdir -p -- "${_bin_dir}" || { log_error "无法创建脚本安装目录"; return 1; }
+
+    if [ -e "${SELF_DEST}" ] || [ -L "${SELF_DEST}" ]; then
+        if [ ! -f "${SELF_DEST}" ] || [ -L "${SELF_DEST}" ]; then
+            log_error "脚本安装路径被占用: ${SELF_DEST}"
+            return 1
+        fi
+    fi
+    if { [ -e "${SHORTCUT}" ] || [ -L "${SHORTCUT}" ]; } && ! shortcut_is_managed; then
+        log_error "快捷命令路径已被其他文件占用: ${SHORTCUT}"
+        return 1
+    fi
+
+    # 在目标目录所在文件系统准备新脚本，最后以 rename 原子替换。
+    _stage=$(mktemp -d "${_bin_dir}/.xray2go-update.XXXXXX") || { log_error "无法创建更新暂存目录"; return 1; }
+    trap 'rm -rf -- "${_stage}"' EXIT
+    log_step "正在下载官方 main 分支脚本..."
+    curl -q --proto '=https' -fsS --connect-timeout 10 --max-time 30 \
+        -o "${_stage}/xray2go" https://raw.githubusercontent.com/Luckylos/xray-2go/main/xray_2go.sh \
+        || { log_error "下载失败，当前脚本仍可用"; return 1; }
+    if ! IFS= read -r _header < "${_stage}/xray2go" ||
+       { [ "${_header}" != '#!/usr/bin/env bash' ] && [ "${_header}" != '#!/bin/bash' ]; } ||
+       ! BASH_ENV='' "${BASH}" -n "${_stage}/xray2go"; then
+        log_error "下载的脚本未通过 Bash 格式或语法检查"
+        return 1
+    fi
+    chmod 755 -- "${_stage}/xray2go" || { log_error "无法设置脚本执行权限"; return 1; }
+
+    local _replace=1
+    if [ -f "${SELF_DEST}" ]; then
+        if [ -x "${SELF_DEST}" ] && cmp -s -- "${_stage}/xray2go" "${SELF_DEST}"; then
+            _replace=0
+        else
+            cp -p -- "${SELF_DEST}" "${_stage}/previous" &&
+                mv -fT -- "${_stage}/previous" "${SELF_DEST}.bak" ||
+                { log_error "无法备份当前脚本"; return 1; }
+        fi
+    fi
+    if [ ! -L "${SHORTCUT}" ]; then
+        if ! ln -s -- xray2go "${_stage}/shortcut" ||
+           ! mv -nT -- "${_stage}/shortcut" "${SHORTCUT}" || [ -L "${_stage}/shortcut" ]; then
+            log_error "创建快捷命令失败: ${SHORTCUT}"
+            return 1
+        fi
+        _created_shortcut=1
+    fi
+    if [ "${_replace}" -eq 1 ] && ! mv -fT -- "${_stage}/xray2go" "${SELF_DEST}"; then
+        [ "${_created_shortcut}" -eq 0 ] || rm -f -- "${SHORTCUT}"
+        log_error "替换脚本失败"
+        return 1
+    fi
+)
+
 module_config_update_shortcut() {
-    log_warn "已禁用内置自更新：为避免未签名 root 脚本覆盖，请通过 GitHub Release/包管理器等可校验渠道手动更新。"
-    return 1
+    with_lock _install_main_script || return 1
+    log_ok "快捷方式和脚本已更新，正在重新载入管理菜单"
+    exec "${BASH}" "${SELF_DEST}"
 }
 
 module_config_update_uuid() {
@@ -4516,11 +4696,11 @@ module_show_action() {
     local _mod="${1:-}"
     if [ "${_mod}" = "all" ]; then
         config_print_nodes
-    elif [ "${_mod}" = "cforigin" ]; then
-        config_print_nodes
-        cforigin_print_cloudflare_hint
     elif module_registry_has "${_mod}"; then
-        config_print_nodes
+        config_print_nodes "${_mod}"
+        if [ "${_mod}" = "cforigin" ]; then
+            cforigin_print_cloudflare_hint
+        fi
     else
         log_error "不支持节点展示的模块: ${_mod}"
         return 1
@@ -4767,7 +4947,7 @@ _menu_toggle_xpad() {
     st_set ".xpad.${_target} = \$v" --argjson v "${_nxp}" || return 1
     config_apply || return 1
     st_persist || { log_error "state.json 写入失败"; return 1; }
-    log_ok "${_label} xPadding 已${_nxp}"; config_print_nodes
+    log_ok "${_label} xPadding 已${_nxp}"; config_print_nodes "${_target}" || true
 }
 
 _xray_runtime_status() {
@@ -4958,9 +5138,15 @@ _menu_render() {
 }
 
 install_plan_reset_defaults() {
-    local _uuid
+    local _uuid _reset
     _uuid=$(st_get '.uuid')
-    _G_STATE="${_STATE_DEFAULT}"
+    # 只重置核心认识的设置，保留扩展插件的状态和端口。
+    _reset=$(jq -c --argjson defaults "${_STATE_DEFAULT}" '
+        def extras($known): with_entries(select(.key as $k | $known | has($k) | not));
+        ((.ports // {}) | extras($defaults.ports)) as $ports
+        | $defaults + extras($defaults) | .ports += $ports
+    ' <<< "${_G_STATE}") || return 1
+    _G_STATE="${_reset}"
     _st_normalize_schema
     if [ -n "${_uuid:-}" ] && val_uuid "${_uuid}" >/dev/null 2>&1; then
         st_set '.uuid = $u' --arg u "${_uuid}" || return 1
@@ -5059,15 +5245,10 @@ preset_apply_reality_tcp_default() {
 }
 
 install_plan_has_enabled_module() {
-    [ "$(st_get '.argo.enabled')" = "true" ] && return 0
-    [ "$(st_get '.ff.enabled')" = "true" ] && [ "$(st_get '.ff.protocol')" != "none" ] && return 0
-    [ "$(st_get '.reality.enabled')" = "true" ] && return 0
-    [ "$(st_get '.vltcp.enabled')" = "true" ] && return 0
-    [ "$(st_get '.socks.enabled')" = "true" ] && return 0
-    [ "$(st_get '.http.enabled')" = "true" ] && return 0
-    [ "$(st_get '.ss2022.enabled')" = "true" ] && return 0
-    [ "$(st_get '.vlquic.enabled')" = "true" ] && return 0
-    [ "$(st_get '.cforigin.enabled')" = "true" ] && return 0
+    local _name
+    for _name in "${_PLUGIN_REGISTRY[@]}"; do
+        plugin_call "${_name}" enabled && return 0
+    done
     return 1
 }
 
@@ -5109,7 +5290,7 @@ install_plan_module_summary() {
 install_plan_render_summary() {
     clear; echo ""
     log_title "══ 自定义安装计划 ══"
-    printf "  说明      : ${C_YLW}首次部署默认进入快速向导；需要多入口或完整参数时选择高级自定义部署${C_RST}\n"
+    printf "  说明      : ${C_YLW}选择要启用的模块，完成配置后选择 11 预览并确认安装${C_RST}\n"
     printf "  当前 UUID : ${C_CYN}%s${C_RST}\n" "$(st_get '.uuid')"
     printf "  Argo      : %s\n" "$(install_plan_module_summary argo)"
     printf "  FreeFlow  : %s\n" "$(install_plan_module_summary ff)"
@@ -5129,14 +5310,14 @@ install_plan_render_summary() {
     _menu_print_action 5 "进入 SOCKS5 配置页"
     _menu_print_action 6 "进入 VLESS-XHTTP-H3 配置页"
     _menu_print_action 7 "进入 CF Origin 配置页"
+    _menu_print_action 12 "进入 HTTP 代理配置页"
+    _menu_print_action 13 "进入 Shadowsocks 2022 配置页"
     _hr
     printf "  ${C_BOLD}全局操作${C_RST}\n"
     _menu_print_action 8 "更新 UUID"
     _menu_print_action 9 "重置为初始安装计划" "${C_YLW}"
     _menu_print_action 10 "运行安装前检查"
-    _menu_print_action 11 "开始安装" "${C_GRN}"
-    _menu_print_action 12 "进入 HTTP 代理配置页"
-    _menu_print_action 13 "进入 Shadowsocks 2022 配置页"
+    _menu_print_action 11 "预览并确认安装" "${C_GRN}"
     _menu_print_action 0 "取消安装并返回主菜单" "${C_PUR}"
     _hr
 }
@@ -5828,33 +6009,28 @@ install_plan_validate() {
 }
 
 install_execute_current_plan() {
+    local _verify_client="${1:-}" _result
     install_plan_validate || return 1
-
-    if [ "$(st_get '.reality.enabled')" = "true" ] && [ "$(st_get '.argo.enabled')" = "true" ]; then
-        [ "$(port_of reality)" = "$(port_of argo)" ] &&             log_warn "Reality 端口与 Argo 回源端口相同；当前不会自动更换，请返回修改端口，否则安装阶段会失败"
-    fi
-    if [ "$(st_get '.vlquic.enabled')" = "true" ]; then
-        port_mgr_in_use_udp "$(port_of vlquic)" &&             log_warn "VLESS-XHTTP-H3 UDP/$(port_of vlquic) 已被占用"
-    fi
-    if [ "$(st_get '.ss2022.enabled')" = "true" ]; then
-        port_mgr_in_use_both "$(port_of ss2022)" &&             log_warn "Shadowsocks 2022 TCP/UDP/$(port_of ss2022) 已被占用"
-    fi
-
     if ! module_xray_install_core; then
         log_error "安装失败"
         return 1
     fi
 
-    st_persist || { log_error "state.json 写入失败"; return 1; }
-
-    if [ "$(st_get '.argo.enabled')" = "true" ]; then
-        argo_apply_fixed_tunnel_from_state || {
-            log_error "固定隧道配置失败，请返回安装计划中的 Argo 配置页修正"
-            return 1
-        }
+    log_ok "══ 安装完成，服务已启动 ══"
+    if config_print_nodes; then
+        log_info "复制上方对应节点的链接，在支持该协议及传输方式的客户端中选择从剪贴板导入。"
+    else
+        log_warn "暂未导出分享链接，请通过主菜单 9 重试，或按模块的连接参数手动配置客户端。"
     fi
-    config_print_nodes
     cforigin_print_cloudflare_hint
+    log_info "请在自己的设备上启用该节点并访问一个网页，验证从客户端到服务器的连接。"
+    if [ "${_verify_client}" = interactive ]; then
+        if prompt "已在客户端成功访问网页？(y/N): " _result && [[ "${_result:-}" == [yY] ]]; then
+            log_ok "客户端连接已由你确认"
+            return 0
+        fi
+    fi
+    log_info "客户端连接待确认，可在主菜单 9 重新查看节点和连接提示。"
 }
 
 _unified_mode_label() {
@@ -6497,6 +6673,7 @@ install_wizard_render() {
 }
 
 install_wizard_confirm() {
+    local _c
     clear; echo ""
     log_title "══ 确认部署 ══"
     printf "  UUID      : %s\n" "$(st_get '.uuid')"
@@ -6511,10 +6688,11 @@ install_wizard_confirm() {
     printf "  CF-Origin : %s\n" "$(install_plan_module_summary cforigin)"
     _hr
     printf "  ${C_YLW}安装前会再次执行完整校验；确认后才开始安装。${C_RST}\n"
-    prompt "确认开始部署？(Y/n): " _c
-    case "${_c:-y}" in
-        n|N) log_info "已取消本次部署，当前计划仍可从高级自定义部署继续调整"; return 1 ;;
-        *) install_execute_current_plan ;;
+    _install_check_port_conflicts preview || return 1
+    prompt "确认开始部署？(y/N): " _c || return 1
+    case "${_c:-}" in
+        y|Y|yes|YES) install_execute_current_plan interactive ;;
+        *) log_info "已取消本次部署，可在高级自定义部署中调整计划"; return 1 ;;
     esac
 }
 
@@ -6566,8 +6744,8 @@ install_wizard_menu() {
     while true; do
         install_wizard_render
         local _c
-        prompt "请选择部署方案 (0-3): " _c
-        case "${_c:-}" in
+        prompt "请选择部署方案 (0-3，回车选 1): " _c || return 1
+        case "${_c:-1}" in
             1) install_wizard_reality && return 0 ;;
             2) install_wizard_argo && return 0 ;;
             3) install_plan_menu && return 0 ;;
@@ -6596,14 +6774,14 @@ install_plan_menu() {
             9) install_plan_reset_defaults || true; log_info "安装计划已重置为初始状态" ;;
             10) install_plan_validate || true ;;
             11)
-                install_execute_current_plan && return 0
+                install_wizard_confirm && return 0
                 ;;
             12) unified_menu_http install || true ;;
             13) unified_menu_ss2022 install || true ;;
             0)
                 log_info "已取消安装并返回主菜单"
                 return 0 ;;
-            *) log_error "无效选项，请输入 0-12" ;;
+            *) log_error "无效选项，请输入 0-13" ;;
         esac
         _pause
     done
@@ -6652,6 +6830,7 @@ usage() {
     cat <<'EOF'
 用法:
   xray2go                 进入交互菜单
+  xray2go --help          显示帮助
   xray2go reality
   xray2go reality -p <port>
   xray_2go.sh reality
@@ -6703,7 +6882,6 @@ cli_install() {
 }
 
 cli_dispatch() {
-    parse_args "$@" || { usage; return 1; }
     case "${_CLI_ACTION:-menu}" in
         menu) menu ;;
         help) usage ;;
@@ -6716,13 +6894,18 @@ cli_dispatch() {
 # Entrypoint
 # ==============================================================================
 main() {
+    parse_args "$@" || { usage; return 1; }
+    if [ "${_CLI_ACTION}" = help ]; then
+        cli_dispatch
+        return
+    fi
     check_root
     platform_detect_init
     platform_preflight
-    st_init
+    st_init || return 1
     # 刷新内置插件并重建注册表
     plugin_refresh_runtime || return 1
-    cli_dispatch "$@"
+    cli_dispatch
 }
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
     main "$@"
