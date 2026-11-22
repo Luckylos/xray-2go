@@ -26,7 +26,7 @@ def assert_true(cond, msg):
         raise AssertionError(msg)
 
 
-def run_bash(script: str) -> str:
+def run_bash(script: str, timeout: int = 20) -> str:
     with XraySandbox() as sandbox:
         cp = subprocess.run(
             ["bash", "-lc", script],
@@ -35,7 +35,7 @@ def run_bash(script: str) -> str:
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            timeout=20,
+            timeout=timeout,
             check=True,
         )
     return cp.stdout
@@ -1396,6 +1396,89 @@ def test_required_dependency_failure_stops_before_state_setup():
     assert_true(cp.returncode != 0, cp.stdout)
     assert_true('dependency=unzip' in cp.stdout, cp.stdout)
     assert_true('dependency=jq' not in cp.stdout and 'state setup called' not in cp.stdout, cp.stdout)
+
+
+def test_argo_xhttp_profiles_and_shared_reality_inbound():
+    out = run_bash(r'''
+        source ./xray_2go.sh
+        set -e
+        st_init
+        platform_get_realip() { printf '%s\n' '203.0.113.5'; }
+        st_set '.argo.enabled=true | .argo.protocol="xhttp" | .argo.domain="argo.example.com" |
+            .reality.enabled=true | .reality.sni="target.example.com" | .reality.sid="0123456789abcdef" |
+            .reality.pbk="fixture_public_key" | .reality.pvk="fixture_private_key"'
+        plugin_refresh_runtime
+        links=$(plugin_collect_links argo)
+        [[ "$links" == *Argo-XHTTP* && "$links" != *Argo-XHTTP-Split* ]]
+        _argo_xhttp_set_profile 0 '{"server":{},"client":{}}'
+        links=$(plugin_collect_links argo)
+        [[ "$links" != *extra=* ]]
+        _argo_xhttp_set_profile 0 '{"server":{"xPaddingBytes":"200-500"},"client":{"xmux":{"maxConcurrency":1}},"split":{"port":28443,"download":{"xhttpSettings":{"extra":{"xmux":{"maxConnections":2}}}}}}'
+        config_build_inbounds | jq -e --argjson origin "$(port_of argo)" '
+            any(.[]; .port == $origin and .listen == "127.0.0.1" and .streamSettings.xhttpSettings.mode == "auto"
+              and .streamSettings.xhttpSettings.extra.xPaddingBytes == "200-500") and
+            any(.[]; .port == 28443 and .streamSettings.security == "reality" and .settings.fallbacks[0].dest == ("127.0.0.1:" + ($origin|tostring))) and
+            any(.[]; .streamSettings.security == "reality" and .settings.clients[0].flow == "xtls-rprx-vision")' >/dev/null
+        fw_desired_rules | grep -qx 28443/tcp
+        _argo_xhttp_client_stream split | jq -e '
+            .xhttpSettings.extra.xmux.maxConcurrency == 1 and
+            .xhttpSettings.extra.downloadSettings.realitySettings.password == "fixture_public_key" and
+            .xhttpSettings.extra.downloadSettings.xhttpSettings.extra.xPaddingBytes == "200-500" and
+            .xhttpSettings.extra.downloadSettings.xhttpSettings.extra.xmux.maxConnections == 2' >/dev/null
+        links=$(plugin_collect_links argo)
+        [[ "$links" == *Argo-XHTTP-Split* && "$links" != *fixture_private_key* ]]
+        printf '%s\n' "$links" | python3 -c '
+import json, sys
+from urllib.parse import parse_qs, urlsplit
+links = [urlsplit(line.strip()) for line in sys.stdin if line.strip()]
+normal = next(link for link in links if link.fragment == "Argo-XHTTP")
+split = next(link for link in links if link.fragment == "Argo-XHTTP-Split")
+ordinary = parse_qs(normal.query)
+separated = parse_qs(split.query)
+assert "downloadSettings" not in json.loads(ordinary["extra"][0])
+assert separated["mode"] == ["packet-up"]
+assert json.loads(separated["extra"][0])["downloadSettings"]["port"] == 28443
+'
+        st_set '.reality.sid="abcdef"'
+        _argo_xhttp_client_stream split | jq -e '.xhttpSettings.extra.downloadSettings.realitySettings.shortId == "abcdef"' >/dev/null
+        _argo_xhttp_set_profile 0 '{"split":{"port":28443}}'
+        _argo_xhttp_set_profile 0 '{"split":{"port":28443,"mode":"stream-one"}}' && exit 1
+        _argo_xhttp_set_profile 0 '{"client":{"xmux":{"maxConcurrency":"1-2","maxConnections":3}}}' && exit 1
+        st_set '.reality.enabled=false'
+        [[ "$(plugin_collect_links argo)" != *Argo-XHTTP-Split* ]]
+        [[ "$(fw_desired_rules)" != *28443/tcp* ]]
+        printf '%s\n' 'Argo XHTTP profiles verified'
+    ''', timeout=42)
+    assert_true('Argo XHTTP profiles verified' in out, out)
+
+
+def test_argo_xhttp_menu_and_runtime_rollback():
+    out = run_bash(r'''
+        source ./xray_2go.sh
+        set -e
+        st_init
+        st_set '.argo.enabled=true | .argo.protocol="xhttp" | .reality.enabled=true'
+        st_persist
+        printf '%s' original > "${CONFIG_FILE}"
+        _pause() { :; }
+        prompt() { IFS= read -r "$2"; }
+        _argo_xhttp_menu 0 <<< $'1\n3\n28443\n6\n0'
+        st_get '.argo.xhttp' | jq -e '.server == {} and .client == {} and (has("split") | not)' >/dev/null
+        port_mgr_in_use() { return 1; }
+        _commit_inner() {
+            [ "$(st_get '.argo.xhttp.split.port')" = 28443 ] || return 1
+            printf '%s' changed > "${CONFIG_FILE}"
+            st_persist || return 1
+            printf '%s\n' 'simulated commit failure'
+            return 1
+        }
+        if _argo_xhttp_set_profile 1 '{"split":{"port":28443}}'; then exit 1; fi
+        [ "$(cat "${CONFIG_FILE}")" = original ]
+        [ -z "$(st_get '.argo.xhttp')" ]
+        jq -e '.argo.xhttp == null' "${STATE_FILE}" >/dev/null
+        printf '%s\n' 'Argo XHTTP rollback verified'
+    ''', timeout=35)
+    assert_true('simulated commit failure' in out and 'Argo XHTTP rollback verified' in out, out)
 
 
 def test_help_runs_before_privileged_setup():

@@ -109,6 +109,29 @@ sudo ./xray_2go.sh
 
 旧版本的 `s` 若提示自更新已禁用，先按上面的下载方式运行当前 `main`，再在菜单里选择 `s`。如果快捷命令路径已被其他文件占用，菜单会提示冲突。更新已有脚本时，上一版保存在 `/usr/local/bin/xray2go.bak`。
 
+### Argo XHTTP 配置
+
+在 Argo 菜单选择 VLESS + XHTTP，再按 `x` 打开配置。可以恢复 Xray 默认参数、编辑 Extra、启用独立的 Reality 下行，以及复制客户端出站 JSON。
+
+启用分离时，选择一个独立且可从公网访问的 TCP 端口。脚本会让该端口的 Reality 下行与 Argo 上行共用本机 `/argo` 入站。原 Reality 节点继续使用自己的端口。Cloudflare Tunnel 仍使用原 Argo 回源。若云平台有安全组，请同步开放新端口。
+
+可将下列 JSON 压成一行后粘贴到「编辑模式、Extra 与下行覆盖」。`server` 配置入站 Extra，`client` 配置普通客户端和分离上行 Extra，`split.download` 覆盖分离下行参数。
+
+```json
+{
+  "mode": "auto",
+  "server": { "scMaxEachPostBytes": 1000000 },
+  "client": { "scMinPostsIntervalMs": 30, "xmux": { "maxConcurrency": "16-32" } },
+  "split": {
+    "port": 28443,
+    "mode": "packet-up",
+    "download": { "xhttpSettings": { "extra": { "xmux": { "maxConnections": 2 } } } }
+  }
+}
+```
+
+自动下行读取本机公网地址和 Reality 的 SNI、公钥及 Short ID。更换密钥后请重新导出。`split.download` 可覆盖对外地址、端口、路径、Host 和安全层。覆盖路径时，转发后的请求仍需进入同一个 `/argo` 入站。`stream-up` 需要沿途支持流式上传，分离默认使用 `packet-up`。
+
 ## 安装后的主要路径
 
 - 工作目录：`/etc/xray2go`

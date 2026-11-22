@@ -1126,31 +1126,36 @@ _plugin_snapshot_rebuild() {
             log_error "插件 inbound 失败: ${_name}"; return 1; }
         [ -n "${_ib:-}" ] || continue
 
-        local _port _listen
-        _port=$(printf '%s' "${_ib}" | jq -r '.port // empty')
-        _listen=$(printf '%s' "${_ib}" | jq -r '.listen // "0.0.0.0"')
-        _key="${_listen}:${_port}"
+        local _rows _port _listen
+        _rows=$(jq -c 'if type == "array" then .[] else . end' <<< "${_ib}") || {
+            log_error "inbounds 组装失败: ${_name}"; return 1; }
+        [ -n "${_rows}" ] || continue
+        while IFS= read -r _ib; do
+            _port=$(printf '%s' "${_ib}" | jq -r '.port // empty')
+            _listen=$(printf '%s' "${_ib}" | jq -r '.listen // "0.0.0.0"')
+            _key="${_listen}:${_port}"
 
-        if _is_wild_listen "${_listen}"; then
-            if { [ -n "${_used_wild_ports:-}" ] && printf '%s\n' "${_used_wild_ports}" | grep -qxF "${_port}"; } || \
-               { [ -n "${_used_exact_keys:-}" ] && printf '%s\n' "${_used_exact_keys}" | grep -qE ":${_port}$"; }; then
-                log_error "端口冲突: ${_key}，插件 [${_name}] 与已启用入站冲突"
-                return 1
-            fi
-            _used_wild_ports="${_used_wild_ports:+${_used_wild_ports}
+            if _is_wild_listen "${_listen}"; then
+                if { [ -n "${_used_wild_ports:-}" ] && printf '%s\n' "${_used_wild_ports}" | grep -qxF "${_port}"; } || \
+                   { [ -n "${_used_exact_keys:-}" ] && printf '%s\n' "${_used_exact_keys}" | grep -qE ":${_port}$"; }; then
+                    log_error "端口冲突: ${_key}，插件 [${_name}] 与已启用入站冲突"
+                    return 1
+                fi
+                _used_wild_ports="${_used_wild_ports:+${_used_wild_ports}
 }${_port}"
-        else
-            if { [ -n "${_used_wild_ports:-}" ] && printf '%s\n' "${_used_wild_ports}" | grep -qxF "${_port}"; } || \
-               { [ -n "${_used_exact_keys:-}" ] && printf '%s\n' "${_used_exact_keys}" | grep -qxF "${_key}"; }; then
-                log_error "端口冲突: ${_key}，插件 [${_name}] 与已启用入站冲突"
-                return 1
-            fi
-            _used_exact_keys="${_used_exact_keys:+${_used_exact_keys}
+            else
+                if { [ -n "${_used_wild_ports:-}" ] && printf '%s\n' "${_used_wild_ports}" | grep -qxF "${_port}"; } || \
+                   { [ -n "${_used_exact_keys:-}" ] && printf '%s\n' "${_used_exact_keys}" | grep -qxF "${_key}"; }; then
+                    log_error "端口冲突: ${_key}，插件 [${_name}] 与已启用入站冲突"
+                    return 1
+                fi
+                _used_exact_keys="${_used_exact_keys:+${_used_exact_keys}
 }${_key}"
-        fi
+            fi
 
-        _ibs=$(printf '%s' "${_ibs}" | jq --argjson ib "${_ib}" '. + [$ib]') \
-            || { log_error "inbounds 组装失败: ${_name}"; return 1; }
+            _ibs=$(printf '%s' "${_ibs}" | jq --argjson ib "${_ib}" '. + [$ib]') \
+                || { log_error "inbounds 组装失败: ${_name}"; return 1; }
+        done <<< "${_rows}"
     done
 
     _PLUGIN_SNAPSHOT_INBOUNDS="${_ibs}"
@@ -1207,7 +1212,7 @@ plugin_collect_inbounds() {
 plugin_install_builtins() {
     mkdir -p "${PLUGIN_DIR}"
     # 内置插件属于脚本本体的一部分：每次运行刷新，确保主脚本更新能同步下发。
-    # 用户自定义插件请使用其它文件名，避免与 argo/ff/reality/vltcp/socks/http/ss2022 重名。
+    # 用户自定义插件请使用其它文件名，避免与下列内置插件重名。
     _plugin_write_argo
     _plugin_write_ff
     _plugin_write_reality
@@ -1227,6 +1232,85 @@ plugin_install_builtins() {
 #   - 插件不调用 svc_* 或 fw_*（由主程序调度）
 #   - 端口全部通过 port_of <name> 读取，不硬编码
 
+# Argo 分离节点沿用 Argo 的回源路径。额外的 REALITY 监听仅负责回落到该入站。
+_argo_xhttp_split_active() {
+    st_get '.argo.enabled == true and .argo.auth_protocol == "vless" and
+        .argo.protocol == "xhttp" and .reality.enabled == true and
+        (.argo.xhttp.split | type == "object")' | grep -qx true
+}
+
+_argo_xhttp_server_extra() {
+    local _legacy='{}'
+    [ "$(xpad_of argo)" != true ] || _legacy="${_XPAD_JSON}"
+    st_get '.argo.xhttp.server // $legacy' --argjson legacy "${_legacy}"
+}
+
+_argo_xhttp_client_stream() {
+    local _kind="$1" _profile _server _address='' _down='{}'
+    _profile=$(st_get '.argo.xhttp // {}') || return 1
+    _server=$(_argo_xhttp_server_extra | jq -c 'with_entries(select(.key | IN(
+        "xPadding"+"Bytes", "xPaddingBytes", "xPaddingObfsMode", "xPaddingKey", "xPaddingHeader",
+        "xPaddingPlacement", "xPaddingMethod", "scMaxEachPostBytes", "sessionPlacement", "sessionKey",
+        "seqPlacement", "seqKey", "uplinkDataPlacement", "uplinkDataKey", "uplinkChunkSize", "uplinkHTTPMethod"
+    )))') || return 1
+    if [ "${_kind}" = split ]; then
+        _argo_xhttp_split_active || return 1
+        _address=$(jq -r '.split.download.address // empty' <<< "${_profile}")
+        [ -n "${_address}" ] || _address=$(platform_get_realip)
+        _address="${_address#[}"; _address="${_address%]}"
+        [ -n "${_address}" ] || return 1
+        _down=$(jq -ce --arg address "${_address}" --arg sni "$(st_get '.reality.sni')" \
+            --arg public "$(st_get '.reality.pbk')" --arg sid "$(st_get '.reality.sid')" \
+            --argjson server "${_server}" '
+            .split as $split | ($split.download // {}) as $override |
+            {address:$address, port:$split.port, network:"xhttp", security:"reality",
+             xhttpSettings:{path:"/argo", extra:$server}} * $override |
+            if .security == "reality" then
+                .realitySettings = ({serverName:$sni, fingerprint:"chrome", shortId:$sid}
+                    + (if ($override.realitySettings // {} | has("publicKey")) then {} else {password:$public} end)
+                    + ($override.realitySettings // {})) |
+                select((.realitySettings.password // .realitySettings.publicKey // "") | length > 0)
+            else del(.realitySettings) end
+        ' <<< "${_profile}") || return 1
+    fi
+    jq -c --arg split "${_kind}" --arg host "$(st_get '.argo.domain')" \
+        --argjson server "${_server}" --argjson down "${_down}" '
+        ($server * (.client // {})) as $extra |
+        {network:"xhttp", security:"tls", tlsSettings:{serverName:$host,fingerprint:"chrome"},
+         xhttpSettings:{host:$host,path:"/argo",mode:(.mode // "auto")}} |
+        if $split == "split" then
+            .xhttpSettings.mode = ($profile.split.mode // "packet-up") |
+            .xhttpSettings.extra = ($extra + {downloadSettings:$down})
+        elif ($extra | length) > 0 then .xhttpSettings.extra = $extra
+        else . end
+    ' --argjson profile "${_profile}" <<< "${_profile}"
+}
+
+_argo_xhttp_link() {
+    local _kind="$1" _stream _mode _extra _domain _suffix=''
+    _stream=$(_argo_xhttp_client_stream "${_kind}") || return 1
+    _mode=$(jq -r '.xhttpSettings.mode' <<< "${_stream}") || return 1
+    _extra=$(jq -r '.xhttpSettings.extra // empty | @uri' <<< "${_stream}") || return 1
+    _domain=$(st_get '.argo.domain')
+    [ "${_kind}" != split ] || _suffix=-Split
+    printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=chrome&type=xhttp&host=%s&path=%%2Fargo&mode=%s%s#Argo-XHTTP%s\n' \
+        "$(st_get '.uuid')" "$(st_get '.cfip')" "$(st_get '.cfport')" "${_domain}" "${_domain}" \
+        "${_mode}" "${_extra:+&extra=${_extra}}" "${_suffix}"
+}
+
+_argo_xhttp_split_inbound() {
+    local _private
+    _private=$(st_get '.reality.pvk')
+    [ -n "${_private}" ] && [ "${_private}" != null ] || return 0
+    jq -n --argjson port "$(st_get '.argo.xhttp.split.port')" \
+        --arg dest "127.0.0.1:$(port_of argo)" --arg uuid "$(st_get '.uuid')" \
+        --arg sni "$(st_get '.reality.sni')" --arg private "${_private}" --arg sid "$(st_get '.reality.sid')" '
+        {listen:"::",port:$port,protocol:"vless",
+         settings:{clients:[{id:$uuid}],decryption:"none",fallbacks:[{dest:$dest,xver:0}]},
+         streamSettings:{network:"raw",security:"reality",
+             realitySettings:{target:($sni+":443"),serverNames:[$sni],privateKey:$private,shortIds:[$sid]}}}'
+}
+
 _plugin_write_argo() {
 cat > "${PLUGIN_DIR}/argo.sh" << 'PLUGIN_EOF'
 # xray-2go plugin: argo
@@ -1239,6 +1323,9 @@ _plg_argo_enabled() {
 _plg_argo_ports() {
     _plg_argo_enabled || return 0
     port_of argo
+    if _argo_xhttp_split_active; then
+        printf '\n%s/tcp\n' "$(st_get '.argo.xhttp.split.port')"
+    fi
 }
 
 _plg_argo_inbound() {
@@ -1250,12 +1337,7 @@ _plg_argo_inbound() {
     _uuid=$(st_get '.uuid')
     _password=$(st_get '.argo.trojan_password')
     [ -n "${_password:-}" ] || _password="${_uuid}"
-    local _xpad
-    if [ "$(xpad_of argo)" = "true" ]; then
-        _xpad=$(printf '%s' "${_XPAD_JSON}" | jq -c .)
-    else
-        _xpad='{}'
-    fi
+    local _xpad _origin _split
     case "${_auth}:${_proto}" in
         trojan:ws)
             jq -n --argjson port "${_port}" --arg password "${_password}" '{
@@ -1265,12 +1347,21 @@ _plg_argo_inbound() {
         trojan:*)
             log_error "Trojan Argo 当前仅支持 WS 传输"; return 1 ;;
         vless:xhttp)
-            jq -n --argjson port "${_port}" --arg uuid "${_uuid}" \
-                   --arg mode "auto" --argjson x "${_xpad}" '{
+            _xpad=$(_argo_xhttp_server_extra) || return 1
+            _origin=$(jq -n --argjson port "${_port}" --arg uuid "${_uuid}" --argjson x "${_xpad}" '{
                 port:$port, listen:"127.0.0.1", protocol:"vless",
                 settings:{clients:[{id:$uuid}], decryption:"none"},
                 streamSettings:{network:"xhttp",
-                    xhttpSettings:({path:"/argo", mode:$mode} + $x)}}' ;;
+                    xhttpSettings:({path:"/argo", mode:"auto"} +
+                        (if ($x|length)>0 then {extra:$x} else {} end))}}') || return 1
+            if _argo_xhttp_split_active; then
+                _split=$(_argo_xhttp_split_inbound) || return 1
+            fi
+            if [ -n "${_split:-}" ]; then
+                jq -n --argjson origin "${_origin}" --argjson split "${_split}" '[$origin, $split]'
+            else
+                printf '%s\n' "${_origin}"
+            fi ;;
         *)
             jq -n --argjson port "${_port}" --arg uuid "${_uuid}" '{
                 port:$port, listen:"127.0.0.1", protocol:"vless",
@@ -1300,6 +1391,13 @@ _plg_argo_link() {
     [ "$(xpad_of argo)" = "true" ] && _xqs="${_XPAD_QS}" || _xqs=""
     case "${_proto}" in
         xhttp)
+            if st_get '.argo.xhttp | type' | grep -qx object; then
+                _argo_xhttp_link normal || return 1
+                if _argo_xhttp_split_active; then
+                    _argo_xhttp_link split || log_warn "Argo XHTTP 分离节点暂不可导出，请检查 Reality 公钥和下行地址"
+                fi
+                return 0
+            fi
             if [ -n "${_xqs}" ]; then
                 printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=chrome&type=xhttp&host=%s&path=%%2Fargo&mode=auto&extra=%%7B%s%%7D#Argo-XHTTP\n' \
                     "${_uuid}" "${_cfip}" "${_cfport}" "${_domain}" "${_domain}" "${_xqs}"
@@ -3274,7 +3372,7 @@ module_argo_uninstall_inner() {
     fi
     rm -f "${ARGO_BIN}" "${WORK_DIR}/tunnel.yml" \
           "${WORK_DIR}/tunnel.json" "${_ARGO_ENV_FILE}" 2>/dev/null || true
-    st_set '.argo.enabled = false | .argo.domain = null | .argo.token = null | .argo.cred_b64 = null | .argo.mode = "fixed" | .argo.protocol = "ws" | .argo.auth_protocol = "vless" | .argo.trojan_password = ""' || return 1
+    st_set '.argo.enabled = false | .argo.domain = null | .argo.token = null | .argo.cred_b64 = null | .argo.mode = "fixed" | .argo.protocol = "ws" | .argo.auth_protocol = "vless" | .argo.trojan_password = "" | del(.argo.xhttp)' || return 1
     _module_disable_commit Argo || return 1
     log_ok "Argo 已完全卸载"
 }
@@ -6133,6 +6231,147 @@ _unified_runtime_only_fn() {
     fi
 }
 
+_argo_xhttp_validate_profile() {
+    jq -ces '
+        def only($allowed): type == "object" and (keys_unsorted - $allowed) == [];
+        def port: type == "number" and floor == . and . >= 1 and . <= 65535;
+        def bounds:
+            if type == "number" then [., .]
+            elif type == "string" and test("^[0-9]+(-[0-9]+)?$") then split("-") | map(tonumber)
+            else [] end;
+        def range($min): bounds as $v | ($v|length) > 0 and
+            all($v[]; floor == . and . >= $min and . <= 2147483647) and $v[0] <= $v[-1];
+        def xmux:
+            only(["maxConcurrency","maxConnections","cMaxReuseTimes","hMaxRequestTimes","hMaxReusableSecs","hKeepAlivePeriod"]) and
+            all(to_entries[]; if .key == "hKeepAlivePeriod" then
+                .value | type == "number" and floor == . and . >= -1 and . <= 2147483647
+            else .value | range(0) end) and
+            ([.maxConcurrency, .maxConnections] | map(select((bounds | max // 0) > 0)) | length <= 1);
+        def extra:
+            type == "object" and (has("downloadSettings") | not) and ((.xmux // {}) | xmux) and
+            all(to_entries[]; if (.key | IN("xPaddingBytes","scMaxEachPostBytes")) then
+                .value | range(1)
+            elif .key == "scMinPostsIntervalMs" then .value | . == -1 or range(0)
+            elif .key == "noGRPCHeader" then .value | type == "boolean" else true end);
+        def download:
+            only(["address","port","network","security","realitySettings","tlsSettings","xhttpSettings","sockopt"]) and
+            ((.address // "") | type == "string" and test("^[a-zA-Z0-9_.:\\[\\]-]*$")) and
+            ((.port // 1) | port) and ((.network // "xhttp") == "xhttp") and
+            ((.security // "reality") | IN("reality","tls","none")) and
+            ((.realitySettings // {}) | only(["serverName","fingerprint","password","publicKey","shortId","spiderX"]) and all(.[]; type == "string")) and
+            ((.tlsSettings // {}) | type == "object" and (has("certificates") | not)) and
+            ((.sockopt // {}) | type == "object") and
+            ((.xhttpSettings // {}) | only(["path","host","extra"]) and
+                ((.path // "/argo") | type == "string" and startswith("/")) and
+                ((.host // "") | type == "string") and ((.extra // {}) | extra));
+        if length == 1 and (.[0] | only(["mode","server","client","split"]) and
+            ((.mode // "auto") | IN("auto","packet-up","stream-up","stream-one")) and
+            ((.server // {}) | extra) and ((.client // {}) | extra) and
+            (if .split == null then true else .split | only(["port","mode","download"]) and
+                (.port | port) and ((.mode // "packet-up") | IN("packet-up","stream-up")) and
+                ((.download // {}) | download) end)) then .[0] else error("invalid XHTTP profile") end
+    ' <<< "$1" 2>/dev/null
+}
+
+_argo_xhttp_apply_profile() {
+    st_set '.argo.xhttp = $profile' --argjson profile "$1" || return 1
+    if [ "$(st_get '.argo.enabled')" = true ]; then
+        _commit_inner
+    else
+        st_persist
+    fi
+}
+
+_argo_xhttp_set_profile() {
+    local _runtime="$1" _raw="$2" _profile _port _old_port=''
+    if [ "${_raw}" = null ]; then
+        _profile=null
+    else
+        _profile=$(_argo_xhttp_validate_profile "${_raw}") || {
+            log_error "XHTTP JSON 无效，请检查模式、端口及 Extra 参数"
+            return 1
+        }
+    fi
+    _port=$(jq -r '.split.port // empty' <<< "${_profile}") || return 1
+    if [ -n "${_port}" ]; then
+        [ "$(st_get '.reality.enabled')" = true ] || { log_error "请先启用本机 Reality"; return 1; }
+        if [ "${_port}" = "$(port_of argo)" ] || [ "${_port}" = "$(port_of reality)" ]; then
+            log_error "分离下行端口须与 Argo 回源和 Reality 端口不同"
+            return 1
+        fi
+        if _argo_xhttp_split_active; then _old_port=$(st_get '.argo.xhttp.split.port'); fi
+        if [ "${_port}" != "${_old_port}" ] && port_mgr_in_use "${_port}"; then
+            log_error "分离下行端口已被占用: ${_port}"
+            return 1
+        fi
+    fi
+    if [ "${_runtime}" = 1 ]; then
+        _transaction_run "更新 Argo XHTTP" _argo_xhttp_apply_profile "${_profile}" || return 1
+        log_ok "Argo XHTTP 配置已保存"
+    else
+        st_set '.argo.xhttp = $profile' --argjson profile "${_profile}" || return 1
+        log_ok "Argo XHTTP 已写入安装计划"
+    fi
+}
+
+_argo_xhttp_export_json() {
+    local _stream
+    _stream=$(_argo_xhttp_client_stream "$1") || return 1
+    jq -n --arg address "$(st_get '.cfip')" --argjson port "$(st_get '.cfport')" \
+        --arg uuid "$(st_get '.uuid')" --argjson stream "${_stream}" '
+        {protocol:"vless",settings:{vnext:[{address:$address,port:$port,users:[{id:$uuid,encryption:"none"}]}]},
+         streamSettings:$stream}'
+}
+
+_argo_xhttp_menu() {
+    local _runtime="$1" _choice _profile _port
+    if [ "$(st_get '.argo.protocol')" != xhttp ] || [ "$(st_get '.argo.auth_protocol')" != vless ]; then
+        log_warn "请先选择 Argo 的 VLESS XHTTP 传输"
+        return 1
+    fi
+    while true; do
+        log_title "══ Argo XHTTP 配置 ══"
+        _menu_print_action 1 "使用 Xray 默认参数（auto，清空 Extra 和分离）"
+        _menu_print_action 2 "编辑模式、Extra 与下行覆盖（单行 JSON）"
+        _menu_print_action 3 "启用分离下行并引用本机 Reality"
+        _menu_print_action 4 "显示客户端出站 JSON"
+        _menu_print_action 5 "恢复旧版 xPadding 配置"
+        _menu_print_action 6 "关闭分离，保留 Extra"
+        _menu_print_back
+        prompt "请选择操作 (0-6): " _choice || return 1
+        case "${_choice}" in
+            0) return 0 ;;
+            1) _argo_xhttp_set_profile "${_runtime}" '{"server":{},"client":{}}' ;;
+            2)
+                st_get '.argo.xhttp // {}' | jq -c .
+                log_info 'JSON 字段: mode, server（入站 Extra）, client（客户端 Extra）, split（port/mode/download）'
+                prompt '粘贴单行 JSON（回车取消）: ' _profile || return 1
+                [ -z "${_profile}" ] || _argo_xhttp_set_profile "${_runtime}" "${_profile}"
+                ;;
+            3)
+                prompt 'Reality 分离下行端口（独立于现有 Reality，回车取消）: ' _port || return 1
+                [ -n "${_port}" ] || continue
+                _port=$(val_port "${_port}") || continue
+                _profile=$(st_get '.argo.xhttp // {} | .split.port = ($port | tonumber)' --arg port "${_port}") || continue
+                _argo_xhttp_set_profile "${_runtime}" "${_profile}"
+                ;;
+            4)
+                _argo_xhttp_export_json normal || log_warn "无法生成普通 XHTTP 出站 JSON"
+                if _argo_xhttp_split_active; then
+                    _argo_xhttp_export_json split || log_warn "无法生成分离出站 JSON，请检查 Reality 公钥和下行地址"
+                fi
+                ;;
+            5) _argo_xhttp_set_profile "${_runtime}" null ;;
+            6)
+                _profile=$(st_get '.argo.xhttp | if type == "object" then del(.split) else null end')
+                _argo_xhttp_set_profile "${_runtime}" "${_profile:-null}"
+                ;;
+            *) log_error "无效选项，请按提示输入" ;;
+        esac
+        _pause
+    done
+}
+
 unified_menu_argo() {
     local _mode="${1:-install}" _runtime=0
     _unified_mode_is_runtime "${_mode}" && { _runtime=1; _manage_module_entry_check || return; }
@@ -6168,8 +6407,9 @@ unified_menu_argo() {
         _menu_print_action 5 "修改密钥/凭证"
         _menu_print_action 6 "修改入站认证（VLESS / Trojan）"
         _menu_print_action 7 "修改 Trojan 密码（仅 Trojan）"
-        _menu_print_action 8 "切换 xPadding（仅 XHTTP）"
+        _menu_print_action 8 "切换旧版 xPadding（仅 XHTTP）"
         _menu_print_action 9 "查看当前节点摘要"
+        _menu_print_action x "XHTTP 默认参数、Extra 和上下行分离"
         if [ "${_runtime}" -eq 1 ]; then
             _hr
             _menu_print_action r "重启隧道服务"
@@ -6179,7 +6419,7 @@ unified_menu_argo() {
         fi
         _menu_print_back
         _hr
-        prompt "请选择操作 $( [ "${_runtime}" -eq 1 ] && printf '(0-9/r/h/v/u)' || printf '(0-9)' ): " _c
+        prompt "请选择操作 $( [ "${_runtime}" -eq 1 ] && printf '(0-9/x/r/h/v/u)' || printf '(0-9/x)' ): " _c
         case "${_c:-}" in
             1) _unified_toggle_or_plan "${_runtime}" argo "${_en}" install_plan_argo_toggle || true ;;
             2) _unified_dispatch_or_plan "${_runtime}" argo update_protocol install_plan_argo_update_protocol || true ;;
@@ -6188,8 +6428,14 @@ unified_menu_argo() {
             5) _unified_dispatch_or_plan "${_runtime}" argo update_auth install_plan_argo_update_auth || true ;;
             6) _unified_dispatch_or_plan "${_runtime}" argo update_auth_protocol install_plan_argo_update_auth_protocol || true ;;
             7) _unified_dispatch_or_plan "${_runtime}" argo update_trojan_password install_plan_argo_update_trojan_password || true ;;
-            8) _unified_runtime_fn_or_plan "${_runtime}" install_plan_argo_toggle_xpad _menu_toggle_xpad argo Argo || true ;;
+            8)
+                if st_get '.argo.xhttp.server | type' | grep -qx object; then
+                    log_info "当前由 XHTTP 配置管理 Padding，请在 x 菜单编辑 Extra 或恢复旧版设置"
+                else
+                    _unified_runtime_fn_or_plan "${_runtime}" install_plan_argo_toggle_xpad _menu_toggle_xpad argo Argo || true
+                fi ;;
             9) log_info "Argo: ${_summary}" ;;
+            x) _argo_xhttp_menu "${_runtime}" ;;
             r) _unified_runtime_only_fn "${_runtime}" _module_action_or_continue argo restart || true ;;
             h) _unified_runtime_only_fn "${_runtime}" argo_check_health || true ;;
             v) _unified_runtime_only_fn "${_runtime}" _module_action_or_continue argo show || true ;;
