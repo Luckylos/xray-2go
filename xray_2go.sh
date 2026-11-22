@@ -226,24 +226,33 @@ platform_pkg_require() {
     command -v "${_bin}" >/dev/null 2>&1 && return 0
     log_step "安装依赖: ${_pkg}"
     local _rc=0
-    if   command -v apt-get >/dev/null 2>&1; then
-        if ! find /var/cache/apt/pkgcache.bin -mtime -1 >/dev/null 2>&1; then
-            DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1 || true
+    if command -v apt-get >/dev/null 2>&1; then
+        if ! DEBIAN_FRONTEND=noninteractive apt-get install -y "${_pkg}" >/dev/null; then
+            log_step "刷新 APT 软件包索引后重试: ${_pkg}"
+            if DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null; then
+                DEBIAN_FRONTEND=noninteractive apt-get install -y "${_pkg}" >/dev/null || _rc=$?
+            else
+                log_error "APT 软件包索引刷新失败"
+                _rc=1
+            fi
         fi
-        DEBIAN_FRONTEND=noninteractive apt-get install -y "${_pkg}" >/dev/null 2>&1; _rc=$?
-    elif command -v dnf  >/dev/null 2>&1; then dnf install -y "${_pkg}" >/dev/null 2>&1; _rc=$?
-    elif command -v yum  >/dev/null 2>&1; then yum install -y "${_pkg}" >/dev/null 2>&1; _rc=$?
-    elif command -v apk  >/dev/null 2>&1; then apk add       "${_pkg}" >/dev/null 2>&1; _rc=$?
-    else die "未找到包管理器"; fi
+    elif command -v dnf >/dev/null 2>&1; then dnf install -y "${_pkg}" >/dev/null || _rc=$?
+    elif command -v yum >/dev/null 2>&1; then yum install -y "${_pkg}" >/dev/null || _rc=$?
+    elif command -v apk >/dev/null 2>&1; then apk add       "${_pkg}" >/dev/null || _rc=$?
+    else
+        log_error "未找到包管理器"
+        return 1
+    fi
     hash -r 2>/dev/null || true
-    [ "${_rc}" -ne 0 ] && die "${_pkg} 安装失败"
-    command -v "${_bin}" >/dev/null 2>&1 || die "${_bin} 安装后仍不可用"
+    [ "${_rc}" -eq 0 ] || { log_error "${_pkg} 安装失败"; return 1; }
+    command -v "${_bin}" >/dev/null 2>&1 || { log_error "${_bin} 安装后仍不可用"; return 1; }
     log_ok "${_pkg} 已就绪"
 }
 
 platform_preflight() {
     log_step "依赖预检..."
-    for _d in curl unzip jq; do platform_pkg_require "${_d}"; done
+    local _d
+    for _d in curl unzip jq; do platform_pkg_require "${_d}" || return 1; done
     command -v xxd    >/dev/null 2>&1 || platform_pkg_require "xxd" "xxd" 2>/dev/null \
         || log_info "xxd 未安装，shortId 将使用内置随机源"
     command -v openssl >/dev/null 2>&1 || log_info "openssl 未安装，shortId 将使用内置随机源"
@@ -4227,8 +4236,8 @@ download_cloudflared() {
     # 官方最佳实践优先：使用 Cloudflare 软件仓库/系统包管理器安装 cloudflared，避免脚本自管裸二进制校验链。
     log_step "通过系统包管理器安装 cloudflared..."
     if command -v apt-get >/dev/null 2>&1; then
-        platform_pkg_require ca-certificates update-ca-certificates
-        platform_pkg_require curl curl
+        platform_pkg_require ca-certificates update-ca-certificates || return 1
+        platform_pkg_require curl curl || return 1
         mkdir -p /usr/share/keyrings
         curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg \
             -o /usr/share/keyrings/cloudflare-main.gpg \
@@ -4336,7 +4345,7 @@ _install_rollback() {
 module_xray_install_core() {
     local _xray_was=0 _argo_was=0
     clear; log_title "══════════ 安装 Xray-2go ══════════"
-    platform_preflight
+    platform_preflight || return 1
     mkdir -p "${WORK_DIR}" && chmod 750 "${WORK_DIR}"
     # 确保现有敏感文件权限正确
     [ -f "${STATE_FILE}" ]    && chmod 600 "${STATE_FILE}"    2>/dev/null || true
@@ -6901,7 +6910,7 @@ main() {
     fi
     check_root
     platform_detect_init
-    platform_preflight
+    platform_preflight || return 1
     st_init || return 1
     # 刷新内置插件并重建注册表
     plugin_refresh_runtime || return 1

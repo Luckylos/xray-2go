@@ -1331,6 +1331,73 @@ def test_wizard_default_previews_ports_before_confirming_install():
     assert_true(out.index('443/tcp') < out.index('install invoked'), out)
 
 
+def test_apt_dependency_retries_with_refreshed_index():
+    out = run_bash(r'''
+        source ./xray_2go.sh
+        refreshed=0
+        find() { return 0; }
+        apt-get() {
+            case "$1" in
+                install)
+                    printf '%s
+' 'apt install' >&2
+                    if [ "$refreshed" = 0 ]; then
+                        printf '%s\n' 'E: fixture package download returned 404' >&2
+                        return 100
+                    fi
+                    fixture_dependency() { :; }
+                    ;;
+                update)
+                    printf '%s\n' 'apt update' >&2
+                    refreshed=1
+                    ;;
+                *) return 2 ;;
+            esac
+        }
+        platform_pkg_require fixture_dependency || exit 1
+        platform_pkg_require fixture_dependency
+    ''')
+    assert_true('E: fixture package download returned 404' in out, out)
+    assert_true(out.count('apt install') == 2 and out.count('apt update') == 1, out)
+    assert_true(out.count('fixture_dependency 已就绪') == 1, out)
+
+
+def test_optional_dependency_failure_does_not_abort_preflight():
+    out = run_bash(r'''
+        source ./xray_2go.sh
+        command() {
+            if [ "$1" = '-v' ] && [ "$2" = xxd ]; then return 1; fi
+            if [ "$1" = '-v' ] && [ "$2" = apt-get ]; then return 0; fi
+            builtin command "$@"
+        }
+        curl() { :; }
+        unzip() { :; }
+        jq() { :; }
+        apt-get() { return 100; }
+        platform_preflight
+    ''')
+    assert_true('xxd 未安装' in out and '依赖预检通过' in out, out)
+
+
+def test_required_dependency_failure_stops_before_state_setup():
+    cp = run_bash_result(r'''
+        source ./xray_2go.sh
+        check_root() { :; }
+        platform_detect_os() { :; }
+        platform_detect_init() { :; }
+        platform_detect_arch() { :; }
+        platform_pkg_require() {
+            printf 'dependency=%s\n' "$1"
+            [ "$1" != unzip ]
+        }
+        st_init() { printf '%s\n' 'state setup called'; }
+        main
+    ''')
+    assert_true(cp.returncode != 0, cp.stdout)
+    assert_true('dependency=unzip' in cp.stdout, cp.stdout)
+    assert_true('dependency=jq' not in cp.stdout and 'state setup called' not in cp.stdout, cp.stdout)
+
+
 def test_help_runs_before_privileged_setup():
     out = run_bash(r'''
         source ./xray_2go.sh
