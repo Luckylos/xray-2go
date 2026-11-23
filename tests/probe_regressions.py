@@ -87,6 +87,67 @@ NEW_SCRIPT
     assert_true('new menu loaded' in out and 'old menu resumed' not in out, out)
 
 
+def test_runtime_script_update_restores_previous_backup_on_failure_and_signal():
+    run_bash(r'''
+        source ./xray_2go.sh
+        set -e
+        mkdir -p "$(dirname "$SELF_DEST")"
+        printf 'current\n' > "$SELF_DEST"
+        printf 'previous\n' > "$SELF_DEST.bak"
+        ln -s "$SELF_DEST" "$SHORTCUT"
+        curl() {
+            while [[ $1 != -o ]]; do shift; done
+            printf '#!/usr/bin/env bash\nexit 0\n' > "$2"
+        }
+        mv() {
+            if [[ ${@: -2:1} == */xray2go && ${@: -1} == "$SELF_DEST" ]]; then
+                if [[ $scenario == replace ]]; then return 1; fi
+                command mv "$@" || return 1
+                if [[ $scenario == parent_term ]]; then
+                    kill -TERM "$supervisor"
+                    sleep .2
+                else
+                    kill -s "$scenario" "$BASHPID"
+                fi
+                return
+            fi
+            command mv "$@"
+        }
+        for scenario in replace INT TERM; do
+            if ( _install_main_script ); then exit 1; fi
+            [[ $(<"$SELF_DEST") == current && $(<"$SELF_DEST.bak") == previous ]] || exit 1
+        done
+        (
+            trap '_trap_int' TERM
+            supervisor=$BASHPID scenario=parent_term
+            module_config_update_shortcut
+        ) && exit 1
+        [[ $(<"$SELF_DEST") == current && $(<"$SELF_DEST.bak") == previous ]]
+    ''')
+
+
+def test_argo_domain_probe_reports_http_and_obeys_total_budget():
+    run_bash(r'''
+        source ./xray_2go.sh
+        set -e
+        st_init
+        st_set '.argo.domain="origin.fixture.invalid"'
+        curl() {
+            [[ "$*" == *'--max-time 15'* ]] || return 1
+            printf '%s' "$http_status"
+        }
+        http_status=404
+        output=$(argo_check_health)
+        [[ $output == *'HTTP 404'* && $output == *'客户端'* ]]
+        http_status=502
+        if output=$(argo_check_health 2>&1); then exit 1; fi
+        [[ $output == *'HTTP 502'* ]]
+        http_status=000
+        if output=$(argo_check_health 2>&1); then exit 1; fi
+        [[ $output == *'未收到 HTTP 响应'* ]]
+    ''', timeout=20)
+
+
 def test_runtime_script_update_leaves_existing_files_on_failure():
     out = run_bash(r'''
         source ./xray_2go.sh
@@ -186,7 +247,6 @@ def test_uninstall_only_removes_managed_shortcut():
         is_systemd() { return 1; }
         lifecycle_rollback_sysctl() { :; }
         lifecycle_rollback_hosts() { :; }
-        lifecycle_cleanup_cloudflared() { :; }
         printf '%s\n' 'existing command' > "${SHORTCUT}"
         module_xray_uninstall
         grep -qx 'existing command' "${SHORTCUT}"
@@ -490,6 +550,30 @@ def test_firewall_does_not_mark_preexisting_rules_as_managed():
     assert_true('pre-existing rule is not script-owned; do not mark it as managed' in TEXT, "pre-existing rules should not be marked as script-managed")
 
 
+def test_firewalld_preserves_preexisting_runtime_and_permanent_rules():
+    run_bash(r'''
+        source ./xray_2go.sh
+        set -e
+        mkdir -p "$WORK_DIR"
+        firewall-cmd() {
+            case "$*" in
+                '--permanent --list-ports') printf '29002/tcp\n' ;;
+                '--list-ports') printf '29001/tcp\n' ;;
+                --query-port=*) return 1 ;;
+                '--permanent --add-port=29003/tcp'|'--add-port=29003/tcp') printf '%s\n' "$*" >> "$WORK_DIR/changes" ;;
+                *) return 1 ;;
+            esac
+        }
+        _fw_open_port_backend firewalld 29001 tcp
+        _fw_open_port_backend firewalld 29002 tcp
+        [[ ! -e $_FW_RULES_FILE && ! -e $WORK_DIR/changes ]]
+        _fw_open_port_backend firewalld 29003 tcp
+        grep -qx 'firewalld:29003/tcp' "$_FW_RULES_FILE"
+        grep -qx -- '--permanent --add-port=29003/tcp' "$WORK_DIR/changes"
+        grep -qx -- '--add-port=29003/tcp' "$WORK_DIR/changes"
+    ''')
+
+
 def test_secret_prompt_exists():
     assert_true('prompt_secret()' in TEXT, "prompt_secret helper missing")
     for label in ["Cloudflare API Token", "Cloudflare Global API Key", "Argo 固定 Tunnel token", "私钥路径"]:
@@ -502,10 +586,8 @@ def test_home_fallback_is_initialized_for_process_substitution_runs():
         unset HOME
         source ./xray_2go.sh
         printf 'home=%s\\n' "${HOME}"
-        lifecycle_cleanup_cloudflared
-        printf 'cleanup-ok\\n'
     """)
-    assert_true('home=' in out and 'cleanup-ok' in out, 'script should survive unset HOME and cloudflared cleanup path')
+    assert_true('home=/' in out, 'script should initialize HOME when unset')
 
 
 def test_backup_retention_two():
@@ -548,8 +630,7 @@ def test_firewall_sync_fails_closed_and_prefers_active_managers():
     assert_true('_failed=0' in TEXT and '_fw_open_port "${_rp}" "${_rproto}" || _failed=1' in TEXT, "fw_reconcile must track firewall open failures")
     assert_true('部分防火墙规则同步失败' in TEXT, "fw_reconcile must report partial firewall failures")
     close_body = TEXT[TEXT.index('_fw_close_port()'):TEXT.index('fw_reconcile()')]
-    assert_true('for _handle in $(nft -a list chain inet xray2go input' in close_body, "nft cleanup must delete all matching handles")
-    assert_true('head -1' not in close_body, "nft cleanup must not delete only the first matching handle")
+    assert_true('[[ "${_handle}" =~ ^[0-9]+$ ]] || return 1' in close_body, "nft cleanup must preserve ambiguous duplicate rules and their ledger entry")
 
 
 def test_config_detects_wildcard_listen_conflicts_and_filters_links():
@@ -601,7 +682,7 @@ def test_argo_env_final_token_validation_and_menu_install_state():
 def test_install_service_and_firewall_fail_closed_status():
     install_body = TEXT[TEXT.index('module_xray_install_core()'):TEXT.index('module_xray_uninstall()')]
     helper_body = TEXT[TEXT.index('svc_enable_start_verify()'):TEXT.index('# ==============================================================================', TEXT.index('svc_enable_start_verify()'))]
-    assert_true('fw_reconcile || { _install_rollback' in install_body, "install must rollback/fail when firewall reconcile fails")
+    assert_true('fw_reconcile || return 1' in install_body, "install must fail when firewall reconciliation fails")
     assert_true('svc_enable_start_verify "${_SVC_XRAY}" 8 required' in install_body, "xray install start path should use shared verified start helper")
     assert_true('svc_enable_start_verify "${_SVC_TUNNEL}" 6 required' in install_body, "Argo install must require verified Tunnel startup")
     assert_true('svc_exec_mut enable "${_svc}"' in helper_body and 'svc_exec_mut start  "${_svc}"' in helper_body, "service helper must centralize enable/start")
@@ -624,28 +705,27 @@ def test_argo_install_tunnel_failure_rolls_back_before_state_commit():
         download_xray() { :; }
         download_cloudflared() { :; }
         _argo_prepare_fixed_tunnel_from_state() { :; }
-        config_apply() { :; }
+        config_apply() { printf fixture > "$CONFIG_FILE"; }
         svc_apply_xray() { :; }
         svc_apply_tunnel() { :; }
         svc_reload_daemon() { :; }
         is_openrc() { return 1; }
         platform_fix_time_sync() { :; }
         fw_reconcile() { :; }
-        _install_rollback() { printf 'install-rollback-called\\n'; return 0; }
         svc_enable_start_verify() {
             printf 'svc-call=%s max=%s mode=%s\\n' "$1" "$2" "$3"
             [ "$1" = "${_SVC_TUNNEL}" ] && return 1
             return 0
         }
         st_persist() { printf 'state-persist-called\\n'; return 0; }
-        module_xray_install_core
+        _transaction_run "fixture deployment" module_xray_install_core
         rc=$?
+        [[ ! -e $CONFIG_FILE ]] || exit 1
         printf 'install-rc=%s enabled=%s\\n' "$rc" "$(st_get '.argo.enabled')"
         exit 0
     """)
     assert_true(cp.returncode == 0, f"Argo install failure probe process failed: {cp.stdout}")
     assert_true("svc-call=tunnel2go max=6 mode=required" in cp.stdout, f"Argo install must use required Tunnel health verification: {cp.stdout}")
-    assert_true("install-rollback-called" in cp.stdout, f"Tunnel failure must trigger install rollback: {cp.stdout}")
     assert_true("install-rc=1" in cp.stdout and "state-persist-called" not in cp.stdout, f"Tunnel failure must fail before state persistence: {cp.stdout}")
 
 
@@ -797,14 +877,14 @@ def test_single_file_module_transaction_helpers():
         body = TEXT[TEXT.index(body_name):TEXT.index('\n}\n', TEXT.index(body_name))]
         assert_true('module_dispatch' in body or '_unified_runtime_toggle' in body, f"{body_name} live actions should route through shared dispatcher/toggle helpers")
     assert_true('_module_apply_if_enabled' in TEXT, "enabled-only config updates should use shared apply helper")
-    assert_true('_module_persist_after_optional_apply()' in TEXT, "legacy modules should retain shared optional-apply helper")
+    assert_true('_module_save_fields()' in TEXT, "field updates should share a transaction")
     for proto in ['socks', 'http', 'vltcp', 'vlquic']:
         assert_true(f'module_update_listen_action {proto}' in TEXT, f'{proto} listen wrapper/dispatcher should delegate to canonical action')
     canonical_body = TEXT[TEXT.index('module_update_listen_action()'):TEXT.index('\n}\n', TEXT.index('module_update_listen_action()'))]
     assert_true('_module_update_listen_transaction' in canonical_body, "canonical listen action must use the transactional helper")
-    for fn in ['module_reality_update_transport()', 'module_cforigin_update_protocol()', 'module_cforigin_update_path()', 'module_socks_update_user()', 'module_socks_update_pass()', 'module_http_update_user()', 'module_http_update_pass()', 'module_cforigin_update_domain()']:
+    for fn in ['module_reality_update_transport()', 'module_cforigin_update_protocol()', 'module_cforigin_update_path()', 'module_socks_update_user()', 'module_socks_update_pass()', 'module_http_update_user()', 'module_http_update_pass()', '_module_cforigin_save_domain()']:
         body = TEXT[TEXT.index(fn):TEXT.index('\n}\n', TEXT.index(fn))]
-        assert_true('_module_persist_after_optional_apply' in body, f"{fn} should use shared optional-apply commit helper")
+        assert_true('_module_save_fields' in body, f"{fn} should use the shared field transaction")
 
 def test_protocol_links_and_udp_port_input_consistency():
     vltcp = TEXT[TEXT.index('_plg_vltcp_link()'):TEXT.index('PLUGIN_EOF', TEXT.index('_plg_vltcp_link()'))]
@@ -1191,9 +1271,10 @@ def test_runtime_enable_paths_no_longer_depend_on_removed_ask_helpers():
         printf 'ff=%s proto=%s\n' "$(st_get '.ff.enabled')" "$(st_get '.ff.protocol')"
         module_dispatch socks enable
         printf 'socks=%s\n' "$(st_get '.socks.enabled')"
-        st_set '.cforigin.domain = "example.com" | .cforigin.cert = "${WORK_DIR}/cert.pem" | .cforigin.key = "${WORK_DIR}/key.pem"' >/dev/null
-        : >"${WORK_DIR}/cert.pem"
-        : >"${WORK_DIR}/key.pem"
+        st_set '.cforigin.domain = "example.com" | .cforigin.cert = $cert | .cforigin.key = $key' \
+            --arg cert "${WORK_DIR}/cert.pem" --arg key "${WORK_DIR}/key.pem" >/dev/null
+        openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj /CN=example.com \
+            -keyout "${WORK_DIR}/key.pem" -out "${WORK_DIR}/cert.pem" >/dev/null 2>&1
         module_dispatch cforigin enable
         printf 'cforigin=%s proto=%s path=%s\n' "$(st_get '.cforigin.enabled')" "$(st_get '.cforigin.protocol')" "$(st_get '.cforigin.path')"
         rm -f "${WORK_DIR}/cert.pem" "${WORK_DIR}/key.pem"
@@ -1259,12 +1340,197 @@ def test_state_get_preserves_false_and_zero_values():
     assert_true("enabled=false" in cp.stdout and "port=0" in cp.stdout, "state reads must preserve false and zero")
 
 
-def test_install_refresh_failure_uses_initialized_rollback_flags():
-    install_start = TEXT.index("module_xray_install_core()")
-    refresh = TEXT.index("plugin_refresh_runtime ||", install_start)
-    declaration = TEXT.index("local _xray_was=0 _argo_was=0", install_start)
-    assert_true(declaration < refresh, "install rollback flags must be initialized before plugin refresh can fail")
+def test_runtime_edits_use_locked_enablement_and_split_prerequisites():
+    run_bash(r'''
+        source ./xray_2go.sh
+        set -e
+        st_init
+        st_set '.socks.enabled=false | .argo.enabled=true | .argo.protocol="xhttp" |
+            .argo.auth_protocol="vless" | .reality.enabled=true | .reality.pvk="fixture"'
+        st_persist
+        config_apply() { printf '%s\n' "$(st_get '.socks.listen')" > "$WORK_DIR/applied"; }
+        config_print_nodes() { return 0; }
+        prompt() {
+            (st_set '.socks.enabled=true | .reality.enabled=false' && st_persist) || return 1
+            printf -v "$2" '%s' 127.0.0.1
+        }
+        module_socks_update_listen
+        [[ $(<"$WORK_DIR/applied") == 127.0.0.1 ]]
+        profile='{"mode":"packet-up","split":{"port":39198}}'
+        if _argo_xhttp_set_profile 1 "$profile"; then exit 1; fi
+        [[ -z $(st_get '.argo.xhttp.split.port') ]]
+        st_set '.argo.xhttp.split.port=39198'
+        st_persist
+        touch "$XRAY_BIN"
+        chmod +x "$XRAY_BIN"
+        port_mgr_in_use() { [[ $1 == 39198 ]]; }
+        if module_reality_enable; then exit 1; fi
+        [[ $(st_get '.reality.enabled') == false ]]
+        port_mgr_in_use() { return 1; }
+        fw_reconcile() { return 0; }
+        module_reality_enable
+        _argo_xhttp_split_active
+    ''', timeout=45)
 
+
+def test_failed_firewall_cleanup_restores_module_and_keeps_rule_record():
+    run_bash(r'''
+        source ./xray_2go.sh
+        set -e
+        st_init
+        st_set '.socks.enabled = true'
+        st_persist
+        printf 'original' > "$CONFIG_FILE"
+        printf 'ufw:1080/tcp\n' > "$_FW_RULES_FILE"
+        config_apply() { printf 'changed' > "$CONFIG_FILE"; }
+        fw_desired_rules() { return 0; }
+        _fw_select_backend() { printf ufw; }
+        ufw() {
+            if [[ $1 == status ]]; then
+                printf 'Status: active\n1080/tcp ALLOW IN Anywhere\n39091/tcp ALLOW IN Anywhere\n'
+            else
+                return 1
+            fi
+        }
+        if module_dispatch socks disable; then exit 1; fi
+        [[ $(st_get '.socks.enabled') == true && $(<"$CONFIG_FILE") == original ]]
+        jq -e '.socks.enabled == true' "$STATE_FILE" >/dev/null
+        grep -qx 'ufw:1080/tcp' "$_FW_RULES_FILE"
+        add_rule_and_fail() { _fw_mark_rule ufw 39091 tcp; return 1; }
+        if _transaction_run 'fixture' add_rule_and_fail; then exit 1; fi
+        grep -qx 'ufw:39091/tcp' "$_FW_RULES_FILE"
+    ''')
+
+
+def test_transaction_rollback_preserves_normalized_state():
+    run_bash(r'''
+        source ./xray_2go.sh
+        set -e
+        mkdir -p "$WORK_DIR"
+        printf '{}' > "$STATE_FILE"
+        st_init
+        before=$(st_get '.uuid')
+        [[ -n $before ]]
+        fail_edit() { st_set '.uuid = "failed-edit"'; return 1; }
+        if _transaction_run 'fixture' fail_edit; then exit 1; fi
+        [[ $(st_get '.uuid') == "$before" && $(<"$STATE_FILE") == '{}' ]]
+    ''')
+
+
+def test_cforigin_rejects_hostname_drift_and_mismatched_private_key():
+    run_bash(r'''
+        source ./xray_2go.sh
+        set -e
+        mkdir -p "$WORK_DIR"
+        openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj /CN=old.fixture.invalid \
+            -addext 'subjectAltName=DNS:old.fixture.invalid,DNS:alias.fixture.invalid' \
+            -keyout "$WORK_DIR/key.pem" -out "$WORK_DIR/cert.pem" >/dev/null 2>&1
+        st_init
+        st_set '.cforigin += {domain:"old.fixture.invalid",origin_tls:true,cert:$cert,key:$key}' \
+            --arg cert "$WORK_DIR/cert.pem" --arg key "$WORK_DIR/key.pem"
+        st_persist
+        prompt() { printf -v "$2" '%s' "$candidate"; }
+        candidate=uncovered.fixture.invalid
+        if module_cforigin_update_domain; then exit 1; fi
+        [[ $(st_get '.cforigin.domain') == old.fixture.invalid ]]
+        candidate=alias.fixture.invalid
+        module_cforigin_update_domain
+        [[ $(st_get '.cforigin.domain') == alias.fixture.invalid ]]
+        openssl genpkey -algorithm ED25519 -out "$WORK_DIR/wrong.pem" 2>/dev/null
+        st_set '.cforigin.key = $key' --arg key "$WORK_DIR/wrong.pem"
+        if _cforigin_check_ready; then exit 1; fi
+    ''')
+
+
+def test_uninstall_retries_failed_firewall_and_preserves_external_files():
+    cp = run_bash_result(r"""
+        source ./xray_2go.sh
+        mkdir -p "$WORK_DIR" "$(dirname "$SELF_DEST")" "$HOME/.cloudflared"
+        printf '%s\n' 'ufw:39091/tcp' > "$_FW_RULES_FILE"
+        printf fixture > "$SELF_DEST"
+        printf fixture > "$CONFIG_FILE"
+        printf external > "$HOME/.cloudflared/independent.json"
+        printf external > "$WORK_DIR/imported.pem"
+        mkdir -p "$PLUGIN_DIR" "$_CERT_DIR/issued.fixture.invalid"
+        printf '# xray-2go plugin: argo\n' > "$PLUGIN_DIR/argo.sh"
+        printf '# independent plugin\n' > "$PLUGIN_DIR/custom.sh"
+        printf managed > "$_CERT_DIR/issued.fixture.invalid/fullchain.pem"
+        printf managed > "$_CERT_DIR/issued.fixture.invalid/privkey.pem"
+        st_init || exit 1
+        st_set '.cforigin += {acme_method:"dns_cf_token",domain:"issued.fixture.invalid",cert:($dir+"/fullchain.pem"),key:($dir+"/privkey.pem")}' \
+            --arg dir "$_CERT_DIR/issued.fixture.invalid" || exit 1
+        st_persist || exit 1
+        prompt() { printf -v "$2" y; }
+        svc_exec_mut() { return 0; }
+        is_systemd() { return 1; }
+        ufw() {
+            case "$1" in
+                status) printf 'Status: active\n'; [[ -n ${deleted:-} ]] || printf '39091/tcp ALLOW IN Anywhere\n' ;;
+                --force) [[ $2 == delete && -n ${retry:-} ]] || return 1; deleted=1 ;;
+            esac
+            return 0
+        }
+        if module_xray_uninstall; then exit 1; fi
+        grep -qx 'ufw:39091/tcp' "$_FW_RULES_FILE" || exit 1
+        [[ -f $SELF_DEST && -f $CONFIG_FILE && -f $_UNINSTALL_PENDING ]] || exit 1
+        install_plan_validate() { return 0; }
+        module_xray_install_core() { touch "$WORK_DIR/unexpected-install"; return 1; }
+        if install_execute_current_plan; then exit 1; fi
+        [[ ! -e $WORK_DIR/unexpected-install ]] || exit 1
+        retry=1
+        module_xray_uninstall || exit 1
+        [[ ! -e $SELF_DEST && ! -e $_FW_RULES_FILE && ! -e $CONFIG_FILE ]] || exit 1
+        [[ -f $HOME/.cloudflared/independent.json && -f $WORK_DIR/imported.pem ]] || exit 1
+        [[ -f $PLUGIN_DIR/custom.sh && ! -e $PLUGIN_DIR/argo.sh && ! -d $_CERT_DIR/issued.fixture.invalid ]] || exit 1
+    """)
+    assert_true(cp.returncode == 0, cp.stdout)
+
+
+def test_first_deploy_rejects_existing_or_stale_plan_before_install_core():
+    cp = run_bash_result(r"""
+        source ./xray_2go.sh
+        st_init || exit 1
+        st_persist || exit 1
+        preset_apply_reality_tcp_default() { return 0; }
+        install_plan_validate() { return 0; }
+        module_xray_install_core() { printf 'UNEXPECTED_INSTALL\n'; return 1; }
+        printf 'existing config' > "$CONFIG_FILE"
+        if cli_install; then exit 1; fi
+        [[ $(<"$CONFIG_FILE") == 'existing config' ]] || exit 1
+        rm -f -- "$CONFIG_FILE"
+        (st_set '.ports.reality = 39091' && st_persist) || exit 1
+        if cli_install; then exit 1; fi
+    """)
+    assert_true(cp.returncode == 0 and "UNEXPECTED_INSTALL" not in cp.stdout, cp.stdout)
+
+
+def test_binary_alone_does_not_block_first_deploy():
+    cp = run_bash_result(r"""
+        source ./xray_2go.sh
+        mkdir -p "$(dirname "$XRAY_BIN")" || exit 1
+        printf 'binary fixture' > "$XRAY_BIN"
+        chmod +x "$XRAY_BIN"
+        is_systemd() { return 1; }
+        if check_xray_install; then exit 1; fi
+    """)
+    assert_true(cp.returncode == 0, cp.stdout)
+
+
+def test_first_deploy_refresh_failure_keeps_reusable_binary():
+    cp = run_bash_result(r"""
+        source ./xray_2go.sh
+        st_init || exit 1
+        mkdir -p "$(dirname "$XRAY_BIN")" || exit 1
+        printf 'binary fixture' > "$XRAY_BIN"
+        chmod +x "$XRAY_BIN"
+        is_systemd() { return 1; }
+        platform_preflight() { return 0; }
+        install_plan_validate() { return 0; }
+        plugin_refresh_runtime() { return 1; }
+        if install_execute_current_plan; then exit 1; fi
+        [[ -x $XRAY_BIN && ! -e $CONFIG_FILE ]] || exit 1
+    """)
+    assert_true(cp.returncode == 0, cp.stdout)
 
 def test_install_plan_rejects_unconfigured_argo():
     cp = run_bash_result("""
@@ -2804,6 +3070,8 @@ printf 'old-env' > "${_ARGO_ENV_FILE}"
 printf 'old-tunnel' > "${WORK_DIR}/tunnel.yml"
 printf 'nft:1080/tcp\\n' > "${_FW_RULES_FILE}"
 printf '1080\\n' > "${_FW_PORTS_FILE}"
+_fw_remove_rule() { return 0; }
+_fw_open_port_backend() { _fw_mark_rule "$@"; }
 _SERVICE_ACTIVE=1
 _SERVICE_ENABLED=1
 svc_exec() {
@@ -2888,6 +3156,8 @@ printf 'old-env' > "${_ARGO_ENV_FILE}"
 printf 'old-tunnel' > "${WORK_DIR}/tunnel.yml"
 printf 'nft:1080/tcp\\n' > "${_FW_RULES_FILE}"
 printf '1080\\n' > "${_FW_PORTS_FILE}"
+_fw_remove_rule() { return 0; }
+_fw_open_port_backend() { _fw_mark_rule "$@"; }
 _commit_inner() {
     st_set '.socks.enabled = false' >/dev/null
     st_persist >/dev/null 2>&1
@@ -3012,6 +3282,8 @@ printf 'old-env' > "${_ARGO_ENV_FILE}"
 printf 'old-tunnel' > "${WORK_DIR}/tunnel.yml"
 printf 'nft:1080/tcp\\n' > "${_FW_RULES_FILE}"
 printf '1080\\n' > "${_FW_PORTS_FILE}"
+_fw_remove_rule() { return 0; }
+_fw_open_port_backend() { _fw_mark_rule "$@"; }
 fw_reconcile() { return 0; }
 config_apply() {
     printf 'new-config' > "${CONFIG_FILE}"
@@ -3263,7 +3535,7 @@ config_apply() { return 37; }
 new_server=$(head -c 16 /dev/zero | base64 | tr -d '\\n')
 new_user=$(head -c 16 /dev/zero | base64 | tr -d '\\n')
 _module_update_state_transaction "probe method" _module_ss2022_update_method_inner true 2022-blake3-aes-128-gcm "$new_server" "$new_user" >/dev/null 2>&1 || :
-_module_update_state_transaction "probe listen" _module_update_listen_transaction_inner ss2022 true 127.0.0.1 >/dev/null 2>&1 || :
+_module_update_state_transaction "probe listen" _module_update_listen_transaction_inner ss2022 127.0.0.1 >/dev/null 2>&1 || :
 printf 'method=%s listen=%s disk_method=%s disk_listen=%s server_same=%s\\n' \\
     "$(st_get '.ss2022.method')" \\
     "$(st_get '.ss2022.listen')" \\
@@ -3300,6 +3572,128 @@ grep -q 'Shadowsocks 2022 端口已更新: 10007（TCP/UDP）' "$_msg_file" && p
     assert_true("fail_rc=1 mem=8388 file=no" in out, f"port update must roll back in-memory state even without state.json: {out}")
     assert_true("ok_rc=0 mem=10007 disk=10007" in out, f"port update must persist the new port: {out}")
     assert_true("msg=ok" in out, f"port update message should name the module and protocol: {out}")
+
+
+def test_transaction_refreshes_state_after_lock():
+    out = run_bash(r'''
+        source ./xray_2go.sh
+        st_init || exit 1
+        st_set '.cforigin.path="/before" | .cforigin.domain="before.example.net"'
+        st_persist || exit 1
+        update() { st_set "$1" && st_persist; }
+        (_transaction_run "first edit" update '.cforigin.path="/first"') || exit 1
+        _transaction_run "second edit" update '.cforigin.domain="second.example.net"' || exit 1
+        jq -e '.cforigin.path=="/first" and .cforigin.domain=="second.example.net"' "$STATE_FILE" >/dev/null || exit 1
+        printf 'BOTH_EDITS_RETAINED\n'
+    ''', timeout=30)
+    assert 'BOTH_EDITS_RETAINED' in out, out
+
+
+def test_cforigin_field_save_rolls_back():
+    out = run_bash(r'''
+        source ./xray_2go.sh
+        st_init || exit 1
+        st_set '.cforigin.enabled=true | .cforigin.path="/before"' || exit 1
+        st_persist || exit 1
+        printf 'old config' > "$CONFIG_FILE"
+        prompt() { printf -v "$2" '%s' '/after'; }
+        config_apply() { printf 'new config' > "$CONFIG_FILE" && printf 'APPLIED\n'; }
+        st_persist() { return 1; }
+        if module_cforigin_update_path; then exit 1; fi
+        [[ $(st_get '.cforigin.path') == /before ]] || exit 1
+        jq -e '.cforigin.path=="/before"' "$STATE_FILE" >/dev/null || exit 1
+        [[ $(<"$CONFIG_FILE") == 'old config' ]] || exit 1
+        printf 'FIELD_SAVE_ROLLED_BACK\n'
+    ''', timeout=30)
+    assert 'APPLIED' in out and 'FIELD_SAVE_ROLLED_BACK' in out, out
+
+
+def test_argo_runtime_publish_restores_failed_token_switch():
+    out = run_bash(r'''
+        source ./xray_2go.sh
+        st_init || exit 1
+        st_set '.argo.enabled=true | .argo.domain="argo.fixture.invalid" | .ports.argo=29991' || exit 1
+        st_persist || exit 1
+        printf '%s' '{"TunnelID":"old-id"}' > "$WORK_DIR/tunnel.json"
+        printf 'old yaml' > "$WORK_DIR/tunnel.yml"
+        prompt_secret() { printf -v "$2" '%0120d' 1; }
+        svc_apply_tunnel() {
+            [[ -n $(st_get '.argo.token') && ! -e "$WORK_DIR/tunnel.json" ]] || return 1
+            printf 'TOKEN_SELECTED\n'
+        }
+        config_apply() { return 0; }
+        svc_exec_mut() { [[ $1 != restart ]]; }
+        if module_argo_update_action auth; then exit 1; fi
+        [[ -z $(st_get '.argo.token') ]] || exit 1
+        jq -e '.argo.token == null' "$STATE_FILE" >/dev/null || exit 1
+        [[ $(<"$WORK_DIR/tunnel.yml") == 'old yaml' && -f "$WORK_DIR/tunnel.json" ]] || exit 1
+        printf 'TOKEN_SWITCH_ROLLED_BACK\n'
+    ''', timeout=35)
+    assert 'TOKEN_SELECTED' in out and 'TOKEN_SWITCH_ROLLED_BACK' in out, out
+
+
+def test_cforigin_plan_defers_certificate_issuance():
+    out = run_bash(r'''
+        source ./xray_2go.sh
+        st_init || exit 1
+        st_set '.argo.enabled=false | .cforigin.enabled=true' || exit 1
+        plugin_refresh_runtime || exit 1
+        prompt() {
+            case "$2" in
+                _domain) printf -v "$2" '%s' 'origin.fixture.invalid' ;;
+                _email) printf -v "$2" '%s' 'admin@fixture.invalid' ;;
+                _c) printf -v "$2" '%s' "$confirm" ;;
+                *) printf -v "$2" '%s' '' ;;
+            esac
+        }
+        prompt_secret() { printf -v "$2" '%s' 'fixture-token'; }
+        acme_issue_cf_token_to_state() {
+            printf 'ISSUER_CALLED\n'
+            [[ $confirm == y ]] || exit 1
+            local dir="$_CERT_DIR/$2"
+            mkdir -p "$dir" || return 1
+            printf 'replacement' > "$dir/fullchain.pem"
+            printf 'private fixture' > "$dir/privkey.pem"
+            [[ $issue_result == ok ]] || return 1
+            openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj "/CN=$2" \
+                -keyout "$dir/privkey.pem" -out "$dir/fullchain.pem" >/dev/null 2>&1 || return 1
+            st_set '.cforigin.cert = $c | .cforigin.key = $k' --arg c "$dir/fullchain.pem" --arg k "$dir/privkey.pem"
+        }
+        _install_check_port_conflicts() { return 0; }
+        module_xray_install_core() { printf 'CORE_CALLED\n'; }
+        config_print_nodes() { return 0; }
+        confirm=n
+        install_plan_cforigin_update_cert || exit 1
+        [[ -z $(st_get '.cforigin.cert') ]] || exit 1
+        if install_wizard_confirm; then exit 1; fi
+        confirm=y
+        issue_result=fail
+        dir="$_CERT_DIR/origin.fixture.invalid"
+        mkdir -p "$dir" || exit 1
+        printf 'existing certificate' > "$dir/fullchain.pem"
+        if install_wizard_confirm; then exit 1; fi
+        [[ $(<"$dir/fullchain.pem") == 'existing certificate' && ! -e "$dir/privkey.pem" ]] || exit 1
+        [[ $(st_get '.cforigin.domain') == origin.fixture.invalid ]] || exit 1
+        issue_result=ok
+        install_wizard_confirm || exit 1
+    ''', timeout=45)
+    assert out.count('ISSUER_CALLED') == 2 and out.count('CORE_CALLED') == 1, out
+
+
+def test_port_prompt_distinguishes_eof_from_blank():
+    out = run_bash(r'''
+        source ./xray_2go.sh
+        port_mgr_random_proto() { printf 'RANDOM_CALLED\n' >&2; printf 29991; }
+        port_mgr_in_use() { return 1; }
+        prompt() { return 1; }
+        if _menu_select_port tcp selected; then exit 1; fi
+        [[ ! -v selected ]] || exit 1
+        prompt() { printf -v "$2" '%s' ''; }
+        _menu_select_port tcp selected || exit 1
+        [[ $selected == 29991 ]] || exit 1
+        printf 'BLANK_SELECTED_RANDOM\n'
+    ''', timeout=30)
+    assert out.count('RANDOM_CALLED') == 1 and 'BLANK_SELECTED_RANDOM' in out, out
 
 
 def test_management_action_pauses_once():
