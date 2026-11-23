@@ -67,9 +67,9 @@ Shadowsocks 2022 通过 Xray-core 的 shadowsocks inbound 提供服务，不额�
 
 ### 首次部署：快速向导
 
-无参数运行时，在主菜单选择 `1` 打开部署向导。向导中回车默认选用 VLESS + Reality TCP，优先使用 `443/tcp`，占用时会选择一个可用的随机 TCP 端口。也可选择 Argo Tunnel，或在高级自定义部署中配置多个入站。安装前会预览监听端口和占用情况，输入 `y` 确认后开始。
+无参数运行时，在主菜单按 `d` 打开部署向导。向导中回车默认选用 VLESS + Reality TCP，优先使用 `443/tcp`，占用时会选择一个可用的随机 TCP 端口。也可选择 Argo Tunnel，或在高级自定义部署中配置多个入站。安装前会预览监听端口和占用情况，输入 `y` 确认后开始。
 
-服务启动并保存配置后，复制相应的分享链接，在支持该模块协议及传输方式的客户端中从剪贴板导入。启用节点后，用自己的设备访问一个网页来确认连接。可在向导中确认结果，或稍后通过主菜单 `9` 再查看节点与连接提示。
+服务启动并保存配置后，复制相应的分享链接，在支持该模块协议及传输方式的客户端中从剪贴板导入。启用节点后，用自己的设备访问一个网页来确认连接。可在向导中确认结果，或稍后通过主菜单 `1` 再查看节点与连接提示。
 
 安装需要 root 权限。可切换到 root，或使用下面的“下载后运行”方式配合 `sudo`。用 `bash xray_2go.sh --help` 或已安装的 `xray2go --help` 查看命令帮助，无需 root 权限。
 
@@ -103,6 +103,10 @@ chmod +x xray_2go.sh
 sudo ./xray_2go.sh
 ```
 
+### 主控制台快捷键
+
+首页显示 Xray 状态及已启用的内置入站。`1` 查看节点，`2`–`10` 管理入站，`11` 更新 UUID。`d` 打开部署向导，`s` 更新脚本，`u` 进入卸载确认，`0` 退出。
+
 ### 创建快捷命令并更新管理脚本
 
 在主菜单选择 `s`（更新快捷方式/脚本）。脚本会下载官方 `main` 的最新内容，安装为 `/usr/local/bin/xray2go`，并创建 `/usr/local/bin/s`。成功后同一终端会进入新版菜单，重新读取现有状态并加载插件。以后可用 `sudo s` 打开管理菜单。
@@ -111,11 +115,11 @@ sudo ./xray_2go.sh
 
 ### Argo XHTTP 配置
 
-在 Argo 菜单选择 VLESS + XHTTP，再按 `x` 打开配置。可以恢复 Xray 默认参数、编辑 Extra、启用独立的 Reality 下行，以及复制客户端出站 JSON。
+在 Argo 菜单选择 VLESS + XHTTP，再按 `x`。配置页会显示当前模式、Padding、XMUX 和分离状态。按 `7` 可逐项设置常用参数，输入 `-` 清除对应覆盖。按 `4` 先选普通或分离节点，再选分享链接或客户端出站 JSON。
 
 启用分离时，选择一个独立且可从公网访问的 TCP 端口。脚本会让该端口的 Reality 下行与 Argo 上行共用本机 `/argo` 入站。原 Reality 节点继续使用自己的端口。Cloudflare Tunnel 仍使用原 Argo 回源。若云平台有安全组，请同步开放新端口。
 
-可将下列 JSON 压成一行后粘贴到「编辑模式、Extra 与下行覆盖」。`server` 配置入站 Extra，`client` 配置普通客户端和分离上行 Extra，`split.download` 覆盖分离下行参数。
+按 `2` 打开高级 Extra 编辑。可直接修改预填的 JSON，也可以清空后粘贴单行配置。校验失败会指出对应字段，并保留输入供修改。`server` 配置入站 Extra，`client` 配置普通客户端和分离上行 Extra，`split.download` 覆盖分离下行参数。
 
 ```json
 {
@@ -132,6 +136,18 @@ sudo ./xray_2go.sh
 
 自动下行读取本机公网地址和 Reality 的 SNI、公钥及 Short ID。更换密钥后请重新导出。`split.download` 可覆盖对外地址、端口、路径、Host 和安全层。覆盖路径时，转发后的请求仍需进入同一个 `/argo` 入站。`stream-up` 需要沿途支持流式上传，分离默认使用 `packet-up`。
 
+### CF Origin XHTTP 配置
+
+在 CF Origin 工作台按 `2` 选择 XHTTP，再按 `x`。高级部署计划和已安装的工作台都提供该入口，页面会显示当前模式、Padding、XMUX 和 Edge HTTP/3 状态。按 `5` 逐项设置常用参数，输入 `-` 恢复该项默认值。按 `3` 选择分享链接或客户端出站 JSON。默认传输模式为 `stream-one`。
+
+按 `2` 可修改预填的高级 Extra JSON。校验失败时会指出具体字段并保留输入。也可以清空后粘贴下面的单行示例，其中 `server` 设置入站 Padding，`client` 设置客户端 XMUX，省略 `mode` 时沿用当前模式。
+
+```json
+{"server":{"xPaddingBytes":"128-768"},"client":{"xmux":{"maxConnections":4}}}
+```
+
+分享链接和出站 JSON 使用 CF Origin 域名及 Cloudflare 客户端入口端口。工作台的 `8` 仍负责实验性的 Edge HTTP/3，启用后导出会把 HTTP/3 标记和自定义 Extra 合并。Argo 的 `split` 分离配置用于 Cloudflare Tunnel 模式。
+
 ## 安装后的主要路径
 
 - 工作目录：`/etc/xray2go`
@@ -145,7 +161,7 @@ sudo ./xray_2go.sh
 
 当 `state.json` 无法读取为 JSON 对象时，交互启动会列出可读取的备份。选择一个编号恢复，损坏文件会保留为 `state.json.corrupt.*`。回车退出可保留现场。
 
-插件的 `ports` 接口每行返回一个 `端口` 或 `端口/tcp`、`端口/udp`，省略协议时按 TCP 处理。`link` 接口每行返回一个 `scheme://…` 分享链接，支持插件自定义的 scheme。诊断信息写到标准错误。模块页仅显示对应插件的链接，主菜单 `9` 汇总所有模块。
+插件的 `ports` 接口每行返回一个 `端口` 或 `端口/tcp`、`端口/udp`，省略协议时按 TCP 处理。`link` 接口每行返回一个 `scheme://…` 分享链接，支持插件自定义的 scheme。诊断信息写到标准错误。模块页仅显示对应插件的链接，主菜单 `1` 汇总所有模块。
 
 ## 服务名称
 

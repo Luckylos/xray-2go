@@ -142,7 +142,11 @@ die()       { log_error "$1"; exit "${2:-1}"; }
 
 prompt() {
     printf '%s%s%s' "${C_RED}" "$1" "${C_RST}" >&2
-    read -r "$2" </dev/tty
+    if [ -n "${3:-}" ]; then
+        read -e -r -i "$3" "$2" </dev/tty
+    else
+        read -r "$2" </dev/tty
+    fi
 }
 
 prompt_secret() {
@@ -448,6 +452,7 @@ readonly _STATE_DEFAULT='{
     "listen":  "::",
     "edge_port": 443,
     "edge_h3": false,
+    "xhttp": null,
     "origin_tls": true,
     "cert":    "",
     "key":     "",
@@ -1245,14 +1250,18 @@ _argo_xhttp_server_extra() {
     st_get '.argo.xhttp.server // $legacy' --argjson legacy "${_legacy}"
 }
 
+_xhttp_client_visible_server_extra() {
+    jq -c 'with_entries(select(.key | IN(
+        "xPaddingBytes", "xPaddingObfsMode", "xPaddingKey", "xPaddingHeader",
+        "xPaddingPlacement", "xPaddingMethod", "scMaxEachPostBytes", "sessionPlacement", "sessionKey",
+        "seqPlacement", "seqKey", "uplinkDataPlacement", "uplinkDataKey", "uplinkChunkSize", "uplinkHTTPMethod"
+    )))'
+}
+
 _argo_xhttp_client_stream() {
     local _kind="$1" _profile _server _address='' _down='{}'
     _profile=$(st_get '.argo.xhttp // {}') || return 1
-    _server=$(_argo_xhttp_server_extra | jq -c 'with_entries(select(.key | IN(
-        "xPadding"+"Bytes", "xPaddingBytes", "xPaddingObfsMode", "xPaddingKey", "xPaddingHeader",
-        "xPaddingPlacement", "xPaddingMethod", "scMaxEachPostBytes", "sessionPlacement", "sessionKey",
-        "seqPlacement", "seqKey", "uplinkDataPlacement", "uplinkDataKey", "uplinkChunkSize", "uplinkHTTPMethod"
-    )))') || return 1
+    _server=$(_argo_xhttp_server_extra | _xhttp_client_visible_server_extra) || return 1
     if [ "${_kind}" = split ]; then
         _argo_xhttp_split_active || return 1
         _address=$(jq -r '.split.download.address // empty' <<< "${_profile}")
@@ -1284,6 +1293,42 @@ _argo_xhttp_client_stream() {
         elif ($extra | length) > 0 then .xhttpSettings.extra = $extra
         else . end
     ' --argjson profile "${_profile}" <<< "${_profile}"
+}
+
+_cforigin_xhttp_client_stream() {
+    local _profile _server
+    _profile=$(st_get '.cforigin.xhttp // {}') || return 1
+    _server=$(jq -c '.server // {}' <<< "${_profile}" | _xhttp_client_visible_server_extra) || return 1
+    jq -c --arg host "$(st_get '.cforigin.domain')" --arg path "$(st_get '.cforigin.path')" \
+        --arg edge_h3 "$(st_get '.cforigin.edge_h3')" --argjson server "${_server}" '
+        {network:"xhttp", security:"tls", tlsSettings:{serverName:$host,fingerprint:"chrome"},
+         xhttpSettings:{host:$host,path:$path,mode:(.mode // "stream-one"),extra:($server * (.client // {}))}} |
+        if $edge_h3 == "true" then
+            .tlsSettings.alpn = ["h3"] | .xhttpSettings.extra.xhttpModeH3 = true
+        elif (.xhttpSettings.extra | length) == 0 then del(.xhttpSettings.extra)
+        else . end
+    ' <<< "${_profile}"
+}
+
+_cforigin_xhttp_link() {
+    local _domain _uuid _edge_port _penc _stream _mode _extra _alpn='' _h3flag='' _tag
+    _domain=$(st_get '.cforigin.domain')
+    [ -n "${_domain}" ] || { log_warn "请先配置 CF Origin 域名，再导出分享链接"; return 1; }
+    _uuid=$(st_get '.uuid')
+    _edge_port=$(st_get '.cforigin.edge_port')
+    _penc=$(urlencode_path "$(st_get '.cforigin.path')")
+    _stream=$(_cforigin_xhttp_client_stream) || return 1
+    _mode=$(jq -r '.xhttpSettings.mode' <<< "${_stream}") || return 1
+    _extra=$(jq -r '.xhttpSettings.extra // empty | tojson | @uri' <<< "${_stream}") || return 1
+    _tag="CF-Origin-XHTTP"
+    if [ "$(st_get '.cforigin.edge_h3')" = true ]; then
+        _alpn='&alpn=h3'
+        _h3flag='&xhttpModeH3=true'
+        _tag="CF-Origin-XHTTP-H3-Experimental"
+    fi
+    printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=chrome&type=xhttp&host=%s&path=%s&mode=%s%s%s%s#%s\n' \
+        "${_uuid}" "${_domain}" "${_edge_port}" "${_domain}" "${_domain}" "${_penc}" \
+        "${_mode}" "${_alpn}" "${_extra:+&extra=${_extra}}" "${_h3flag}" "${_tag}"
 }
 
 _argo_xhttp_link() {
@@ -1813,7 +1858,7 @@ _plg_cforigin_ports() {
 
 _plg_cforigin_inbound() {
     _plg_cforigin_enabled || return 0
-    local _port _listen _uuid _proto _path _tls
+    local _port _listen _uuid _proto _path _tls _profile
     _port=$(port_of cforigin)
     _listen=$(st_get '.cforigin.listen')
     _uuid=$(st_get '.uuid')
@@ -1834,32 +1879,27 @@ _plg_cforigin_inbound() {
                 settings:{clients:[{id:$uuid}], decryption:"none"},
                 streamSettings:({network:"httpupgrade", httpupgradeSettings:{path:$path}} + $tls)}' ;;
         xhttp)
+            _profile=$(st_get '.cforigin.xhttp // {}') || return 1
             jq -n --argjson port "${_port}" --arg listen "${_listen}" --arg uuid "${_uuid}" \
-                  --arg path "${_path}" --argjson tls "${_tls}" '{
-                port:$port, listen:$listen, protocol:"vless",
-                settings:{clients:[{id:$uuid}], decryption:"none"},
-                streamSettings:({network:"xhttp", xhttpSettings:{path:$path, mode:"stream-one"}} + $tls)}' ;;
+                  --arg path "${_path}" --argjson tls "${_tls}" --argjson profile "${_profile}" '
+                ({path:$path, mode:($profile.mode // "stream-one")} +
+                  (if ($profile.server // {}) == {} then {} else {extra:$profile.server} end)) as $xhttp |
+                {port:$port, listen:$listen, protocol:"vless",
+                 settings:{clients:[{id:$uuid}], decryption:"none"},
+                 streamSettings:({network:"xhttp", xhttpSettings:$xhttp} + $tls)}' ;;
         *) log_error "_plg_cforigin_inbound: 未知协议 ${_proto}"; return 1 ;;
     esac
 }
 
 _plg_cforigin_link() {
     _plg_cforigin_enabled || return 0
-    local _domain _proto _uuid _edge_port _path _penc _edge_h3 _h3qs _tag
+    local _domain _proto _uuid _edge_port _penc
     _domain=$(st_get '.cforigin.domain')
     [ -n "${_domain:-}" ] && [ "${_domain}" != "null" ] || return 0
     _proto=$(st_get '.cforigin.protocol')
     _uuid=$(st_get '.uuid')
     _edge_port=$(st_get '.cforigin.edge_port')
     _penc=$(urlencode_path "$(st_get '.cforigin.path')")
-    _edge_h3=$(st_get '.cforigin.edge_h3')
-    if [ "${_proto}" = "xhttp" ] && [ "${_edge_h3}" = "true" ]; then
-        _h3qs="&alpn=h3&extra=%7B%22xhttpModeH3%22%3Atrue%7D&xhttpModeH3=true"
-        _tag="CF-Origin-XHTTP-H3-Experimental"
-    else
-        _h3qs=""
-        _tag="CF-Origin-XHTTP"
-    fi
     case "${_proto}" in
         ws)
             printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=chrome&type=ws&host=%s&path=%s#CF-Origin-WS\n' \
@@ -1867,9 +1907,7 @@ _plg_cforigin_link() {
         httpupgrade)
             printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=chrome&type=httpupgrade&host=%s&path=%s#CF-Origin-HTTPUpgrade\n' \
                 "${_uuid}" "${_domain}" "${_edge_port}" "${_domain}" "${_domain}" "${_penc}" ;;
-        xhttp)
-            printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=chrome&type=xhttp&host=%s&path=%s&mode=stream-one%s#%s\n' \
-                "${_uuid}" "${_domain}" "${_edge_port}" "${_domain}" "${_domain}" "${_penc}" "${_h3qs}" "${_tag}" ;;
+        xhttp) _cforigin_xhttp_link ;;
     esac
 }
 PLUGIN_EOF
@@ -3222,7 +3260,7 @@ module_vlquic_uninstall() {
 }
 
 module_cforigin_uninstall() {
-    _module_disable_transaction "CF Origin" st_set '.cforigin.enabled = false | .cforigin.domain = "" | .cforigin.protocol = "ws" | .cforigin.path = "/origin" | .cforigin.listen = "::" | .cforigin.edge_port = 443 | .cforigin.edge_h3 = false | .cforigin.origin_tls = true | .cforigin.cert = "" | .cforigin.key = "" | .cforigin.acme_method = "manual" | .ports.cforigin = 28888' || return 1
+    _module_disable_transaction "CF Origin" st_set '.cforigin.enabled = false | .cforigin.domain = "" | .cforigin.protocol = "ws" | .cforigin.path = "/origin" | .cforigin.listen = "::" | .cforigin.edge_port = 443 | .cforigin.edge_h3 = false | .cforigin.xhttp = null | .cforigin.origin_tls = true | .cforigin.cert = "" | .cforigin.key = "" | .cforigin.acme_method = "manual" | .ports.cforigin = 28888' || return 1
     log_ok "CF Origin 已卸载"
 }
 
@@ -5135,113 +5173,78 @@ check_argo() {
 # ── 主菜单 ────────────────────────────────────────────────────────────────────
 
 _menu_collect_status() {
-    local _xs _cx
-    _MENU_SSD=""
-    _xs=$(check_xray); _cx=$?
-    check_xray_install && _MENU_XI=1 || _MENU_XI=0
-    [ "${_cx}" -eq 0 ] && _MENU_XC="${C_GRN}" || _MENU_XC="${C_RED}"
-    _MENU_XS="${_xs}"; _MENU_CX="${_cx}"
-
-    _MENU_AD=$(module_summary argo)
-    _MENU_FD=$(module_summary ff)
-    _MENU_RD=$(module_summary reality)
-    _MENU_VD=$(module_summary vltcp)
-    _MENU_QD=$(module_summary vlquic)
-    _MENU_CD=$(module_summary cforigin)
-    _MENU_SD=$(module_summary socks)
-    _MENU_HD=$(module_summary http)
-    _MENU_SSD=$(module_summary ss2022)
+    if check_xray >/dev/null 2>&1; then _MENU_CX=0; else _MENU_CX=$?; fi
+    if check_xray_install; then _MENU_XI=1; else _MENU_XI=0; fi
 }
 
-_menu_display_width() {
-    # 终端显示宽度：ASCII 记 1 列，多字节字符按常见全角 2 列计
-    local LC_ALL=C
-    local _s="$1" _bytes _ascii _wide
-    _bytes=${#_s}
-    _ascii="${_s//[^ -~]/}"
-    _ascii=${#_ascii}
-    _wide=$(( (_bytes - _ascii) / 3 ))
-    printf '%s' "$(( _ascii + _wide * 2 ))"
-}
-
-_menu_fit() {
-    # 超出状态列时截断，避免长摘要把控制台右边框推出去。
-    local LC_ALL=C
-    local _text="$1" _max="$2" _width _out="" _used=0 _i=0 _len _ch _cost _step
-    _width=$(_menu_display_width "${_text}")
-    if [ "${_width}" -le "${_max}" ]; then
-        printf '%s' "${_text}"
-        return 0
-    fi
-    _len=${#_text}
-    while [ "${_i}" -lt "${_len}" ]; do
-        _ch="${_text:_i:1}"
-        if [ "${_ch//[^ -~]/}" = "${_ch}" ]; then
-            _cost=1
-            _step=1
-        else
-            _cost=2
-            _step=3
-            _ch="${_text:_i:3}"
-        fi
-        [ $(( _used + _cost )) -le $(( _max - 2 )) ] || break
-        _out="${_out}${_ch}"
-        _used=$(( _used + _cost ))
-        _i=$(( _i + _step ))
-    done
-    printf '%s..' "${_out}"
-}
-
-_menu_pad() {
-    local _text="$1" _target="$2" _width _pad
-    _width=$(_menu_display_width "${_text}")
-    _pad=$(( _target - _width ))
-    [ "${_pad}" -gt 0 ] || _pad=0
-    printf '%*s' "${_pad}" ''
-}
-
-_menu_status_row() {
-    local _label="$1" _value="$2" _color="${3:-}" _label_pad _value_pad
-    _value=$(_menu_fit "${_value}" 28)
-    _label_pad=$(_menu_pad "${_label}" 10)
-    _value_pad=$(_menu_pad "${_value}" 28)
-    printf "${C_BOLD}${C_PUR}  ║${C_RST}  %s%s: ${_color}%s${C_RST}%s${C_PUR}║${C_RST}\n" \
-        "${_label}" "${_label_pad}" "${_value}" "${_value_pad}"
+# 区组、按键、显示名称、模块和动作。显示与分派共用这份主菜单定义。
+_menu_actions() {
+    cat <<'MENU'
+连接|1|查看节点与连接提示|nodes|show
+入站管理|2|Argo 固定隧道|argo|
+入站管理|3|Reality|reality|
+入站管理|4|VLESS-TCP|vltcp|
+入站管理|5|VLESS-XHTTP-H3|vlquic|
+入站管理|6|FreeFlow|ff|
+入站管理|7|CF Origin 回源|cforigin|
+入站管理|8|SOCKS5|socks|
+入站管理|9|HTTP 代理|http|
+入站管理|10|Shadowsocks 2022|ss2022|
+维护|11|更新 UUID|config|update_uuid
+维护|d|开始部署（快速向导）|xray|install
+维护|s|更新快捷方式/脚本|config|update_shortcut
+维护|u|卸载整套 Xray-2go|xray|uninstall
+维护|0|退出程序||
+MENU
 }
 
 _menu_render() {
-    clear; echo ""
-    printf "${C_BOLD}${C_PUR}  ╔══════════════════════════════════════════╗${C_RST}\n"
-    printf "${C_BOLD}${C_PUR}  ║%s%s%s║${C_RST}\n" \
-        "$(_menu_pad "" 13)" "Xray-2go 控制台" "$(_menu_pad "Xray-2go 控制台" 29)"
-    printf "${C_BOLD}${C_PUR}  ╠══════════════════════════════════════════╣${C_RST}\n"
-    _menu_status_row "Xray" "${_MENU_XS}" "${_MENU_XC}"
-    _menu_status_row "Argo" "${_MENU_AD}"
-    _menu_status_row "Reality" "${_MENU_RD}"
-    _menu_status_row "VLESS-TCP" "${_MENU_VD}"
-    _menu_status_row "XHTTP-H3" "${_MENU_QD}"
-    _menu_status_row "CF-Origin" "${_MENU_CD}"
-    _menu_status_row "FF" "${_MENU_FD}"
-    _menu_status_row "SOCKS5" "${_MENU_SD}"
-    _menu_status_row "HTTP代理" "${_MENU_HD}"
-    _menu_status_row "SS2022" "${_MENU_SSD}"
-    printf "${C_BOLD}${C_PUR}  ╚══════════════════════════════════════════╝${C_RST}\n\n"
-    printf "  ${C_GRN}1.${C_RST} 开始部署（快速向导）\n"
-    printf "  ${C_RED}2.${C_RST} 卸载整套 Xray-2go\n"; _hr
-    printf "  ${C_GRN}3.${C_RST} 管理 Argo 固定隧道\n"
-    printf "  ${C_GRN}4.${C_RST} 管理 Reality\n"
-    printf "  ${C_GRN}5.${C_RST} 管理 VLESS-TCP\n"
-    printf "  ${C_GRN}6.${C_RST} 管理 VLESS-XHTTP-H3\n"
-    printf "  ${C_GRN}7.${C_RST} 管理 FreeFlow\n"
-    printf "  ${C_GRN}8.${C_RST} 管理 CF Origin 回源\n"
-    printf "  ${C_GRN}9.${C_RST} 查看节点与连接提示\n"
-    printf "  ${C_GRN}10.${C_RST} 更新 UUID\n"
-    printf "  ${C_GRN}11.${C_RST} 管理 SOCKS5 入站\n"
-    printf "  ${C_GRN}12.${C_RST} 管理 HTTP 代理入站\n"; _hr
-    printf "  %s13.%s 管理 Shadowsocks 2022 入站\n" "$C_GRN" "$C_RST"; _hr
-    printf "  ${C_GRN}s.${C_RST} 更新快捷方式/脚本\n"; _hr
-    printf "  ${C_RED}0.${C_RST} 退出程序\n\n"
-    printf "  说明: ${C_YLW}首次部署进入快速向导，已安装时进入管理菜单${C_RST}；命令行 ${C_CYN}reality${C_RST} 可一键安装 VLESS + Reality (TCP)\n\n"
+    local _module _summary _section _key _label _last_section='' _color
+    [ ! -t 1 ] || clear
+    log_title "Xray-2go 控制台"
+    if [ "${_MENU_CX}" -eq 0 ]; then
+        printf '  Xray  %s运行中%s\n' "${C_GRN}" "${C_RST}"
+    elif [ "${_MENU_XI}" -eq 1 ]; then
+        printf '  Xray  %s已安装 · 未运行%s\n' "${C_YLW}" "${C_RST}"
+    else
+        printf '  Xray  %s未安装%s\n' "${C_YLW}" "${C_RST}"
+        printf '  首次使用请按 d 打开快速向导。\n'
+    fi
+
+    for _module in ${_MODULE_IDS}; do
+        _summary=$(module_summary "${_module}")
+        [ "${_summary}" != '未启用' ] || continue
+        printf '  %s\n    %s\n' "$(module_label "${_module}")" "${_summary}"
+    done
+
+    while IFS='|' read -r _section _key _label _; do
+        if [ "${_section}" != "${_last_section}" ]; then
+            printf '\n%s%s%s\n' "${C_BOLD}" "${_section}" "${C_RST}"
+            _last_section="${_section}"
+        fi
+        _color="${C_GRN}"
+        [ "${_key}" != u ] || _color="${C_RED}"
+        printf '  %s%2s.%s %s\n' "${_color}" "${_key}" "${C_RST}" "${_label}"
+    done < <(_menu_actions)
+    printf '\n'
+}
+
+_menu_select_action() {
+    local _selected="$1" _key _module _action _matched=0
+    while IFS='|' read -r _ _key _ _module _action; do
+        [ "${_key}" = "${_selected}" ] || continue
+        _matched=1
+        break
+    done < <(_menu_actions)
+    if [ "${_matched}" -eq 0 ]; then
+        log_error "无效选项，请输入菜单中显示的编号或按键"
+    elif [ "${_key}" = 0 ]; then
+        log_info "已退出"
+        exit 0
+    else
+        module_dispatch "${_module}" ${_action:+"${_action}"} && [ -z "${_action}" ] && return 0
+    fi
+    _pause
 }
 
 install_plan_reset_defaults() {
@@ -6127,7 +6130,7 @@ install_execute_current_plan() {
     if config_print_nodes; then
         log_info "复制上方对应节点的链接，在支持该协议及传输方式的客户端中选择从剪贴板导入。"
     else
-        log_warn "暂未导出分享链接，请通过主菜单 9 重试，或按模块的连接参数手动配置客户端。"
+        log_warn "暂未导出分享链接，请通过主菜单 1 重试，或按模块的连接参数手动配置客户端。"
     fi
     cforigin_print_cloudflare_hint
     log_info "请在自己的设备上启用该节点并访问一个网页，验证从客户端到服务器的连接。"
@@ -6137,7 +6140,7 @@ install_execute_current_plan() {
             return 0
         fi
     fi
-    log_info "客户端连接待确认，可在主菜单 9 重新查看节点和连接提示。"
+    log_info "客户端连接待确认，可在主菜单 1 重新查看节点和连接提示。"
 }
 
 _unified_mode_label() {
@@ -6231,8 +6234,12 @@ _unified_runtime_only_fn() {
     fi
 }
 
-_argo_xhttp_validate_profile() {
-    jq -ces '
+_xhttp_validate_profile() {
+    local _checked
+    _checked=$(jq -ces '
+        def require($path; condition):
+            if condition then . else error("XHTTP 字段无效: " + $path) end;
+        def checked(f): f as $_ | .;
         def only($allowed): type == "object" and (keys_unsorted - $allowed) == [];
         def port: type == "number" and floor == . and . >= 1 and . <= 65535;
         def bounds:
@@ -6241,41 +6248,62 @@ _argo_xhttp_validate_profile() {
             else [] end;
         def range($min): bounds as $v | ($v|length) > 0 and
             all($v[]; floor == . and . >= $min and . <= 2147483647) and $v[0] <= $v[-1];
-        def xmux:
-            only(["maxConcurrency","maxConnections","cMaxReuseTimes","hMaxRequestTimes","hMaxReusableSecs","hKeepAlivePeriod"]) and
-            all(to_entries[]; if .key == "hKeepAlivePeriod" then
-                .value | type == "number" and floor == . and . >= -1 and . <= 2147483647
-            else .value | range(0) end) and
-            ([.maxConcurrency, .maxConnections] | map(select((bounds | max // 0) > 0)) | length <= 1);
-        def extra:
-            type == "object" and (has("downloadSettings") | not) and ((.xmux // {}) | xmux) and
-            all(to_entries[]; if (.key | IN("xPaddingBytes","scMaxEachPostBytes")) then
-                .value | range(1)
-            elif .key == "scMinPostsIntervalMs" then .value | . == -1 or range(0)
-            elif .key == "noGRPCHeader" then .value | type == "boolean" else true end);
+        def xmux($path):
+            require($path; only(["maxConcurrency","maxConnections","cMaxReuseTimes","hMaxRequestTimes","hMaxReusableSecs","hKeepAlivePeriod"])) |
+            checked([to_entries[] | .key as $key | .value |
+                require($path + "." + $key;
+                    if $key == "hKeepAlivePeriod" then type == "number" and floor == . and . >= -1 and . <= 2147483647
+                    else range(0) end)]) |
+            require($path + ".maxConnections 与 " + $path + ".maxConcurrency 只能设置一项正值";
+                ([.maxConcurrency, .maxConnections] | map(select((bounds | max // 0) > 0)) | length <= 1));
+        def extra($path):
+            require($path; type == "object") |
+            require($path + ".downloadSettings（请改用 split.download）"; has("downloadSettings") | not) |
+            checked((.xmux // {}) | xmux($path + ".xmux")) |
+            require($path + ".xPaddingBytes"; if has("xPaddingBytes") then .xPaddingBytes | range(1) else true end) |
+            require($path + ".scMaxEachPostBytes"; if has("scMaxEachPostBytes") then .scMaxEachPostBytes | range(1) else true end) |
+            require($path + ".scMinPostsIntervalMs"; if has("scMinPostsIntervalMs") then .scMinPostsIntervalMs | . == -1 or range(0) else true end) |
+            require($path + ".noGRPCHeader"; if has("noGRPCHeader") then .noGRPCHeader | type == "boolean" else true end);
         def download:
-            only(["address","port","network","security","realitySettings","tlsSettings","xhttpSettings","sockopt"]) and
-            ((.address // "") | type == "string" and test("^[a-zA-Z0-9_.:\\[\\]-]*$")) and
-            ((.port // 1) | port) and ((.network // "xhttp") == "xhttp") and
-            ((.security // "reality") | IN("reality","tls","none")) and
-            ((.realitySettings // {}) | only(["serverName","fingerprint","password","publicKey","shortId","spiderX"]) and all(.[]; type == "string")) and
-            ((.tlsSettings // {}) | type == "object" and (has("certificates") | not)) and
-            ((.sockopt // {}) | type == "object") and
-            ((.xhttpSettings // {}) | only(["path","host","extra"]) and
-                ((.path // "/argo") | type == "string" and startswith("/")) and
-                ((.host // "") | type == "string") and ((.extra // {}) | extra));
-        if length == 1 and (.[0] | only(["mode","server","client","split"]) and
-            ((.mode // "auto") | IN("auto","packet-up","stream-up","stream-one")) and
-            ((.server // {}) | extra) and ((.client // {}) | extra) and
-            (if .split == null then true else .split | only(["port","mode","download"]) and
-                (.port | port) and ((.mode // "packet-up") | IN("packet-up","stream-up")) and
-                ((.download // {}) | download) end)) then .[0] else error("invalid XHTTP profile") end
-    ' <<< "$1" 2>/dev/null
+            require("split.download"; only(["address","port","network","security","realitySettings","tlsSettings","xhttpSettings","sockopt"])) |
+            require("split.download.address"; (.address // "") | type == "string" and test("^[a-zA-Z0-9_.:\\[\\]-]*$")) |
+            require("split.download.port"; (.port // 1) | port) |
+            require("split.download.network"; (.network // "xhttp") == "xhttp") |
+            require("split.download.security"; (.security // "reality") | IN("reality","tls","none")) |
+            require("split.download.realitySettings"; (.realitySettings // {}) |
+                only(["serverName","fingerprint","password","publicKey","shortId","spiderX"]) and all(.[]; type == "string")) |
+            require("split.download.tlsSettings"; (.tlsSettings // {}) | type == "object" and (has("certificates") | not)) |
+            require("split.download.sockopt"; (.sockopt // {}) | type == "object") |
+            checked((.xhttpSettings // {}) |
+                require("split.download.xhttpSettings"; only(["path","host","extra"])) |
+                require("split.download.xhttpSettings.path"; (.path // "/argo") | type == "string" and startswith("/")) |
+                require("split.download.xhttpSettings.host"; (.host // "") | type == "string") |
+                checked((.extra // {}) | extra("split.download.xhttpSettings.extra")));
+        (if length == 1 then .[0] else error("XHTTP 请输入一个 JSON 对象") end) |
+        require("配置对象（允许 mode、server、client、split）"; only(["mode","server","client","split"])) |
+        require("mode（auto、packet-up、stream-up 或 stream-one）"; (.mode // "auto") | IN("auto","packet-up","stream-up","stream-one")) |
+        checked((.server // {}) | extra("server")) |
+        checked((.client // {}) | extra("client")) |
+        checked(.split | if . == null then . else
+            require("split（允许 port、mode、download）"; only(["port","mode","download"])) |
+            require("split.port（1–65535 的整数）"; .port | port) |
+            require("split.mode（packet-up 或 stream-up）"; (.mode // "packet-up") | IN("packet-up","stream-up")) |
+            checked((.download // {}) | download) end)
+    ' <<< "$1" 2>&1) || {
+        case "${_checked}" in
+            *': XHTTP '*) log_error "XHTTP ${_checked#*: XHTTP }" ;;
+            *"parse error:"*) log_error "XHTTP JSON 语法无效" ;;
+            *) log_error "无法校验 XHTTP JSON" ;;
+        esac
+        return 1
+    }
+    printf '%s\n' "${_checked}"
 }
 
-_argo_xhttp_apply_profile() {
-    st_set '.argo.xhttp = $profile' --argjson profile "$1" || return 1
-    if [ "$(st_get '.argo.enabled')" = true ]; then
+_xhttp_apply_profile() {
+    local _module="$1" _profile="$2"
+    st_set '.[$inbound_id].xhttp = $profile' --arg inbound_id "${_module}" --argjson profile "${_profile}" || return 1
+    if [ "$(st_get '.[$inbound_id].enabled' --arg inbound_id "${_module}")" = true ]; then
         _commit_inner
     else
         st_persist
@@ -6287,26 +6315,23 @@ _argo_xhttp_set_profile() {
     if [ "${_raw}" = null ]; then
         _profile=null
     else
-        _profile=$(_argo_xhttp_validate_profile "${_raw}") || {
-            log_error "XHTTP JSON 无效，请检查模式、端口及 Extra 参数"
-            return 1
-        }
+        _profile=$(_xhttp_validate_profile "${_raw}") || return 1
     fi
     _port=$(jq -r '.split.port // empty' <<< "${_profile}") || return 1
     if [ -n "${_port}" ]; then
-        [ "$(st_get '.reality.enabled')" = true ] || { log_error "请先启用本机 Reality"; return 1; }
+        [ "$(st_get '.reality.enabled')" = true ] || { log_error "split.port：请先启用本机 Reality"; return 1; }
         if [ "${_port}" = "$(port_of argo)" ] || [ "${_port}" = "$(port_of reality)" ]; then
-            log_error "分离下行端口须与 Argo 回源和 Reality 端口不同"
+            log_error "split.port：分离下行端口须与 Argo 回源和 Reality 端口不同"
             return 1
         fi
         if _argo_xhttp_split_active; then _old_port=$(st_get '.argo.xhttp.split.port'); fi
         if [ "${_port}" != "${_old_port}" ] && port_mgr_in_use "${_port}"; then
-            log_error "分离下行端口已被占用: ${_port}"
+            log_error "split.port：分离下行端口已被占用（${_port}）"
             return 1
         fi
     fi
     if [ "${_runtime}" = 1 ]; then
-        _transaction_run "更新 Argo XHTTP" _argo_xhttp_apply_profile "${_profile}" || return 1
+        _transaction_run "更新 Argo XHTTP" _xhttp_apply_profile argo "${_profile}" || return 1
         log_ok "Argo XHTTP 配置已保存"
     else
         st_set '.argo.xhttp = $profile' --argjson profile "${_profile}" || return 1
@@ -6314,58 +6339,174 @@ _argo_xhttp_set_profile() {
     fi
 }
 
-_argo_xhttp_export_json() {
-    local _stream
-    _stream=$(_argo_xhttp_client_stream "$1") || return 1
-    jq -n --arg address "$(st_get '.cfip')" --argjson port "$(st_get '.cfport')" \
-        --arg uuid "$(st_get '.uuid')" --argjson stream "${_stream}" '
+_xhttp_export_vless_outbound() {
+    jq -n --arg address "$1" --argjson port "$2" \
+        --arg uuid "$(st_get '.uuid')" --argjson stream "$3" '
         {protocol:"vless",settings:{vnext:[{address:$address,port:$port,users:[{id:$uuid,encryption:"none"}]}]},
          streamSettings:$stream}'
 }
 
+_argo_xhttp_export_json() {
+    local _stream
+    _stream=$(_argo_xhttp_client_stream "$1") || return 1
+    _xhttp_export_vless_outbound "$(st_get '.cfip')" "$(st_get '.cfport')" "${_stream}"
+}
+
+_argo_xhttp_render_status() {
+    jq -r --argjson server "$(_argo_xhttp_server_extra)" --arg legacy "$(xpad_of argo)" '
+        ((.client // {}) | .xmux // {}) as $xmux |
+        "模式 \(.mode // "auto") · Padding \(
+            if .server == null and $legacy == "true" then "旧版设置"
+            else $server.xPaddingBytes // "Xray 默认" end)" +
+        (if .server == null and $legacy == "true" and $server.xPaddingBytes != null then
+            "（\($server.xPaddingBytes)）" else "" end),
+        "XMUX \(if ($xmux | length) == 0 then "Xray 默认" else $xmux | tojson end)",
+        (if .split == null then "分离下行 已关闭"
+         else "分离下行 TCP \(.split.port) · \(.split.mode // "packet-up")" end)
+    ' <<< "$(st_get '.argo.xhttp // {}')"
+}
+
+_xhttp_edit_advanced() {
+    local _module="$1" _runtime="$2" _draft
+    _draft=$(st_get '.[$inbound_id].xhttp // {}' --arg inbound_id "${_module}" | jq -c .) || return 1
+    while prompt '编辑单行 JSON（回车保存，清空后回车返回）: ' _draft "${_draft}" && [ -n "${_draft}" ]; do
+        if "_${_module}_xhttp_set_profile" "${_runtime}" "${_draft}"; then
+            _pause
+            return 0
+        fi
+    done
+}
+
+_xhttp_edit_field() {
+    local _module="$1" _runtime="$2" _field="$3" _label="$4" _raw='' _profile _server='{}'
+    if [ "${_module}" = argo ]; then _server=$(_argo_xhttp_server_extra) || return 1; fi
+    while prompt "${_label}（空行返回）: " _raw "${_raw}" && [ -n "${_raw}" ]; do
+        _profile=$(st_get '
+            ($path | split(".")) as $field | (.[$inbound_id].xhttp // {}) |
+            if $field[0] == "server" then .server //= $server
+            elif $field[0] == "client" then .client //= {} | .client.xmux //= {}
+            else . end |
+            if $value == "-" and $path == "mode" and $inbound_id == "cforigin" then .mode = "stream-one"
+            elif $value == "-" and $path != "split.port" then delpaths([$field])
+            else setpath($field; if ($value | test("^[0-9]+$")) then $value | tonumber else $value end) end
+        ' --arg inbound_id "${_module}" --arg path "${_field}" --arg value "${_raw}" --argjson server "${_server}")
+        if "_${_module}_xhttp_set_profile" "${_runtime}" "${_profile}"; then
+            _pause
+            return 0
+        fi
+    done
+}
+
+_xhttp_edit_common() {
+    local _module="$1" _runtime="$2" _choice _field _label _last=6
+    [ "${_module}" != argo ] || _last=7
+    while true; do
+        log_title "══ $(module_label "${_module}") XHTTP 常用参数 ══"
+        "_${_module}_xhttp_render_status"
+        _menu_print_action 1 "传输模式"
+        _menu_print_action 2 "Padding 字节范围"
+        _menu_print_action 3 "XMUX 最大连接数"
+        _menu_print_action 4 "XMUX 最大并发数"
+        _menu_print_action 5 "XMUX 每连接请求数"
+        _menu_print_action 6 "XMUX 连接复用时长（秒）"
+        if [ "${_module}" = argo ]; then _menu_print_action 7 "分离节点上行模式"; fi
+        _menu_print_back
+        prompt "请选择常用参数 (0-${_last}): " _choice || return 0
+        case "${_choice}" in
+            0) return 0 ;;
+            1) _field=mode; _label='auto、packet-up、stream-up 或 stream-one' ;;
+            2) _field=server.xPaddingBytes; _label='Padding 字节数或范围，如 128-768' ;;
+            3) _field=client.xmux.maxConnections; _label='最大连接数或范围' ;;
+            4) _field=client.xmux.maxConcurrency; _label='最大并发数或范围' ;;
+            5) _field=client.xmux.hMaxRequestTimes; _label='每连接请求数或范围，如 600-900' ;;
+            6) _field=client.xmux.hMaxReusableSecs; _label='连接复用时长或范围，如 1800-3000' ;;
+            7)
+                if [ "${_module}" != argo ]; then log_error "无效选项，请按提示输入"; continue; fi
+                if [ "$(st_get '.argo.xhttp.split | type')" != object ]; then
+                    log_warn "请先在上一级启用分离下行"
+                    continue
+                fi
+                _field=split.mode; _label='packet-up 或 stream-up'
+                ;;
+            *) log_error "无效选项，请按提示输入"; continue ;;
+        esac
+        _xhttp_edit_field "${_module}" "${_runtime}" "${_field}" "${_label}，输入 - 恢复该项默认值"
+    done
+}
+
+_argo_xhttp_export_menu() {
+    local _choice _kind _label
+    while true; do
+        log_title "══ 导出 Argo XHTTP 节点 ══"
+        _menu_print_action 1 "普通 XHTTP"
+        if _argo_xhttp_split_active; then
+            _menu_print_action 2 "分离 XHTTP"
+        else
+            _menu_print_action 2 "分离 XHTTP（下行未启用）"
+        fi
+        _menu_print_back
+        prompt '选择节点 (0-2): ' _choice || return 0
+        case "${_choice}" in
+            0) return 0 ;;
+            1) _kind=normal; _label='普通 XHTTP' ;;
+            2)
+                if ! _argo_xhttp_split_active; then
+                    log_warn "请先启用分离下行"
+                    continue
+                fi
+                _kind='split'; _label='分离 XHTTP'
+                ;;
+            *) log_error "无效选项，请按提示输入"; continue ;;
+        esac
+        while true; do
+            log_title "══ ${_label} ══"
+            _menu_print_action 1 "分享链接"
+            _menu_print_action 2 "客户端出站 JSON"
+            _menu_print_back
+            prompt '选择格式 (0-2): ' _choice || return 0
+            case "${_choice}" in
+                0) break ;;
+                1) _argo_xhttp_link "${_kind}" || log_warn "无法生成 ${_label} 分享链接"; _pause; break ;;
+                2) _argo_xhttp_export_json "${_kind}" || log_warn "无法生成 ${_label} 出站 JSON"; _pause; break ;;
+                *) log_error "无效选项，请按提示输入" ;;
+            esac
+        done
+    done
+}
+
 _argo_xhttp_menu() {
-    local _runtime="$1" _choice _profile _port
+    local _runtime="$1" _choice _profile
     if [ "$(st_get '.argo.protocol')" != xhttp ] || [ "$(st_get '.argo.auth_protocol')" != vless ]; then
         log_warn "请先选择 Argo 的 VLESS XHTTP 传输"
         return 1
     fi
     while true; do
         log_title "══ Argo XHTTP 配置 ══"
+        _argo_xhttp_render_status
         _menu_print_action 1 "使用 Xray 默认参数（auto，清空 Extra 和分离）"
-        _menu_print_action 2 "编辑模式、Extra 与下行覆盖（单行 JSON）"
-        _menu_print_action 3 "启用分离下行并引用本机 Reality"
-        _menu_print_action 4 "显示客户端出站 JSON"
+        _menu_print_action 2 "高级 Extra 与下行覆盖（单行 JSON）"
+        _menu_print_action 3 "启用分离下行或修改端口"
+        _menu_print_action 4 "导出分享链接或客户端出站 JSON"
         _menu_print_action 5 "恢复旧版 xPadding 配置"
         _menu_print_action 6 "关闭分离，保留 Extra"
+        _menu_print_action 7 "逐项编辑常用参数"
         _menu_print_back
-        prompt "请选择操作 (0-6): " _choice || return 1
+        prompt "请选择操作 (0-7): " _choice || return 0
         case "${_choice}" in
             0) return 0 ;;
             1) _argo_xhttp_set_profile "${_runtime}" '{"server":{},"client":{}}' ;;
             2)
-                st_get '.argo.xhttp // {}' | jq -c .
                 log_info 'JSON 字段: mode, server（入站 Extra）, client（客户端 Extra）, split（port/mode/download）'
-                prompt '粘贴单行 JSON（回车取消）: ' _profile || return 1
-                [ -z "${_profile}" ] || _argo_xhttp_set_profile "${_runtime}" "${_profile}"
-                ;;
-            3)
-                prompt 'Reality 分离下行端口（独立于现有 Reality，回车取消）: ' _port || return 1
-                [ -n "${_port}" ] || continue
-                _port=$(val_port "${_port}") || continue
-                _profile=$(st_get '.argo.xhttp // {} | .split.port = ($port | tonumber)' --arg port "${_port}") || continue
-                _argo_xhttp_set_profile "${_runtime}" "${_profile}"
-                ;;
-            4)
-                _argo_xhttp_export_json normal || log_warn "无法生成普通 XHTTP 出站 JSON"
-                if _argo_xhttp_split_active; then
-                    _argo_xhttp_export_json split || log_warn "无法生成分离出站 JSON，请检查 Reality 公钥和下行地址"
-                fi
-                ;;
+                _xhttp_edit_advanced argo "${_runtime}"
+                continue ;;
+            3) _xhttp_edit_field argo "${_runtime}" split.port 'Reality 分离下行端口（独立于现有 Reality）'; continue ;;
+            4) _argo_xhttp_export_menu; continue ;;
             5) _argo_xhttp_set_profile "${_runtime}" null ;;
             6)
                 _profile=$(st_get '.argo.xhttp | if type == "object" then del(.split) else null end')
                 _argo_xhttp_set_profile "${_runtime}" "${_profile:-null}"
                 ;;
+            7) _xhttp_edit_common argo "${_runtime}"; continue ;;
             *) log_error "无效选项，请按提示输入" ;;
         esac
         _pause
@@ -6419,7 +6560,7 @@ unified_menu_argo() {
         fi
         _menu_print_back
         _hr
-        prompt "请选择操作 $( [ "${_runtime}" -eq 1 ] && printf '(0-9/x/r/h/v/u)' || printf '(0-9/x)' ): " _c
+        prompt "请选择操作 $( [ "${_runtime}" -eq 1 ] && printf '(0-9/x/r/h/v/u)' || printf '(0-9/x)' ): " _c || return 0
         case "${_c:-}" in
             1) _unified_toggle_or_plan "${_runtime}" argo "${_en}" install_plan_argo_toggle || true ;;
             2) _unified_dispatch_or_plan "${_runtime}" argo update_protocol install_plan_argo_update_protocol || true ;;
@@ -6435,7 +6576,7 @@ unified_menu_argo() {
                     _unified_runtime_fn_or_plan "${_runtime}" install_plan_argo_toggle_xpad _menu_toggle_xpad argo Argo || true
                 fi ;;
             9) log_info "Argo: ${_summary}" ;;
-            x) _argo_xhttp_menu "${_runtime}" ;;
+            x) _argo_xhttp_menu "${_runtime}" && continue ;;
             r) _unified_runtime_only_fn "${_runtime}" _module_action_or_continue argo restart || true ;;
             h) _unified_runtime_only_fn "${_runtime}" argo_check_health || true ;;
             v) _unified_runtime_only_fn "${_runtime}" _module_action_or_continue argo show || true ;;
@@ -6492,7 +6633,7 @@ unified_menu_freeflow() {
         fi
         _menu_print_back
         _hr
-        prompt "请选择操作 $( [ "${_runtime}" -eq 1 ] && printf '(0-6/r/v/u)' || printf '(0-6)' ): " _c
+        prompt "请选择操作 $( [ "${_runtime}" -eq 1 ] && printf '(0-6/r/v/u)' || printf '(0-6)' ): " _c || return 0
         case "${_c:-}" in
             1) _unified_toggle_or_plan "${_runtime}" ff "${_active}" install_plan_ff_toggle || true ;;
             2) _unified_dispatch_or_plan "${_runtime}" ff update_mode install_plan_ff_update_mode || true ;;
@@ -6550,7 +6691,7 @@ unified_menu_reality() {
         fi
         _menu_print_back
         _hr
-        prompt "请选择操作 $( [ "${_runtime}" -eq 1 ] && printf '(0-6/k/r/v/u)' || printf '(0-6)' ): " _c
+        prompt "请选择操作 $( [ "${_runtime}" -eq 1 ] && printf '(0-6/k/r/v/u)' || printf '(0-6)' ): " _c || return 0
         case "${_c:-}" in
             1) _unified_toggle_or_plan "${_runtime}" reality "${_en}" install_plan_reality_toggle || true ;;
             2) _unified_dispatch_or_plan "${_runtime}" reality update_port install_plan_reality_update_port || true ;;
@@ -6603,7 +6744,7 @@ unified_menu_vltcp() {
         fi
         _menu_print_back
         _hr
-        prompt "请选择操作 $( [ "${_runtime}" -eq 1 ] && printf '(0-4/r/v/u)' || printf '(0-4)' ): " _c
+        prompt "请选择操作 $( [ "${_runtime}" -eq 1 ] && printf '(0-4/r/v/u)' || printf '(0-4)' ): " _c || return 0
         case "${_c:-}" in
             1) _unified_toggle_or_plan "${_runtime}" vltcp "${_en}" install_plan_vltcp_toggle || true ;;
             2) _unified_dispatch_or_plan "${_runtime}" vltcp update_port install_plan_vltcp_update_port || true ;;
@@ -6656,7 +6797,7 @@ unified_menu_vlquic() {
         fi
         _menu_print_back
         _hr
-        prompt "请选择操作 $( [ "${_runtime}" -eq 1 ] && printf '(0-5/r/v/u)' || printf '(0-5)' ): " _c
+        prompt "请选择操作 $( [ "${_runtime}" -eq 1 ] && printf '(0-5/r/v/u)' || printf '(0-5)' ): " _c || return 0
         case "${_c:-}" in
             1) _unified_toggle_or_plan "${_runtime}" vlquic "${_en}" install_plan_vlquic_toggle || true ;;
             2) _unified_dispatch_or_plan "${_runtime}" vlquic update_port install_plan_vlquic_update_port || true ;;
@@ -6675,6 +6816,108 @@ unified_menu_vlquic() {
                 fi ;;
             0) return 0 ;;
             *) log_error "无效选项，请按提示输入" ;;
+        esac
+        _pause
+    done
+}
+
+_cforigin_xhttp_set_profile() {
+    local _runtime="$1" _raw="$2" _profile _invalid
+    if [ "${_raw}" = null ]; then
+        _profile=null
+    else
+        _profile=$(_xhttp_validate_profile "${_raw}") || return 1
+        _invalid=$(jq -r '
+            if has("split") then "split（仅 Argo 支持）"
+            elif (.mode | type | IN("null","string") | not) then "mode"
+            elif (.server | type | IN("null","object") | not) then "server"
+            elif (.client | type | IN("null","object") | not) then "client"
+            elif (.server // {} | has("xhttpModeH3")) then "server.xhttpModeH3（请在上一级用 8 设置）"
+            elif (.client // {} | has("xhttpModeH3")) then "client.xhttpModeH3（请在上一级用 8 设置）"
+            else empty end
+        ' <<< "${_profile}") || return 1
+        [ -z "${_invalid}" ] || { log_error "CF Origin XHTTP 字段无效: ${_invalid}"; return 1; }
+        _profile=$(jq -ce --arg mode "$(st_get '.cforigin.xhttp.mode // "stream-one"')" '.mode //= $mode' <<< "${_profile}") || return 1
+    fi
+    if [ "${_runtime}" = 1 ]; then
+        _transaction_run "更新 CF Origin XHTTP" _xhttp_apply_profile cforigin "${_profile}" || return 1
+        log_ok "CF Origin XHTTP 配置已保存"
+    else
+        st_set '.cforigin.xhttp = $profile' --argjson profile "${_profile}" || return 1
+        log_ok "CF Origin XHTTP 已写入安装计划"
+    fi
+}
+
+_cforigin_xhttp_export_json() {
+    local _domain _stream
+    _domain=$(st_get '.cforigin.domain') || return 1
+    [ -n "${_domain}" ] || { log_warn "请先配置 CF Origin 域名，再导出出站 JSON"; return 1; }
+    _stream=$(_cforigin_xhttp_client_stream) || return 1
+    _xhttp_export_vless_outbound "${_domain}" "$(st_get '.cforigin.edge_port')" "${_stream}"
+}
+
+_cforigin_xhttp_render_status() {
+    jq -r --arg edge_h3 "$(st_get '.cforigin.edge_h3')" '
+        "  当前模式 \(.mode // "stream-one") · Padding \(.server.xPaddingBytes // "Xray 默认")",
+        "  XMUX \(if (.client.xmux // {} | length) == 0 then "Xray 默认" else .client.xmux | tojson end)",
+        "  Edge HTTP/3 \(if $edge_h3 == "true" then "已启用（实验性）" else "已关闭" end)"
+    ' <<< "$(st_get '.cforigin.xhttp // {}')"
+}
+
+_cforigin_xhttp_export_menu() {
+    local _choice
+    while true; do
+        log_title "══ 导出 CF Origin XHTTP 节点 ══"
+        _menu_print_action 1 "分享链接"
+        _menu_print_action 2 "客户端出站 JSON"
+        _menu_print_back
+        prompt '选择格式 (0-2): ' _choice || return 0
+        case "${_choice}" in
+            0) return 0 ;;
+            1) _cforigin_xhttp_link || true ;;
+            2) _cforigin_xhttp_export_json || true ;;
+            *) log_error "无效选项，请按提示输入"; continue ;;
+        esac
+        _pause
+        return 0
+    done
+}
+
+_cforigin_xhttp_menu() {
+    local _runtime="$1" _choice _mode _profile _input
+    [ "$(st_get '.cforigin.protocol')" = xhttp ] || { log_warn "请先选择 CF Origin 的 XHTTP 传输"; return 1; }
+    while true; do
+        log_title "CF Origin / XHTTP"
+        _cforigin_xhttp_render_status
+        _menu_print_action 1 "选择传输模式"
+        _menu_print_action 2 "编辑服务端和客户端 Extra JSON"
+        _menu_print_action 3 "导出分享链接或客户端出站 JSON"
+        _menu_print_action 4 "恢复 stream-one 和默认 Extra"
+        _menu_print_action 5 "逐项编辑常用参数"
+        _menu_print_back
+        prompt "请选择操作 (0-5): " _choice || return 0
+        case "${_choice}" in
+            0) return 0 ;;
+            1)
+                prompt "传输模式（1 stream-one，2 auto，3 packet-up，4 stream-up，回车返回）: " _input || return 0
+                case "${_input}" in
+                    1) _mode=stream-one ;;
+                    2) _mode=auto ;;
+                    3) _mode=packet-up ;;
+                    4) _mode=stream-up ;;
+                    '') continue ;;
+                    *) log_error "请输入 1–4 选择传输模式"; _pause; continue ;;
+                esac
+                _profile=$(st_get '.cforigin.xhttp // {} | .mode = $mode' --arg mode "${_mode}")
+                _cforigin_xhttp_set_profile "${_runtime}" "${_profile}" || true ;;
+            2)
+                log_info 'JSON 字段: mode, server（入站 Extra）, client（客户端 Extra）'
+                _xhttp_edit_advanced cforigin "${_runtime}"
+                continue ;;
+            3) _cforigin_xhttp_export_menu; continue ;;
+            4) _cforigin_xhttp_set_profile "${_runtime}" null || true ;;
+            5) _xhttp_edit_common cforigin "${_runtime}"; continue ;;
+            *) log_error "请输入 0–5 选择操作" ;;
         esac
         _pause
     done
@@ -6713,6 +6956,7 @@ unified_menu_cforigin() {
         _menu_print_action 8 "切换客户端到 Cloudflare Edge HTTP/3（仅 XHTTP）"
         _menu_print_action 9 "配置域名/证书"
         _menu_print_action a "查看当前节点摘要"
+        _menu_print_action x "XHTTP 参数与节点导出"
         if [ "${_runtime}" -eq 1 ]; then
             _hr
             _menu_print_action r "重启 xray2go 服务"
@@ -6721,7 +6965,7 @@ unified_menu_cforigin() {
         fi
         _menu_print_back
         _hr
-        prompt "请选择操作 $( [ "${_runtime}" -eq 1 ] && printf '(0-9/a/r/v/u)' || printf '(0-9/a)' ): " _c
+        prompt "请选择操作 $( [ "${_runtime}" -eq 1 ] && printf '(0-9/a/x/r/v/u)' || printf '(0-9/a/x)' ): " _c || return 0
         case "${_c:-}" in
             1) _unified_toggle_or_plan "${_runtime}" cforigin "${_en}" install_plan_cforigin_toggle || true ;;
             2) _unified_dispatch_or_plan "${_runtime}" cforigin update_protocol install_plan_cforigin_update_protocol || true ;;
@@ -6733,6 +6977,7 @@ unified_menu_cforigin() {
             8) _unified_dispatch_or_plan "${_runtime}" cforigin toggle_edge_h3 install_plan_cforigin_toggle_edge_h3 || true ;;
             9) _unified_dispatch_or_plan "${_runtime}" cforigin update_cert install_plan_cforigin_update_cert || true ;;
             a) log_info "CF Origin: ${_summary}" ;;
+            x) _cforigin_xhttp_menu "${_runtime}" && continue ;;
             r) _unified_runtime_only_fn "${_runtime}" _module_action_or_continue cforigin restart || true ;;
             v) _unified_runtime_only_fn "${_runtime}" _module_action_or_continue cforigin show || true ;;
             u)
@@ -6780,7 +7025,7 @@ unified_menu_socks() {
         fi
         _menu_print_back
         _hr
-        prompt "请选择操作 $( [ "${_runtime}" -eq 1 ] && printf '(0-6/r/v/u)' || printf '(0-6)' ): " _c
+        prompt "请选择操作 $( [ "${_runtime}" -eq 1 ] && printf '(0-6/r/v/u)' || printf '(0-6)' ): " _c || return 0
         case "${_c:-}" in
             1) _unified_toggle_or_plan "${_runtime}" socks "${_en}" install_plan_socks_toggle || true ;;
             2) _unified_dispatch_or_plan "${_runtime}" socks update_port install_plan_socks_update_port || true ;;
@@ -6836,7 +7081,7 @@ unified_menu_ss2022() {
         fi
         _menu_print_back
         _hr
-        prompt "请选择操作 $( [ "$_runtime" -eq 1 ] && printf '(0-6/r/v/u)' || printf '(0-6)' ): " _c
+        prompt "请选择操作 $( [ "$_runtime" -eq 1 ] && printf '(0-6/r/v/u)' || printf '(0-6)' ): " _c || return 0
         case "$_c" in
             1) _unified_toggle_or_plan "$_runtime" ss2022 "$_en" install_plan_ss2022_toggle || true ;;
             2) _unified_dispatch_or_plan "$_runtime" ss2022 update_port install_plan_ss2022_update_port || true ;;
@@ -6891,7 +7136,7 @@ unified_menu_http() {
         fi
         _menu_print_back
         _hr
-        prompt "请选择操作 $( [ "${_runtime}" -eq 1 ] && printf '(0-6/r/v/u)' || printf '(0-6)' ): " _c
+        prompt "请选择操作 $( [ "${_runtime}" -eq 1 ] && printf '(0-6/r/v/u)' || printf '(0-6)' ): " _c || return 0
         case "${_c:-}" in
             1) _unified_toggle_or_plan "${_runtime}" http "${_en}" install_plan_http_toggle || true ;;
             2) _unified_dispatch_or_plan "${_runtime}" http update_port install_plan_http_update_port || true ;;
@@ -7015,24 +7260,24 @@ install_plan_menu() {
     while true; do
         install_plan_render_summary
         local _c
-        prompt "请选择操作 (0-13): " _c
+        prompt "请选择操作 (0-13): " _c || return 0
         echo ""
         case "${_c:-}" in
-            1) unified_menu_argo install || true ;;
-            2) unified_menu_freeflow install || true ;;
-            3) unified_menu_reality install || true ;;
-            4) unified_menu_vltcp install || true ;;
-            5) unified_menu_socks install || true ;;
-            6) unified_menu_vlquic install || true ;;
-            7) unified_menu_cforigin install || true ;;
+            1) unified_menu_argo install && continue ;;
+            2) unified_menu_freeflow install && continue ;;
+            3) unified_menu_reality install && continue ;;
+            4) unified_menu_vltcp install && continue ;;
+            5) unified_menu_socks install && continue ;;
+            6) unified_menu_vlquic install && continue ;;
+            7) unified_menu_cforigin install && continue ;;
             8) install_plan_configure_uuid || true ;;
             9) install_plan_reset_defaults || true; log_info "安装计划已重置为初始状态" ;;
             10) install_plan_validate || true ;;
             11)
                 install_wizard_confirm && return 0
                 ;;
-            12) unified_menu_http install || true ;;
-            13) unified_menu_ss2022 install || true ;;
+            12) unified_menu_http install && continue ;;
+            13) unified_menu_ss2022 install && continue ;;
             0)
                 log_info "已取消安装并返回主菜单"
                 return 0 ;;
@@ -7045,39 +7290,21 @@ install_plan_menu() {
 module_xray_install() {
     if [ "${_MENU_XI}" -eq 1 ]; then
         if [ "${_MENU_CX}" -eq 0 ]; then
-            log_warn "Xray-2go 已安装并运行，如需重装请先卸载 (选项 2)"; return
+            log_warn "Xray-2go 已安装并运行，如需重装请先卸载 (按 u)"; return
         fi
-        log_warn "Xray-2go 已安装但未运行；如需重装请先卸载 (选项 2)，如需启动请进入对应管理菜单。"; return
+        log_warn "Xray-2go 已安装但未运行；如需重装请先卸载 (按 u)，如需启动请进入对应管理菜单。"; return
     fi
     install_plan_reset_defaults || { log_error "安装计划初始化失败"; return 1; }
     install_wizard_menu
 }
 menu() {
-    local _MENU_XS="" _MENU_XC="" _MENU_CX=1 _MENU_XI=0
-    local _MENU_AD="" _MENU_FD="" _MENU_RD="" _MENU_VD="" _MENU_QD="" _MENU_CD="" _MENU_SD="" _MENU_HD="" _MENU_SSD=""
+    local _MENU_CX=1 _MENU_XI=0 _choice
     while true; do
         _menu_collect_status
         _menu_render
-        local _c; prompt "请选择操作 (0-13/s): " _c; echo ""
-        case "${_c:-}" in
-            1) module_dispatch xray install ;;
-            2) module_dispatch xray uninstall ;;
-            3) module_dispatch argo ;;
-            4) module_dispatch reality ;;
-            5) module_dispatch vltcp ;;
-            6) module_dispatch vlquic ;;
-            7) module_dispatch ff ;;
-            8) module_dispatch cforigin ;;
-            11) module_dispatch socks ;;
-            12) module_dispatch http ;;
-            13) module_dispatch ss2022 ;;
-            9) module_dispatch nodes show ;;
-            10) module_dispatch config update_uuid ;;
-            s) module_dispatch config update_shortcut ;;
-            0) log_info "已退出"; exit 0 ;;
-            *) log_error "无效选项，请输入 0-13 或 s" ;;
-        esac
-        _pause
+        prompt "输入编号或按键: " _choice || return 0
+        printf '\n'
+        _menu_select_action "${_choice}"
     done
 }
 
@@ -7092,7 +7319,7 @@ usage() {
   xray_2go.sh reality -p <port>
 
 说明:
-  - 无参数: 首次部署进入快速向导；已安装时进入管理菜单
+  - 无参数: 打开控制台。首次部署时按 d 进入快速向导
   - reality: 非交互一键安装 VLESS + Reality (TCP)
   - reality -p <port>: 使用指定监听端口进行一键安装
 EOF

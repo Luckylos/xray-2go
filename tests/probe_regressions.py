@@ -4,7 +4,6 @@ import re
 import subprocess
 import sys
 import time
-import unicodedata
 
 
 TESTS_DIR = Path(__file__).resolve().parent
@@ -533,7 +532,6 @@ def test_cforigin_edge_h3_toggle_and_link():
     assert_true(".cforigin.edge_h3 = false" in TEXT, "CF Origin edge_h3 normalization/reset missing")
     assert_true("实验性客户端到 Cloudflare Edge HTTP/3" in TEXT, "initial CF Origin Edge HTTP/3 prompt must mark experimental")
     assert_true("切换客户端到 Cloudflare Edge HTTP/3" in TEXT, "CF Origin management toggle missing")
-    assert_true('"&alpn=h3&extra=%7B%22xhttpModeH3%22%3Atrue%7D&xhttpModeH3=true"' in TEXT, "CF Origin XHTTP H3 link parameters must include extra and compatibility flag")
     assert_true("CF-Origin-XHTTP-H3-Experimental" in TEXT, "CF Origin H3 link tag must mark experimental")
     assert_true("这不是 H3/QUIC 源站回源" in TEXT, "Cloudflare hint must clarify Edge H3 is not origin H3")
     assert_true("失败可回退普通 XHTTP/WS" in TEXT, "Cloudflare H3 prompt/hint must include rollback path")
@@ -713,15 +711,7 @@ def test_single_file_module_registry_drives_main_status():
     for name in ['_MODULE_LABELS', '_MODULE_MENU_FN', '_MODULE_RESTART_TARGET', '_MODULE_ENABLE_FN', '_MODULE_DISABLE_FN', '_MODULE_UNINSTALL_FN', '_MODULE_UPDATE_PORT_FN', '_MODULE_UPDATE_LISTEN_FN']:
         assert_true(name in TEXT, f"module metadata missing: {name}")
     assert_true('module_summary()' in TEXT and 'module_label()' in TEXT and 'module_registry_has()' in TEXT, "module metadata helpers missing")
-    collect_body = TEXT[TEXT.index('_menu_collect_status()'):TEXT.index('_menu_render()')]
-    for mod in ['argo', 'ff', 'reality', 'vltcp', 'vlquic', 'cforigin', 'socks', 'http', 'ss2022']:
-        assert_true(f'module_summary {mod}' in collect_body, f"main status should be driven by module_summary for {mod}")
-    assert_true('module_dispatch()' in TEXT, "module dispatcher skeleton missing")
-    menu_body = TEXT[TEXT.index('menu()'):TEXT.index('# ==============================================================================', TEXT.index('menu()'))]
-    for key, mod in [('1', 'xray install'), ('2', 'xray uninstall'), ('3', 'argo'), ('4', 'reality'), ('5', 'vltcp'), ('6', 'vlquic'), ('7', 'ff'), ('8', 'cforigin'), ('9', 'nodes show'), ('10', 'config update_uuid'), ('11', 'socks'), ('12', 'http'), ('s', 'config update_shortcut')]:
-        assert_true(f'{key}) module_dispatch {mod} ;;' in menu_body, f"main menu should route {mod} via module_dispatch")
-    for forbidden in ['_menu_do_install', 'exec_uninstall', 'config_print_nodes', 'cforigin_print_cloudflare_hint', 'exec_update_uuid', 'exec_update_shortcut']:
-        assert_true(forbidden not in menu_body, f"main menu should be dispatcher-only, found direct action: {forbidden}")
+    assert_true('module_dispatch()' in TEXT, "module dispatcher missing")
 
 
 def test_single_file_module_dispatch_actions():
@@ -859,7 +849,6 @@ def test_socks5_module_option_and_plugin_contract():
     assert_true('_plugin_write_socks()' in TEXT and '_plugin_write_socks' in TEXT[TEXT.index('plugin_install_builtins()'):TEXT.index('# ==============================================================================', TEXT.index('plugin_install_builtins()'))], "SOCKS5 built-in plugin must be installed")
     assert_true('_MODULE_IDS="argo ff reality vltcp vlquic cforigin socks http ss2022"' in TEXT, "module registry must include socks and http")
     assert_true('[socks]="SOCKS5"' in TEXT and '[socks]=unified_menu_socks' in TEXT, "SOCKS5 registry metadata missing")
-    assert_true('module_summary socks' in TEXT and '_MENU_SD=$(module_summary socks)' in TEXT, "main status must summarize socks")
     assert_true('_MODULE_ENABLE_FN' in TEXT and '_MODULE_UPDATE_PORT_FN' in TEXT and 'module_registry_dispatch_common' in TEXT, "SOCKS5 common actions must use registry dispatch")
     for token in ['socks:update_auth)', 'socks:update_user)', 'socks:update_pass)']:
         assert_true(token in TEXT, f"SOCKS5 specialized dispatch route missing: {token}")
@@ -1481,6 +1470,54 @@ def test_argo_xhttp_menu_and_runtime_rollback():
     assert_true('simulated commit failure' in out and 'Argo XHTTP rollback verified' in out, out)
 
 
+def test_argo_xhttp_editor_and_selected_exports():
+    import json
+    from urllib.parse import parse_qs, urlsplit
+
+    out = run_bash(r'''
+        source ./xray_2go.sh
+        set -e
+        st_init
+        st_set '.argo.enabled=true | .argo.protocol="xhttp" | .argo.domain="tunnel.example.com" |
+                .xpad.argo=true | .argo.xhttp.client=false |
+                .reality.enabled=true | .reality.pbk="fixture-public" |
+                .reality.pvk="fixture-private" | .reality.sni="example.com" | .reality.sid="abcd"'
+        port_mgr_in_use() { return 1; }
+        platform_get_realip() { printf '192.0.2.10\n'; }
+        _pause() { :; }
+        candidate='{"client":{"xmux":{"maxConcurrency":2,"maxConnections":3}}}'
+        fixed='{"mode":"auto","server":{"xPaddingBytes":"128-768"},"client":{"xmux":{"maxConcurrency":2}},"split":{"port":28443,"download":{"xhttpSettings":{"extra":{"xmux":{"maxConnections":5}}}}}}'
+        prompt() {
+            if [ "${3:-}" = "$candidate" ]; then printf 'Advanced draft retained\n'; fi
+            IFS= read -r "$2"
+        }
+        _argo_xhttp_menu 0 <<< $'7\n2\n900-100\n128-768\n3\n2\n0\n0'
+        jq -e '.argo.xhttp | .server.xPaddingBytes == "128-768" and
+            .server.xPaddingObfsMode == true and .client.xmux.maxConnections == 2' <<< "${_G_STATE}" >/dev/null
+        _argo_xhttp_menu 0 <<< $'2\n'"$candidate"$'\n'"$fixed"$'\n7\n3\n3\n-\n4\n4\n7\nstream-up\n0\n4\n1\n0\n1\n1\n2\n1\n2\n2\n0\n0'
+        jq -e '.argo.xhttp | .mode == "auto" and .client.xmux.maxConcurrency == 4 and
+            .split.download.xhttpSettings.extra.xmux.maxConnections == 5' <<< "${_G_STATE}" >/dev/null
+        printf 'Argo editor state verified\n'
+    ''', timeout=40)
+    for marker in ('server.xPaddingBytes', 'client.xmux.maxConnections', 'Advanced draft retained',
+                   'Padding 旧版设置', '分离下行 TCP 28443', 'Argo editor state verified'):
+        assert_true(marker in out, f'Missing {marker}: {out}')
+    links = [urlsplit(line) for line in out.splitlines() if line.startswith('vless://')]
+    assert [link.fragment for link in links] == ['Argo-XHTTP', 'Argo-XHTTP-Split']
+    normal_extra, split_extra = [json.loads(parse_qs(link.query)['extra'][0]) for link in links]
+    assert 'downloadSettings' not in normal_extra
+    decoder = json.JSONDecoder()
+    outbound, _ = decoder.raw_decode(out[out.index('{\n  "protocol": "vless"'):])
+    assert outbound['streamSettings']['xhttpSettings']['extra'] == split_extra
+    expected_public_key = 'fixture-public'
+    assert split_extra['downloadSettings']['realitySettings']['password'] == expected_public_key
+    assert parse_qs(links[0].query)['mode'] == ['auto']
+    assert parse_qs(links[1].query)['mode'] == ['stream-up']
+    assert outbound['streamSettings']['xhttpSettings']['mode'] == 'stream-up'
+    assert out.count('{\n  "protocol": "vless"') == 1
+    assert 'fixture-private' not in out
+
+
 def test_help_runs_before_privileged_setup():
     out = run_bash(r'''
         source ./xray_2go.sh
@@ -1887,6 +1924,112 @@ def test_argo_domain_update_rolls_back_null_domain_type_on_apply_failure():
     assert_true(cp.returncode == 0, "null-domain rollback probe should complete")
     assert_true("module-rc=0" not in cp.stdout, "domain update must fail when Argo apply fails")
     assert_true("domain_type=null" in cp.stdout, "Argo domain rollback must preserve JSON null type")
+
+
+def test_cforigin_xhttp_menu_profiles_and_links():
+    import json
+    from urllib.parse import parse_qs, urlsplit
+
+    out = run_bash(r'''
+        source ./xray_2go.sh
+        set -e
+        st_init
+        st_set '.cforigin.enabled=true | .cforigin.origin_tls=false | .cforigin.protocol="xhttp" |
+                .cforigin.domain="origin.example.com" | .cforigin.edge_port=8443 | .cforigin.path="/origin-test" |
+                del(.cforigin.xhttp)'
+        plugin_refresh_runtime
+        printf 'LEGACY=%s\n' "$(_plg_cforigin_link)"
+        check_xray() { return 1; }
+        clear() { :; }
+        _pause() { :; }
+        prompt() { IFS= read -r "$2"; }
+        unified_menu_cforigin install <<< $'x\n1\n3\n2\n{"server":{"xPaddingBytes":"128-768","scMaxBufferedPosts":35},"client":{"xmux":{"maxConnections":4}}}\n0\n0'
+        for bad in '{"split":{"port":28443}}' '{"client":{"xmux":{"maxConnections":2,"maxConcurrency":3}}}' '{"client":{"xhttpModeH3":true}}'; do
+            if _cforigin_xhttp_set_profile 0 "$bad"; then exit 1; fi
+        done
+        printf 'INBOUND=%s\n' "$(_plg_cforigin_inbound | jq -c .)"
+        printf 'NORMAL=%s\n' "$(_plg_cforigin_link)"
+        st_set '.cforigin.edge_h3=true'
+        rejected='{"client":{"xhttpModeH3":true}}'
+        corrected='{"server":{"xPaddingBytes":"128-768","scMaxBufferedPosts":35},"client":{"xmux":{"maxConnections":3}}}'
+        prompt() {
+            if [ "${3:-}" = "$rejected" ]; then printf 'Origin draft retained\n'; fi
+            IFS= read -r "$2"
+        }
+        _cforigin_xhttp_menu 0 <<< $'2\n'"$rejected"$'\n'"$corrected"$'\n5\n3\n4\n0\n3\n1\n3\n2\n0'
+        printf 'H3=%s\n' "$(_plg_cforigin_link)"
+        printf 'OUTBOUND=%s\n' "$(_cforigin_xhttp_export_json | jq -c .)"
+        st_set '.cforigin.protocol="ws"'
+        printf 'WS=%s\n' "$(_plg_cforigin_link)"
+        st_set '.cforigin.protocol="xhttp"'
+        _cforigin_xhttp_set_profile 0 null
+        printf 'DEFAULT=%s\n' "$(_plg_cforigin_link)"
+        printf 'CF Origin generated outputs verified\n'
+    ''', timeout=35)
+    assert_true('CF Origin generated outputs verified' in out, out)
+    assert_true('Origin draft retained' in out and 'client.xhttpModeH3' in out, out)
+    exported_link = next(line for line in out.splitlines() if line.startswith('vless://'))
+    assert_true(f'H3={exported_link}' in out, out)
+    json_start = '{\n  "protocol": "vless"'
+    assert_true(out.count(json_start) == 1, out)
+    exported_json, _ = json.JSONDecoder().raw_decode(out[out.index(json_start):])
+    assert_true('XHTTP 参数与节点导出' in out, out)
+    values = dict(re.findall(r'^(LEGACY|INBOUND|NORMAL|H3|OUTBOUND|WS|DEFAULT)=(.*)$', out, re.MULTILINE))
+    assert exported_json == json.loads(values['OUTBOUND'])
+    legacy = parse_qs(urlsplit(values['LEGACY']).query)
+    inbound = json.loads(values['INBOUND'])
+    normal_url = urlsplit(values['NORMAL'])
+    normal = parse_qs(normal_url.query)
+    h3_url = urlsplit(values['H3'])
+    h3 = parse_qs(h3_url.query)
+    outbound = json.loads(values['OUTBOUND'])
+    ws = parse_qs(urlsplit(values['WS']).query)
+    default = parse_qs(urlsplit(values['DEFAULT']).query)
+    expected_extra = {'xPaddingBytes': '128-768', 'xmux': {'maxConnections': 4}}
+    assert_true(legacy['mode'] == ['stream-one'] and 'extra' not in legacy, legacy)
+    assert_true(inbound['streamSettings']['xhttpSettings'] == {
+        'path': '/origin-test', 'mode': 'packet-up',
+        'extra': {'xPaddingBytes': '128-768', 'scMaxBufferedPosts': 35},
+    }, inbound)
+    assert_true(normal_url.hostname == 'origin.example.com' and normal_url.port == 8443, normal_url)
+    assert_true(normal['mode'] == ['packet-up'] and json.loads(normal['extra'][0]) == expected_extra, normal)
+    h3_extra = {**expected_extra, 'xhttpModeH3': True}
+    assert_true(len(h3['extra']) == 1 and json.loads(h3['extra'][0]) == h3_extra, h3)
+    assert_true(h3['alpn'] == ['h3'] and h3['xhttpModeH3'] == ['true'] and h3_url.fragment.endswith('Experimental'), h3_url)
+    stream = outbound['streamSettings']
+    server = outbound['settings']['vnext'][0]
+    assert_true((server['address'], server['port']) == ('origin.example.com', 8443), server)
+    assert_true(stream['tlsSettings']['alpn'] == ['h3'] and stream['tlsSettings']['serverName'] == 'origin.example.com', stream)
+    assert_true(stream['xhttpSettings'] == {
+        'host': 'origin.example.com', 'path': '/origin-test', 'mode': 'packet-up', 'extra': h3_extra,
+    }, stream)
+    assert_true(ws['type'] == ['ws'] and 'mode' not in ws and 'extra' not in ws, ws)
+    assert_true(default['mode'] == ['stream-one'] and json.loads(default['extra'][0]) == {'xhttpModeH3': True}, default)
+
+
+def test_cforigin_xhttp_runtime_profile_rolls_back():
+    out = run_bash(r'''
+        source ./xray_2go.sh
+        set -e
+        st_init
+        st_set '.cforigin.enabled=true | .cforigin.protocol="xhttp"'
+        _commit_inner() { st_persist; }
+        _cforigin_xhttp_set_profile 1 '{"mode":"stream-up","server":{"xPaddingBytes":"100-300"}}'
+        printf '%s' original > "${CONFIG_FILE}"
+        _commit_inner() {
+            [ "$(st_get '.cforigin.xhttp.mode')" = packet-up ] || return 1
+            printf '%s' modified > "${CONFIG_FILE}"
+            st_persist || return 1
+            printf '%s\n' 'simulated CF Origin commit failure'
+            return 1
+        }
+        if _cforigin_xhttp_set_profile 1 '{"mode":"packet-up"}'; then exit 1; fi
+        [ "$(cat "${CONFIG_FILE}")" = original ]
+        [ "$(st_get '.cforigin.xhttp.mode')" = stream-up ]
+        jq -e '.cforigin.xhttp.mode == "stream-up"' "${STATE_FILE}" >/dev/null
+        printf '%s\n' 'CF Origin XHTTP rollback verified'
+    ''', timeout=30)
+    assert_true('simulated CF Origin commit failure' in out and 'CF Origin XHTTP rollback verified' in out, out)
 
 
 def test_cforigin_plain_http_does_not_require_certificates():
@@ -3159,47 +3302,73 @@ grep -q 'Shadowsocks 2022 端口已更新: 10007（TCP/UDP）' "$_msg_file" && p
     assert_true("msg=ok" in out, f"port update message should name the module and protocol: {out}")
 
 
-def test_main_menu_status_rows_align_to_box():
-    enabled_prelude = (
-        "st_init >/dev/null 2>&1\n"
-        "st_set '.cforigin.enabled = true | .cforigin.protocol = \"cloudflare\" | .cforigin.domain = \"example.com\"' >/dev/null 2>&1\n"
-        "st_set '.socks.enabled = true' >/dev/null 2>&1\n"
-        "st_set '.ss2022.enabled = true' >/dev/null 2>&1\n"
-        "st_set '.vltcp.enabled = true' >/dev/null 2>&1\n"
-    )
+def test_menu_back_redraws_parent_without_pause():
+    out = run_bash(r'''
+source ./xray_2go.sh
+st_init >/dev/null
+st_set '.argo.protocol="xhttp"'
+clear() { :; }
+check_xray_install() { return 0; }
+check_xray() { return 0; }
+_manage_module_entry_check() { :; }
+_pause() { printf 'UNEXPECTED_PAUSE\n'; }
+prompt() { printf 'page=%s\n' "$1"; IFS= read -r "$2"; }
+(menu <<< $'2\nx\n0\n0\n0')
+(install_plan_menu <<< $'1\n0\n0')
+unified_menu_argo runtime </dev/null
+    ''')
+    pages = re.findall(r'^page=(.*)$', out, re.MULTILINE)
+    expected = ['输入编号或按键', '(0-9/x/r/h/v/u)', '(0-7)', '(0-9/x/r/h/v/u)',
+                '输入编号或按键', '(0-13)', '(0-9/x)', '(0-13)', '(0-9/x/r/h/v/u)']
+    assert_true(len(pages) == len(expected) and all(hint in page for hint, page in zip(expected, pages)), pages)
+    assert_true('UNEXPECTED_PAUSE' not in out, out)
 
-    def dw(text):
-        return sum(2 if unicodedata.east_asian_width(ch) in 'WF' else 1 for ch in text)
 
-    def bar_columns(line):
-        cols, col = [], 0
-        for ch in line:
-            if ch == '║':
-                cols.append(col)
-            col += 2 if unicodedata.east_asian_width(ch) in 'WF' else 1
-        return tuple(cols)
-
-    for label, prelude in (('disabled', ''), ('enabled', enabled_prelude)):
-        out = run_bash(
-            'source ./xray_2go.sh\n'
-            + prelude
-            + '_menu_collect_status >/dev/null 2>&1\n'
-            + '_menu_render 2>/dev/null\n'
-        )
-        plain = re.sub(r'\x1b\[[0-9;]*m', '', out)
-        box = [ln for ln in plain.splitlines() if '║' in ln or '╔' in ln or '╠' in ln or '╚' in ln]
-        assert_true(len(box) >= 13, f'main menu box lines missing ({label}), got {len(box)}')
-
-        widths = sorted({dw(ln) for ln in box})
-        assert_true(
-            len(widths) == 1,
-            f'main menu box lines must share one display width ({label}), got {widths}',
-        )
-        bars = {bar_columns(ln) for ln in box if '║' in ln}
-        assert_true(
-            bars == {(2, widths[0] - 1)},
-            f'main menu box vertical bars must sit on both borders ({label}), got {bars}',
-        )
+def test_main_menu_status_and_key_dispatch():
+    out = run_bash(r'''
+source ./xray_2go.sh
+st_init >/dev/null
+clear() { :; }
+_pause() { :; }
+prompt() { IFS= read -r "$2"; }
+check_xray() { return 1; }
+check_xray_install() { return 1; }
+printf '%s\n' FIRST
+_menu_collect_status
+_menu_render
+check_xray() { return 0; }
+check_xray_install() { return 0; }
+check_argo() { printf running; }
+st_set '.argo.enabled=true | .argo.protocol="xhttp" | .argo.domain="long-argo-domain-for-terminal-width-check.example.com" |
+    .http.enabled=true | .http.listen="2001:db8:1234:5678:9101:abcd:eded:42" | .ports.http=61107'
+printf '%s\n' INSTALLED
+_menu_collect_status
+_menu_render
+printf '%s\n' ROUTES
+_menu_render() { :; }
+module_dispatch() { printf 'route=%s\n' "$*"; }
+(menu <<< $'1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\nd\nu\ns\n12\n0')
+module_dispatch() { IFS= read -r input; printf 'action stdin=%s\n' "$input"; }
+_menu_select_action s <<< original-input
+    ''', timeout=70)
+    plain = re.sub(r'\x1b\[[0-9;]*m', '', out)
+    first, installed = plain.split('FIRST\n', 1)[1].split('INSTALLED\n', 1)
+    installed, routes = installed.split('ROUTES\n', 1)
+    assert_true('未安装' in first and 'd. 开始部署（快速向导）' in first, first)
+    assert_true('Xray-2go 控制台' in installed and '运行中' in installed, installed)
+    for detail in ['long-argo-domain-for-terminal-width-check.example.com', '2001:db8:1234:5678:9101:abcd:eded:42', '61107']:
+        assert_true(detail in installed, installed)
+    for label in ['连接', '入站管理', '维护', '1. 查看节点与连接提示', '2. Argo 固定隧道', '10. Shadowsocks 2022', '11. 更新 UUID', 'u. 卸载整套 Xray-2go']:
+        assert_true(label in installed, installed)
+    overview = installed.split('连接', 1)[0]
+    assert_true('Reality' not in overview and '未启用' not in overview, overview)
+    expected = ['nodes show', 'argo', 'reality', 'vltcp', 'vlquic', 'ff', 'cforigin',
+                'socks', 'http', 'ss2022', 'config update_uuid', 'xray install',
+                'xray uninstall', 'config update_shortcut']
+    actual = re.findall(r'^route=(.*)$', routes, re.MULTILINE)
+    assert_true(actual == expected, f'main menu routes: {actual!r}')
+    assert_true('无效选项' in routes and '已退出' in routes, routes)
+    assert_true('action stdin=original-input' in routes, routes)
 
 
 def _function_body(name):
