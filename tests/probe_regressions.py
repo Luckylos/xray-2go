@@ -601,12 +601,22 @@ def test_systemd_hardening_templates():
 
 
 def test_vlquic_link_includes_explicit_h3_parameters():
-    start = TEXT.index("_plg_vlquic_link()")
-    end = TEXT.index("PLUGIN_EOF", start)
-    body = TEXT[start:end]
-    for token in ["type=xhttp", "mode=stream-one", "xhttpModeH3=true", "alpn=h3"]:
-        assert_true(token in body, f"VLESS-XHTTP-H3 share link missing explicit {token}")
-    assert_true("#VLESS-XHTTP-H3" in body, "VLESS-XHTTP-H3 link tag missing")
+    import json
+    from urllib.parse import parse_qs, urlsplit
+
+    out = run_bash(r'''
+        source ./xray_2go.sh
+        set -e
+        st_init
+        st_set '.vlquic.enabled=true | .vlquic.domain="h3.example.com"'
+        plugin_refresh_runtime
+        plugin_collect_links vlquic
+    ''')
+    link = urlsplit(next(line for line in out.splitlines() if line.startswith('vless://')))
+    query = parse_qs(link.query)
+    assert link.fragment == 'VLESS-XHTTP-H3'
+    assert query['type'] == ['xhttp'] and query['mode'] == ['stream-one'] and query['alpn'] == ['h3']
+    assert query['xhttpModeH3'] == ['true'] and json.loads(query['extra'][0]) == {'xhttpModeH3': True}
 
 
 def test_cforigin_edge_h3_toggle_and_link():
@@ -889,8 +899,6 @@ def test_single_file_module_transaction_helpers():
 def test_protocol_links_and_udp_port_input_consistency():
     vltcp = TEXT[TEXT.index('_plg_vltcp_link()'):TEXT.index('PLUGIN_EOF', TEXT.index('_plg_vltcp_link()'))]
     assert_true('encryption=none' in vltcp, "VLESS-TCP link must include encryption=none")
-    vlquic = TEXT[TEXT.index('_plg_vlquic_link()'):TEXT.index('PLUGIN_EOF', TEXT.index('_plg_vlquic_link()'))]
-    assert_true('extra=%%7B%%22xhttpModeH3%%22%%3Atrue%%7D' in vlquic, "VLESS-XHTTP-H3 link should encode xhttpModeH3 in XHTTP extra")
     assert_true('_menu_update_port()' in TEXT, "menu port updates should use shared helper")
     assert_true('port_mgr_random_proto()' in TEXT, "random port selection should be protocol-aware")
     assert_true('_port_input=$(port_mgr_random_proto "${_proto}")' in TEXT, "empty port input should use protocol-aware random selection")
@@ -2192,6 +2200,117 @@ def test_argo_domain_update_rolls_back_null_domain_type_on_apply_failure():
     assert_true("domain_type=null" in cp.stdout, "Argo domain rollback must preserve JSON null type")
 
 
+def test_freeflow_and_direct_h3_xhttp_workbench_profiles():
+    import json
+    from urllib.parse import parse_qs, urlsplit
+
+    out = run_bash(r'''
+        source ./xray_2go.sh
+        set -e
+        st_init
+        st_set '.ff.enabled=true | .ff.protocol="xhttp" | .ff.path="/ff-test" | .xpad.ff=true |
+                .vlquic.enabled=true | .vlquic.domain="h3.example.com" |
+                .vlquic.cert="/fixture/cert.pem" | .vlquic.key="/fixture/key.pem"'
+        platform_get_realip() { printf '192.0.2.20'; }
+        plugin_refresh_runtime
+        clear() { :; }
+        _pause() { :; }
+        prompt() { IFS= read -r "$2"; }
+        for m in ff vlquic; do
+            printf '%s-legacy=%s\n' "$m" "$(plugin_collect_links "$m")"
+        done
+        draft='{"server":{"xPaddingBytes":"128-768"},"client":{"xmux":{"maxConnections":4}}}'
+        unified_menu_freeflow install <<< $'x\n1\n3\n2\n'"$draft"$'\n3\n1\n3\n2\n0\n0'
+        unified_menu_vlquic install <<< $'x\n1\n4\n2\n'"$draft"$'\n3\n1\n3\n2\n0\n0'
+        for m in ff vlquic; do
+            if "_${m}_xhttp_set_profile" 0 '{"client":{"xhttpModeH3":false}}'; then exit 1; fi
+            printf '%s-in=%s\n' "$m" "$(plugin_call "$m" inbound | jq -ce .)"
+            printf '%s-link=%s\n' "$m" "$(plugin_collect_links "$m")"
+            printf '%s-out=%s\n' "$m" "$("_${m}_xhttp_export_json" | jq -ce .)"
+            "_${m}_xhttp_set_profile" 0 null
+            printf '%s-reset=%s\n' "$m" "$(plugin_collect_links "$m")"
+        done
+        [[ $(plugin_call vlquic ports) == */udp ]]
+        st_set '.ff.protocol="ws"'
+        [[ $(plugin_collect_links ff) == *'type=ws'* ]]
+    ''', timeout=65)
+    rows = dict(line.split('=',1) for line in out.splitlines() if re.match(r'^(ff|vlquic)-\w+=',line))
+    for mod, mode, path in [('ff', 'packet-up', '/ff-test'), ('vlquic', 'stream-up', '/')]:
+        link = parse_qs(urlsplit(rows[mod+'-link']).query)
+        inbound = json.loads(rows[mod+'-in'])['streamSettings']
+        outbound = json.loads(rows[mod+'-out'])['streamSettings']
+        assert inbound['xhttpSettings'] == {'mode': mode, 'path': path, 'xPaddingBytes': '128-768'}
+        assert outbound['xhttpSettings']['mode'] == link['mode'][0] == mode
+        extra = json.loads(link['extra'][0])
+        if mod == 'vlquic':
+            assert extra.pop('xhttpModeH3') is True
+            assert inbound['tlsSettings']['alpn'] == outbound['tlsSettings']['alpn'] == link['alpn'] == ['h3']
+            assert 'certificateFile' not in rows[mod+'-out'] and 'keyFile' not in rows[mod+'-out']
+        assert outbound['xhttpSettings']['extra'] == extra == {'xPaddingBytes': '128-768', 'xmux': {'maxConnections':4}}
+        assert rows[mod+'-legacy'] == rows[mod+'-reset']
+        assert out.splitlines().count(rows[mod+'-link']) >= 1
+
+
+def test_reality_xhttp_workbench_profiles_and_legacy_transport():
+    import json
+    from urllib.parse import parse_qs, urlsplit
+
+    out = run_bash(r'''
+        source ./xray_2go.sh
+        set -e
+        st_init
+        st_set '.reality.enabled = true | .reality.network = "xhttp" | .reality.pvk = "fixture-server-key" |
+                .reality.pbk = "fixture-public-key" | .reality.sid = "abcdef01" | .reality.sni = "example.com" |
+                .xpad.reality = true | del(.reality.xhttp)'
+        platform_get_realip() { printf '[2001:db8::1]'; }
+        plugin_refresh_runtime
+        printf 'LEGACY=%s\n' "$(_plg_reality_link)"
+        clear() { :; }
+        _pause() { :; }
+        prompt() { IFS= read -r "$2"; }
+        unified_menu_reality install <<< $'x\n1\n3\n2\n{"server":{"xPaddingBytes":"128-768","scMaxBufferedPosts":35},"client":{"xmux":{"maxConnections":4}}}\n5\n3\n6\n0\n3\n1\n3\n2\n0\n0'
+        for bad in '{"split":{"port":28443}}' '{"client":{"xhttpModeH3":true}}' '{"server":false}'; do
+            if _reality_xhttp_set_profile 0 "$bad"; then exit 1; fi
+        done
+        printf 'INBOUND=%s\n' "$(_plg_reality_inbound | jq -c .)"
+        printf 'LINK=%s\n' "$(_plg_reality_link)"
+        printf 'OUTBOUND=%s\n' "$(_reality_xhttp_export_json | jq -c .)"
+        st_persist
+        config_apply() { _plg_reality_inbound > "$CONFIG_FILE"; }
+        fw_reconcile() { [[ $(st_get '.reality.xhttp.mode') != stream-up ]]; }
+        _reality_xhttp_set_profile 1 '{"mode":"packet-up","server":{"xPaddingBytes":"128-768","scMaxBufferedPosts":35},"client":{"xmux":{"maxConnections":6}}}'
+        jq -e '.streamSettings.xhttpSettings.mode == "packet-up"' "$CONFIG_FILE" >/dev/null
+        if _reality_xhttp_set_profile 1 '{"mode":"stream-up"}'; then exit 1; fi
+        jq -e '.reality.xhttp.mode == "packet-up"' "$STATE_FILE" >/dev/null
+        jq -e '.streamSettings.xhttpSettings.mode == "packet-up"' "$CONFIG_FILE" >/dev/null
+        [[ $(st_get '.reality.xhttp.mode') == packet-up ]]
+        st_set '.reality.network = "tcp"'
+        printf 'TCP=%s\n' "$(_plg_reality_link)"
+        st_set '.reality.network = "xhttp"'
+        [[ $(_plg_reality_link) == *'mode=packet-up'* ]]
+        _reality_xhttp_set_profile 0 null
+        printf 'RESET=%s\n' "$(_plg_reality_link)"
+    ''', timeout=60)
+    records = dict(line.split('=', 1) for line in out.splitlines() if re.match(r'^[A-Z]+=', line))
+    legacy = parse_qs(urlsplit(records['LEGACY']).query)
+    link = parse_qs(urlsplit(records['LINK']).query)
+    inbound = json.loads(records['INBOUND'])['streamSettings']['xhttpSettings']
+    outbound = json.loads(records['OUTBOUND'])
+    stream = outbound['streamSettings']
+    extra = json.loads(link['extra'][0])
+    assert legacy['mode'] == ['stream-one'] and json.loads(legacy['extra'][0])['xPaddingObfsMode'] is True
+    assert inbound == {'path': '/', 'mode': 'packet-up', 'xPaddingBytes': '128-768', 'scMaxBufferedPosts': 35}
+    assert stream['xhttpSettings'] == {'path': '/', 'mode': 'packet-up', 'extra': extra}
+    assert extra == {'xPaddingBytes': '128-768', 'xmux': {'maxConnections': 6}}
+    assert link['pbk'] == ['fixture-public-key']
+    assert stream['realitySettings']['password'] == link['pbk'][0]
+    assert outbound['settings']['vnext'][0]['address'] == '2001:db8::1'
+    assert 'fixture-server-key' not in records['OUTBOUND'] + records['LINK']
+    assert 'flow=xtls-rprx-vision' in records['TCP'] and 'type=tcp' in records['TCP']
+    assert records['RESET'] == records['LEGACY']
+    assert records['LINK'] in out and 'Reality / XHTTP' in out
+
+
 def test_cforigin_xhttp_menu_profiles_and_links():
     import json
     from urllib.parse import parse_qs, urlsplit
@@ -3271,8 +3390,8 @@ def test_runtime_vlquic_enable_restores_cross_artifact_state_after_config_failur
                 """
 source ./xray_2go.sh
 mkdir -p "${WORK_DIR}" "${_SVC_SYSTEMD_DIR}"
-printf 'cert' > "${WORK_DIR}/cert.pem"
-printf 'key' > "${WORK_DIR}/key.pem"
+openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj /CN=old.example \
+    -keyout "${WORK_DIR}/key.pem" -out "${WORK_DIR}/cert.pem" >/dev/null 2>&1 || exit 1
 st_init >/dev/null 2>&1
 st_set '.vlquic.enabled = false | .vlquic.domain = "old.example" | .vlquic.cert = "'"${WORK_DIR}"'/cert.pem" | .vlquic.key = "'"${WORK_DIR}"'/key.pem"' >/dev/null
 st_persist >/dev/null 2>&1
@@ -3678,6 +3797,97 @@ def test_cforigin_plan_defers_certificate_issuance():
         install_wizard_confirm || exit 1
     ''', timeout=45)
     assert out.count('ISSUER_CALLED') == 2 and out.count('CORE_CALLED') == 1, out
+
+
+def test_direct_h3_certificate_validation_and_rollback():
+    out = run_bash(r'''
+        source ./xray_2go.sh
+        set -e
+        st_init
+        mkdir -p "$WORK_DIR"
+        for domain in old.fixture.invalid new.fixture.invalid; do
+            openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj "/CN=$domain" \
+                -keyout "$WORK_DIR/$domain.key" -out "$WORK_DIR/$domain.crt" >/dev/null 2>&1
+        done
+        old=old.fixture.invalid
+        new=new.fixture.invalid
+        st_set '.vlquic.enabled=true | .vlquic.domain=$d | .vlquic.cert=$c | .vlquic.key=$k' \
+            --arg d "$old" --arg c "$WORK_DIR/$old.crt" --arg k "$WORK_DIR/$old.key"
+        st_persist
+        printf 'old-config' > "$CONFIG_FILE"
+        prompt() { IFS= read -r "$2"; }
+        prompt_secret() { IFS= read -r "$2"; }
+        fw_reconcile() { return 0; }
+        config_print_nodes() { return 0; }
+        config_apply() {
+            printf 'CONFIG_APPLY_CALLED\n'
+            printf 'new-config' > "$CONFIG_FILE"
+            [[ $apply_result == ok ]]
+        }
+        update_cert() {
+            module_vlquic_update_cert <<< "$new"$'\n4\n'"$WORK_DIR/$1.crt"$'\n'"$WORK_DIR/$2.key"
+        }
+        apply_result=ok
+        if update_cert "$old" "$old"; then exit 1; fi
+        if update_cert "$new" "$old"; then exit 1; fi
+        apply_result=fail
+        if update_cert "$new" "$new"; then exit 1; fi
+        [[ $(st_get '.vlquic.domain') == "$old" && $(<"$CONFIG_FILE") == old-config ]]
+        jq -e --arg d "$old" '.vlquic.domain == $d' "$STATE_FILE" >/dev/null
+        apply_result=ok
+        update_cert "$new" "$new"
+        jq -e --arg d "$new" '.vlquic.domain == $d' "$STATE_FILE" >/dev/null
+    ''', timeout=36)
+    assert out.count('CONFIG_APPLY_CALLED') == 2, out
+
+
+def test_direct_h3_plan_defers_certificate_issuance():
+    out = run_bash(r'''
+        source ./xray_2go.sh
+        set -e
+        st_init
+        st_set '.argo.enabled=false | .vlquic.enabled=true'
+        plugin_refresh_runtime
+        clear() { :; }
+        prompt() {
+            case "$2" in
+                _domain) printf -v "$2" '%s' h3.fixture.invalid ;;
+                _m) printf -v "$2" '%s' 3 ;;
+                _email) printf -v "$2" '%s' admin@fixture.invalid ;;
+                _c) printf -v "$2" '%s' "$confirm" ;;
+            esac
+        }
+        acme_issue_http01() {
+            printf 'H3_ISSUER_CALLED\n'
+            [[ $confirm == y ]] || exit 1
+            local dir="$_CERT_DIR/$1"
+            mkdir -p "$dir" || return 1
+            printf 'replacement' > "$dir/fullchain.pem"
+            printf 'fixture key' > "$dir/privkey.pem"
+            [[ $issue_result == ok ]] || return 1
+            openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj "/CN=$1" \
+                -keyout "$dir/privkey.pem" -out "$dir/fullchain.pem" >/dev/null 2>&1 || return 1
+            st_set '.vlquic.cert = $c | .vlquic.key = $k' --arg c "$dir/fullchain.pem" --arg k "$dir/privkey.pem"
+        }
+        _install_check_port_conflicts() { return 0; }
+        module_xray_install_core() { printf 'CORE_CALLED\n'; }
+        config_print_nodes() { return 0; }
+        confirm=n
+        install_plan_vlquic_update_cert
+        [[ -z $(st_get '.vlquic.cert') ]]
+        if install_wizard_confirm; then exit 1; fi
+        confirm=y
+        issue_result=fail
+        dir="$_CERT_DIR/h3.fixture.invalid"
+        mkdir -p "$dir"
+        printf 'existing certificate' > "$dir/fullchain.pem"
+        if install_wizard_confirm; then exit 1; fi
+        [[ $(<"$dir/fullchain.pem") == 'existing certificate' && ! -e "$dir/privkey.pem" ]]
+        [[ $(st_get '.vlquic.domain') == h3.fixture.invalid ]]
+        issue_result=ok
+        install_wizard_confirm
+    ''', timeout=45)
+    assert out.count('H3_ISSUER_CALLED') == 2 and out.count('CORE_CALLED') == 1, out
 
 
 def test_port_prompt_distinguishes_eof_from_blank():

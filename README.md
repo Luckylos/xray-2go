@@ -140,6 +140,18 @@ sudo ./xray_2go.sh
 
 Argo 工作台的 `h` 探测域名根路径，HTTP 请求上限为 15 秒。菜单会显示返回状态码，例如 `404`，并单独提示 `5xx` 和未收到 HTTP 响应。请通过客户端验证节点连通。
 
+### Reality XHTTP 配置
+
+在 Reality 工作台按 `4` 选择 XHTTP，再按 `x`。已安装的工作台和高级部署计划都提供这个入口。默认使用 `stream-one` 和根路径 `/`。切回 TCP Vision 后，保存的 XHTTP 配置可在下次切换时继续使用。
+
+按 `1` 选择模式，按 `2` 编辑预填的服务端和客户端 Extra JSON，按 `5` 逐项设置 Padding 和 XMUX，按 `3` 导出分享链接或客户端出站 JSON。设置服务端 Extra 后，该配置优先于上一级的旧版 xPadding 开关。在 XHTTP 页面按 `4` 可恢复 `stream-one` 和旧版 Padding 行为。
+
+### FreeFlow 与直连 VLESS-XHTTP-H3 配置
+
+FreeFlow 按 `2` 选择 XHTTP 后进入 `x`，直连 VLESS-XHTTP-H3 可直接进入 `x`。两者都默认使用 `stream-one`。按 `1` 选择模式，按 `2` 编辑 Extra JSON，按 `5` 设置常用 Padding 和 XMUX，按 `3` 导出分享链接或客户端出站 JSON，按 `4` 恢复默认。FreeFlow 的旧版 xPadding 在未设置服务端 Extra 时生效。
+
+直连 H3 使用 UDP、根路径 `/` 和 TLS `alpn=h3`。请使用支持 XHTTP over HTTP/3 的客户端。高级部署计划会在最终确认后签发 ACME 证书。导入或更换证书时，脚本会检查域名、有效期及私钥是否匹配。
+
 ### CF Origin XHTTP 配置
 
 使用 TLS 回源时，脚本会检查证书覆盖的域名、有效期和私钥配对，支持 Cloudflare Origin CA。更换域名时，如果现有证书不覆盖新域名，请从 CF Origin 工作台的 `9` 导入或签发证书，与域名一同保存。

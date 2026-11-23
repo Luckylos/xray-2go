@@ -388,6 +388,7 @@ _G_STATE=""
 _G_STATE_DISK=""
 _G_STATE_BASE=""
 _CFORIGIN_ISSUE=()
+_VLQUIC_ISSUE=()
 
 # 当前 state schema：端口和协议状态集中管理
 # 加载 state 时自动规范化 schema
@@ -1355,6 +1356,89 @@ _argo_xhttp_client_stream() {
     ' --argjson profile "${_profile}" <<< "${_profile}"
 }
 
+_xhttp_server_extra_with_legacy_padding() {
+    local _module="$1" _legacy='{}'
+    [ "$(xpad_of "${_module}")" != true ] || _legacy="${_XPAD_JSON}"
+    st_get '.[$id].xhttp.server // $legacy' --arg id "${_module}" --argjson legacy "${_legacy}"
+}
+
+_reality_xhttp_server_extra() { _xhttp_server_extra_with_legacy_padding reality; }
+_ff_xhttp_server_extra() { _xhttp_server_extra_with_legacy_padding ff; }
+
+_ff_xhttp_client_stream() {
+    local _server
+    _server=$(_ff_xhttp_server_extra | _xhttp_client_visible_server_extra) || return 1
+    jq -c --arg path "$(st_get '.ff.path')" --arg host "$1" --argjson server "${_server}" '
+        {network:"xhttp",security:"none",
+         xhttpSettings:{host:$host,path:$path,mode:(.mode // "stream-one"),extra:($server * (.client // {}))}} |
+        if (.xhttpSettings.extra | length) == 0 then del(.xhttpSettings.extra) else . end
+    ' <<< "$(st_get '.ff.xhttp // {}')"
+}
+
+_ff_xhttp_link() {
+    local _address _stream _mode _extra
+    _address=$(platform_get_realip)
+    [ -n "${_address}" ] || { log_warn "无法获取服务器 IP，FreeFlow 节点已跳过"; return 0; }
+    _stream=$(_ff_xhttp_client_stream "${_address}") || return 1
+    _mode=$(jq -r '.xhttpSettings.mode' <<< "${_stream}") || return 1
+    _extra=$(jq -r '.xhttpSettings.extra // empty | tojson | @uri' <<< "${_stream}") || return 1
+    printf 'vless://%s@%s:%s?encryption=none&security=none&type=xhttp&host=%s&path=%s&mode=%s%s#FreeFlow-XHTTP\n' \
+        "$(st_get '.uuid')" "${_address}" "$(port_of ff)" "${_address}" "$(urlencode_path "$(st_get '.ff.path')")" \
+        "${_mode}" "${_extra:+&extra=${_extra}}"
+}
+
+_vlquic_xhttp_client_stream() {
+    local _server
+    _server=$(st_get '.vlquic.xhttp.server // {}' | _xhttp_client_visible_server_extra) || return 1
+    jq -c --arg domain "$1" --argjson server "${_server}" '
+        {network:"xhttp",security:"tls",tlsSettings:{serverName:$domain,fingerprint:"chrome",alpn:["h3"]},
+         xhttpSettings:{host:$domain,path:"/",mode:(.mode // "stream-one"),extra:($server * (.client // {}))}} |
+        if (.xhttpSettings.extra | length) == 0 then del(.xhttpSettings.extra) else . end
+    ' <<< "$(st_get '.vlquic.xhttp // {}')"
+}
+
+_vlquic_xhttp_link() {
+    local _domain _stream _mode _extra
+    _domain=$(st_get '.vlquic.domain')
+    [ -n "${_domain}" ] || return 0
+    _stream=$(_vlquic_xhttp_client_stream "${_domain}") || return 1
+    _mode=$(jq -r '.xhttpSettings.mode' <<< "${_stream}") || return 1
+    _extra=$(jq -r '(.xhttpSettings.extra // {}) + {xhttpModeH3:true} | tojson | @uri' <<< "${_stream}") || return 1
+    printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=chrome&alpn=h3&type=xhttp&host=%s&path=%%2F&mode=%s&extra=%s&xhttpModeH3=true#VLESS-XHTTP-H3\n' \
+        "$(st_get '.uuid')" "${_domain}" "$(port_of vlquic)" "${_domain}" "${_domain}" "${_mode}" "${_extra}"
+}
+
+_reality_xhttp_client_stream() {
+    local _profile _server _public
+    _public=$(st_get '.reality.pbk')
+    if [ -z "${_public}" ] || [ "${_public}" = null ]; then
+        log_warn "请先生成 Reality 密钥，再导出节点"
+        return 1
+    fi
+    _profile=$(st_get '.reality.xhttp // {}') || return 1
+    _server=$(_reality_xhttp_server_extra | _xhttp_client_visible_server_extra) || return 1
+    jq -c --arg sni "$(st_get '.reality.sni')" --arg public "${_public}" \
+        --arg sid "$(st_get '.reality.sid')" --argjson server "${_server}" '
+        {network:"xhttp", security:"reality",
+         realitySettings:{serverName:$sni, fingerprint:"chrome", password:$public, shortId:$sid},
+         xhttpSettings:{path:"/", mode:(.mode // "stream-one"), extra:($server * (.client // {}))}} |
+        if (.xhttpSettings.extra | length) == 0 then del(.xhttpSettings.extra) else . end
+    ' <<< "${_profile}"
+}
+
+_reality_xhttp_link() {
+    local _ip _stream _mode _extra
+    _stream=$(_reality_xhttp_client_stream) || return 1
+    _ip=$(platform_get_realip)
+    [ -n "${_ip}" ] || { log_warn "无法获取服务器 IP，Reality 节点已跳过"; return 0; }
+    if [[ "${_ip}" == *:* && "${_ip}" != \[*\] ]]; then _ip="[${_ip}]"; fi
+    _mode=$(jq -r '.xhttpSettings.mode' <<< "${_stream}") || return 1
+    _extra=$(jq -r '.xhttpSettings.extra // empty | tojson | @uri' <<< "${_stream}") || return 1
+    printf 'vless://%s@%s:%s?encryption=none&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=xhttp&path=%%2F&mode=%s%s#Reality-XHTTP\n' \
+        "$(st_get '.uuid')" "${_ip}" "$(port_of reality)" "$(st_get '.reality.sni')" "$(st_get '.reality.pbk')" \
+        "$(st_get '.reality.sid')" "${_mode}" "${_extra:+&extra=${_extra}}"
+}
+
 _cforigin_xhttp_client_stream() {
     local _profile _server
     _profile=$(st_get '.cforigin.xhttp // {}') || return 1
@@ -1540,12 +1624,7 @@ _plg_ff_inbound() {
     _path=$(st_get '.ff.path')
     _uuid=$(st_get '.uuid')
     _port=$(port_of ff)
-    local _xpad
-    if [ "$(xpad_of ff)" = "true" ]; then
-        _xpad=$(printf '%s' "${_XPAD_JSON}" | jq -c .)
-    else
-        _xpad='{}'
-    fi
+    local _mode _extra
     case "${_proto}" in
         ws)
             jq -n --argjson port "${_port}" --arg uuid "${_uuid}" --arg path "${_path}" '{
@@ -1559,8 +1638,10 @@ _plg_ff_inbound() {
                 streamSettings:{network:"httpupgrade",
                     httpupgradeSettings:{path:$path}}}' ;;
         xhttp)
+            _mode=$(st_get '.ff.xhttp.mode // "stream-one"') || return 1
+            _extra=$(_ff_xhttp_server_extra) || return 1
             jq -n --argjson port "${_port}" --arg uuid "${_uuid}" --arg path "${_path}" \
-                   --arg mode "stream-one" --argjson x "${_xpad}" '{
+                   --arg mode "${_mode}" --argjson x "${_extra}" '{
                 port:$port, listen:"::", protocol:"vless",
                 settings:{clients:[{id:$uuid}], decryption:"none"},
                 streamSettings:{network:"xhttp",
@@ -1585,14 +1666,17 @@ _plg_ff_inbound() {
 
 _plg_ff_link() {
     _plg_ff_enabled || return 0
-    local _proto _uuid _ip _penc _port _xqs
+    local _proto _uuid _ip _penc _port
     _proto=$(st_get '.ff.protocol')
+    if [ "${_proto}" = xhttp ]; then
+        _ff_xhttp_link
+        return $?
+    fi
     _uuid=$(st_get '.uuid')
     _port=$(port_of ff)
     _ip=$(platform_get_realip)
     [ -z "${_ip:-}" ] && { log_warn "无法获取服务器 IP，FreeFlow 节点已跳过"; return 0; }
     _penc=$(urlencode_path "$(st_get '.ff.path')")
-    [ "$(xpad_of ff)" = "true" ] && _xqs="${_XPAD_QS}" || _xqs=""
     case "${_proto}" in
         ws)
             printf 'vless://%s@%s:%s?encryption=none&security=none&type=ws&host=%s&path=%s#FreeFlow-WS\n' \
@@ -1600,14 +1684,6 @@ _plg_ff_link() {
         httpupgrade)
             printf 'vless://%s@%s:%s?encryption=none&security=none&type=httpupgrade&host=%s&path=%s#FreeFlow-HTTPUpgrade\n' \
                 "${_uuid}" "${_ip}" "${_port}" "${_ip}" "${_penc}" ;;
-        xhttp)
-            if [ -n "${_xqs}" ]; then
-                printf 'vless://%s@%s:%s?encryption=none&security=none&type=xhttp&host=%s&path=%s&mode=stream-one&extra=%%7B%s%%7D#FreeFlow-XHTTP\n' \
-                    "${_uuid}" "${_ip}" "${_port}" "${_ip}" "${_penc}" "${_xqs}"
-            else
-                printf 'vless://%s@%s:%s?encryption=none&security=none&type=xhttp&host=%s&path=%s&mode=stream-one#FreeFlow-XHTTP\n' \
-                    "${_uuid}" "${_ip}" "${_port}" "${_ip}" "${_penc}"
-            fi ;;
         tcphttp)
             local _host _henc
             _host=$(st_get '.ff.host')
@@ -1639,29 +1715,25 @@ _plg_reality_inbound() {
     if [ -z "${_pvk:-}" ] || [ "${_pvk}" = "null" ]; then
         log_warn "Reality 密钥未就绪，已跳过"; return 0
     fi
-    local _port _sni _sid _net _uuid _port
+    local _port _sni _sid _net _uuid _mode _extra
     _port=$(port_of reality)
     _sni=$(st_get '.reality.sni')
     _sid=$(st_get '.reality.sid')
     _net=$(st_get '.reality.network'); _net="${_net:-tcp}"
     _uuid=$(st_get '.uuid')
-    local _xpad
-    if [ "$(xpad_of reality)" = "true" ]; then
-        _xpad=$(printf '%s' "${_XPAD_JSON}" | jq -c .)
-    else
-        _xpad='{}'
-    fi
     case "${_net}" in
         xhttp)
+            _mode=$(st_get '.reality.xhttp.mode // "stream-one"') || return 1
+            _extra=$(_reality_xhttp_server_extra) || return 1
             jq -n --argjson port "${_port}" --arg uuid "${_uuid}" \
                    --arg sni "${_sni}" --arg pvk "${_pvk}" --arg sid "${_sid}" \
-                   --arg mode "stream-one" --argjson x "${_xpad}" '{
+                   --arg mode "${_mode}" --argjson x "${_extra}" '{
                 port:$port, listen:"::", protocol:"vless",
                 settings:{clients:[{id:$uuid}], decryption:"none"},
                 streamSettings:{network:"xhttp", security:"reality",
                     realitySettings:{dest:($sni+":443"),
                         serverNames:[$sni], privateKey:$pvk, shortIds:[$sid]},
-                    xhttpSettings:({path:"/", mode:$mode} + $x)}}' ;;
+                    xhttpSettings:($x + {path:"/", mode:$mode})}}' ;;
         *)
             jq -n --argjson port "${_port}" --arg uuid "${_uuid}" \
                    --arg sni "${_sni}" --arg pvk "${_pvk}" --arg sid "${_sid}" '{
@@ -1675,31 +1747,17 @@ _plg_reality_inbound() {
 
 _plg_reality_link() {
     _plg_reality_enabled || return 0
-    local _rpbk; _rpbk=$(st_get '.reality.pbk')
+    local _rpbk _ip
+    _rpbk=$(st_get '.reality.pbk')
     [ -n "${_rpbk:-}" ] && [ "${_rpbk}" != "null" ] || return 0
-    local _ip; _ip=$(platform_get_realip)
-    [ -z "${_ip:-}" ] && { log_warn "无法获取服务器 IP，Reality 节点已跳过"; return 0; }
-    local _port _rnet _uuid _xqs
-    _port=$(port_of reality)
-    _rnet=$(st_get '.reality.network'); _rnet="${_rnet:-tcp}"
-    _uuid=$(st_get '.uuid')
-    [ "$(xpad_of reality)" = "true" ] && _xqs="${_XPAD_QS}" || _xqs=""
-    case "${_rnet}" in
-        xhttp)
-            if [ -n "${_xqs}" ]; then
-                printf 'vless://%s@%s:%s?encryption=none&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=xhttp&path=%%2F&mode=stream-one&extra=%%7B%s%%7D#Reality-XHTTP\n' \
-                    "${_uuid}" "${_ip}" "${_port}" \
-                    "$(st_get '.reality.sni')" "${_rpbk}" "$(st_get '.reality.sid')" "${_xqs}"
-            else
-                printf 'vless://%s@%s:%s?encryption=none&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=xhttp&path=%%2F&mode=stream-one#Reality-XHTTP\n' \
-                    "${_uuid}" "${_ip}" "${_port}" \
-                    "$(st_get '.reality.sni')" "${_rpbk}" "$(st_get '.reality.sid')"
-            fi ;;
-        *)
-            printf 'vless://%s@%s:%s?encryption=none&flow=xtls-rprx-vision&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=tcp&headerType=none#Reality-Vision\n' \
-                "${_uuid}" "${_ip}" "${_port}" \
-                "$(st_get '.reality.sni')" "${_rpbk}" "$(st_get '.reality.sid')" ;;
-    esac
+    if [ "$(st_get '.reality.network')" = xhttp ]; then
+        _reality_xhttp_link
+        return $?
+    fi
+    _ip=$(platform_get_realip)
+    [ -n "${_ip}" ] || { log_warn "无法获取服务器 IP，Reality 节点已跳过"; return 0; }
+    printf 'vless://%s@%s:%s?encryption=none&flow=xtls-rprx-vision&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=tcp&headerType=none#Reality-Vision\n' \
+        "$(st_get '.uuid')" "${_ip}" "$(port_of reality)" "$(st_get '.reality.sni')" "${_rpbk}" "$(st_get '.reality.sid')"
 }
 PLUGIN_EOF
     chmod 644 "${PLUGIN_DIR}/reality.sh"
@@ -1989,7 +2047,7 @@ _plg_vlquic_ports() {
 
 _plg_vlquic_inbound() {
     _plg_vlquic_enabled || return 0
-    local _port _listen _uuid _domain _cert _key
+    local _port _listen _uuid _domain _cert _key _mode _extra
     _port=$(port_of vlquic)
     _listen=$(st_get '.vlquic.listen')
     _uuid=$(st_get '.uuid')
@@ -1998,27 +2056,24 @@ _plg_vlquic_inbound() {
     _key=$(st_get '.vlquic.key')
     [ -n "${_domain:-}" ] && [ -n "${_cert:-}" ] && [ -n "${_key:-}" ] || {
         log_error "VLESS-XHTTP-H3 缺少域名或证书路径"; return 1; }
+    _mode=$(st_get '.vlquic.xhttp.mode // "stream-one"') || return 1
+    _extra=$(st_get '.vlquic.xhttp.server // {}') || return 1
     jq -n --argjson port "${_port}" --arg listen "${_listen}" --arg uuid "${_uuid}" \
-          --arg domain "${_domain}" --arg cert "${_cert}" --arg key "${_key}" '{
+          --arg domain "${_domain}" --arg cert "${_cert}" --arg key "${_key}" \
+          --arg mode "${_mode}" --argjson server "${_extra}" '{
         port:$port, listen:$listen, protocol:"vless",
         settings:{clients:[{id:$uuid}], decryption:"none"},
         streamSettings:{
             network:"xhttp",
             security:"tls",
             tlsSettings:{serverName:$domain, alpn:["h3"], certificates:[{certificateFile:$cert, keyFile:$key}]},
-            xhttpSettings:{path:"/", mode:"stream-one", extra:{xhttpModeH3:true}}
+            xhttpSettings:($server + {path:"/", mode:$mode})
         }}'
 }
 
 _plg_vlquic_link() {
     _plg_vlquic_enabled || return 0
-    local _domain _uuid _port
-    _domain=$(st_get '.vlquic.domain')
-    _uuid=$(st_get '.uuid')
-    _port=$(port_of vlquic)
-    [ -n "${_domain:-}" ] || return 0
-    printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=chrome&alpn=h3&type=xhttp&host=%s&path=%%2F&mode=stream-one&extra=%%7B%%22xhttpModeH3%%22%%3Atrue%%7D&xhttpModeH3=true#VLESS-XHTTP-H3\n' \
-        "${_uuid}" "${_domain}" "${_port}" "${_domain}" "${_domain}"
+    _vlquic_xhttp_link
 }
 PLUGIN_EOF
     chmod 644 "${PLUGIN_DIR}/vlquic.sh"
@@ -2721,18 +2776,22 @@ _transaction_lock_release() {
     _TXN_LOCK_FD=""
 }
 
+_transaction_snapshot_file() {
+    local _p="$1" _i="$2" _exists=0
+    if [ -e "${_p}" ] || [ -L "${_p}" ]; then
+        _exists=1
+        cp -a -- "${_p}" "${_TXN_DIR}/files/${_i}" || return 1
+    fi
+    printf '%s\t%s\t%s\n' "${_i}" "${_exists}" "${_p}" >> "${_TXN_DIR}/manifest"
+}
+
 _transaction_snapshot_files() {
-    local _i=0 _p _exists
+    local _i=0 _p
     _transaction_collect_artifacts
     mkdir -p "${_TXN_DIR}/files"
     : > "${_TXN_DIR}/manifest"
     for _p in "${_TXN_ARTIFACT_PATHS[@]}"; do
-        _exists=0
-        if [ -e "${_p}" ] || [ -L "${_p}" ]; then
-            _exists=1
-            cp -a -- "${_p}" "${_TXN_DIR}/files/${_i}" || return 1
-        fi
-        printf '%s\t%s\t%s\n' "${_i}" "${_exists}" "${_p}" >> "${_TXN_DIR}/manifest"
+        _transaction_snapshot_file "${_p}" "${_i}" || return 1
         _i=$(( _i + 1 ))
     done
 }
@@ -3250,12 +3309,12 @@ module_cforigin_disable() {
 }
 
 module_ff_uninstall() {
-    _module_disable_transaction FreeFlow st_set '.ff.enabled = false | .ff.protocol = "none" | .ff.path = "/" | .ff.host = ""' || return 1
+    _module_disable_transaction FreeFlow st_set '.ff.enabled = false | .ff.protocol = "none" | .ff.path = "/" | .ff.host = "" | del(.ff.xhttp)' || return 1
     log_ok "FreeFlow 已卸载"
 }
 
 module_reality_uninstall() {
-    _module_disable_transaction Reality st_set '.reality.enabled = false | .reality.pbk = null | .reality.pvk = null | .reality.sid = null' || return 1
+    _module_disable_transaction Reality st_set '.reality.enabled = false | .reality.pbk = null | .reality.pvk = null | .reality.sid = null | del(.reality.xhttp)' || return 1
     log_ok "Reality 已卸载"
 }
 
@@ -3371,7 +3430,7 @@ module_http_update_pass() {
     if [ "${_en}" = "true" ]; then config_print_nodes http || true; fi
 }
 module_vlquic_uninstall() {
-    _module_disable_transaction VLESS-XHTTP-H3 st_set '.vlquic.enabled = false | .vlquic.listen = "0.0.0.0" | .vlquic.domain = "" | .vlquic.cert = "" | .vlquic.key = "" | .vlquic.acme_method = "manual"' || return 1
+    _module_disable_transaction VLESS-XHTTP-H3 st_set '.vlquic.enabled = false | .vlquic.listen = "0.0.0.0" | .vlquic.domain = "" | .vlquic.cert = "" | .vlquic.key = "" | .vlquic.acme_method = "manual" | del(.vlquic.xhttp)' || return 1
     log_ok "VLESS-XHTTP-H3 已卸载"
 }
 
@@ -3662,13 +3721,11 @@ _module_reality_regenerate_keys_inner() {
 }
 
 _module_vlquic_enable_prepare() {
-    local _domain _cert _key
-    _domain=$(st_get '.vlquic.domain')
-    _cert=$(st_get '.vlquic.cert')
-    _key=$(st_get '.vlquic.key')
-    if [ -z "${_domain:-}" ] || [ "${_domain}" = "null" ] || [ ! -f "${_cert}" ] || [ ! -f "${_key}" ]; then
+    local -a _VLQUIC_ISSUE=()
+    if [ -z "$(st_get '.vlquic.domain')" ] || [ ! -f "$(st_get '.vlquic.cert')" ] || [ ! -f "$(st_get '.vlquic.key')" ]; then
         vlquic_config_cert || return 1
     fi
+    _vlquic_apply_cert || return 1
     st_set '.vlquic.enabled = true'
 }
 
@@ -3683,14 +3740,20 @@ module_vlquic_disable() {
 }
 
 module_vlquic_update_cert() {
-    local _en
-    _en=$(st_get '.vlquic.enabled')
-    vlquic_config_cert || return 1
-    st_persist || { log_error "state.json 写入失败"; return 1; }
-    if [ "${_en}" = "true" ]; then
-        fw_reconcile
-        config_apply || return 1
+    local -a _VLQUIC_ISSUE=()
+    _transaction_run "更新 VLESS-XHTTP-H3 证书" _module_vlquic_save_cert || return 1
+    log_ok "VLESS-XHTTP-H3 域名/证书已更新"
+    if [ "$(st_get '.vlquic.enabled')" = true ]; then
         config_print_nodes vlquic || true
+    fi
+}
+
+_module_vlquic_save_cert() {
+    vlquic_config_cert && _vlquic_apply_cert || return 1
+    if [ "$(st_get '.vlquic.enabled')" = true ]; then
+        _commit_inner
+    else
+        st_persist
     fi
 }
 
@@ -4146,27 +4209,31 @@ _cforigin_check_ready() {
 
 _cforigin_check_origin_tls() {
     [ "$(st_get '.cforigin.origin_tls')" = true ] || return 0
-    local _domain="$1" _cert _key _cert_pub _key_pub
-    _cert=$(st_get '.cforigin.cert')
-    _key=$(st_get '.cforigin.key')
-    [ -f "${_cert}" ] || { log_error "CF Origin 证书文件不存在"; return 1; }
-    [ -f "${_key}" ] || { log_error "CF Origin 私钥文件不存在"; return 1; }
-    # 以叶证书为本地信任锚，同时检查有效期和域名。回源 CA 的信任由 Cloudflare 判断。
+    _check_tls_certificate "CF Origin" "$1" "$(st_get '.cforigin.cert')" "$(st_get '.cforigin.key')"
+}
+
+_check_tls_certificate() {
+    local _label="$1" _domain="$2" _cert="$3" _key="$4" _cert_pub _key_pub
+    [ -f "${_cert}" ] || { log_error "${_label} 证书文件不存在"; return 1; }
+    [ -f "${_key}" ] || { log_error "${_label} 私钥文件不存在"; return 1; }
+    # 以叶证书为本地信任锚，同时检查有效期和域名。由客户端或 CDN 校验完整证书链。
     openssl verify -partial_chain -trusted "${_cert}" -verify_hostname "${_domain}" "${_cert}" >/dev/null 2>&1 || {
-        log_error "CF Origin 证书不覆盖 ${_domain}，或证书有效期、格式有误"
+        log_error "${_label} 证书不覆盖 ${_domain}，或证书有效期、格式有误"
         return 1
     }
     _cert_pub=$(openssl x509 -in "${_cert}" -pubkey -noout 2>/dev/null) &&
         _key_pub=$(openssl pkey -in "${_key}" -passin pass: -pubout 2>/dev/null) &&
         [ -n "${_cert_pub}" ] && [ "${_cert_pub}" = "${_key_pub}" ] || {
-        log_error "CF Origin 证书与私钥不匹配，或私钥无法读取"
+        log_error "${_label} 证书与私钥不匹配，或私钥无法读取"
         return 1
     }
 }
 
 vlquic_config_cert() {
     echo ""; log_title "VLESS-XHTTP-H3 证书配置"
-    local _domain _email; prompt "入口域名（需 DNS only 直连 VPS）: " _domain || return 1
+    local _domain _email _method _cert="" _key=""
+    local -a _issue=()
+    prompt "入口域名（需 DNS only 直连 VPS）: " _domain || return 1
     _domain=$(val_domain "${_domain}") || return 1
     echo ""
     printf "  ${C_GRN}1.${C_RST} Cloudflare Global API Key ${C_YLW}[简单]${C_RST}\n"
@@ -4188,25 +4255,55 @@ vlquic_config_cert() {
             local _cf_key _cf_email
             prompt "Cloudflare 账号邮箱: " _cf_email || return 1
             prompt_secret "Cloudflare Global API Key（不会显示在节点/日志中）: " _cf_key || return 1
-            acme_issue_cf_key "${_domain}" "${_cf_key}" "${_cf_email}" "${_email}" || return 1 ;;
+            _method=cf_key
+            _issue=(acme_issue_cf_key "${_domain}" "${_cf_key}" "${_cf_email}" "${_email}") ;;
         2)
             local _token
             prompt_secret "Cloudflare API Token（需 Zone:Read + DNS:Edit，不会显示在节点/日志中）: " _token || return 1
-            acme_issue_cf_token "${_domain}" "${_token}" "${_email}" || return 1 ;;
+            _method=cf_token
+            _issue=(acme_issue_cf_token "${_domain}" "${_token}" "${_email}") ;;
         3)
             log_warn "HTTP-01 需要域名 A 记录指向本机且 80/tcp 开放/空闲"
-            acme_issue_http01 "${_domain}" "${_email}" || return 1 ;;
+            _method=http01
+            _issue=(acme_issue_http01 "${_domain}" "${_email}") ;;
         4)
-            local _cert _key
             prompt "fullchain.pem 路径: " _cert || return 1
             prompt_secret "privkey.pem 路径: " _key || return 1
-            [ -f "${_cert}" ] || { log_error "证书文件不存在: ${_cert}"; return 1; }
-            [ -f "${_key}" ]  || { log_error "私钥文件不存在: ${_key}"; return 1; }
-            st_set '.vlquic.domain = $d | .vlquic.cert = $c | .vlquic.key = $k | .vlquic.acme_method = "manual"' \
-                --arg d "${_domain}" --arg c "${_cert}" --arg k "${_key}" ;;
+            _check_tls_certificate VLESS-XHTTP-H3 "${_domain}" "${_cert}" "${_key}" || return 1
+            _method=manual ;;
         *) log_error "无效选项，请按提示输入"; return 1 ;;
     esac
-    log_ok "证书配置完成: ${_domain}"
+    st_set '.vlquic.domain = $d | .vlquic.cert = $c | .vlquic.key = $k | .vlquic.acme_method = $m' \
+        --arg d "${_domain}" --arg c "${_cert}" --arg k "${_key}" --arg m "${_method}" || return 1
+    _VLQUIC_ISSUE=("${_issue[@]}")
+}
+
+_vlquic_check_ready() {
+    local _domain
+    _domain=$(st_get '.vlquic.domain')
+    [ -n "${_domain}" ] && [ "${_domain}" != null ] || { log_error "VLESS-XHTTP-H3 域名不能为空"; return 1; }
+    if [ "${1:-}" = plan ] && [ "${#_VLQUIC_ISSUE[@]}" -gt 0 ]; then
+        [ "${_VLQUIC_ISSUE[1]}" = "${_domain}" ] || { log_error "VLESS-XHTTP-H3 域名已变更，请重新选择证书来源"; return 1; }
+        return 0
+    fi
+    _check_tls_certificate VLESS-XHTTP-H3 "${_domain}" "$(st_get '.vlquic.cert')" "$(st_get '.vlquic.key')"
+}
+
+_vlquic_apply_cert() {
+    if [ "${#_VLQUIC_ISSUE[@]}" -gt 0 ]; then
+        _vlquic_check_ready plan || return 1
+        local _dir="${_CERT_DIR}/${_VLQUIC_ISSUE[1]}" _file _path _known
+        for _file in fullchain.pem privkey.pem; do
+            _path="${_dir}/${_file}"
+            for _known in "${_TXN_ARTIFACT_PATHS[@]}"; do
+                [ "${_known}" != "${_path}" ] || continue 2
+            done
+            _transaction_snapshot_file "${_path}" "${#_TXN_ARTIFACT_PATHS[@]}" || return 1
+            _TXN_ARTIFACT_PATHS+=("${_path}")
+        done
+        "${_VLQUIC_ISSUE[@]}" || return 1
+    fi
+    _vlquic_check_ready
 }
 
 # ==============================================================================
@@ -5489,6 +5586,7 @@ _menu_select_action() {
 
 install_plan_reset_defaults() {
     _CFORIGIN_ISSUE=()
+    _VLQUIC_ISSUE=()
     local _uuid _reset
     _uuid=$(st_get '.uuid')
     # 只重置核心认识的设置，保留扩展插件的状态和端口。
@@ -6190,7 +6288,7 @@ install_plan_vlquic_update_listen() {
 
 install_plan_vlquic_update_cert() {
     vlquic_config_cert || return 1
-    log_ok "VLESS-XHTTP-H3 域名/证书已更新"
+    log_ok "VLESS-XHTTP-H3 域名/证书配置已写入安装计划"
 }
 
 install_plan_ss2022_toggle() {
@@ -6341,9 +6439,7 @@ install_plan_validate() {
     if [ "$(st_get '.vlquic.enabled')" = "true" ]; then
         val_port "$(port_of vlquic)" >/dev/null || return 1
         val_listen_addr "$(st_get '.vlquic.listen')" >/dev/null || return 1
-        [ -n "$(st_get '.vlquic.domain')" ] || { log_error "VLESS-XHTTP-H3 域名不能为空"; return 1; }
-        [ -f "$(st_get '.vlquic.cert')" ] || { log_error "VLESS-XHTTP-H3 证书文件不存在"; return 1; }
-        [ -f "$(st_get '.vlquic.key')" ] || { log_error "VLESS-XHTTP-H3 私钥文件不存在"; return 1; }
+        _vlquic_check_ready plan || return 1
     fi
 
     if [ "$(st_get '.cforigin.enabled')" = "true" ]; then
@@ -6353,8 +6449,14 @@ install_plan_validate() {
     log_ok "安装计划校验通过"
 }
 
-_install_issue_cforigin_and_start() {
-    "${_CFORIGIN_ISSUE[@]}" && _cforigin_check_ready && module_xray_install_core
+_install_issue_certs_and_start() {
+    if [ "$(st_get '.cforigin.enabled')" = true ] && [ "${#_CFORIGIN_ISSUE[@]}" -gt 0 ]; then
+        "${_CFORIGIN_ISSUE[@]}" && _cforigin_check_ready || return 1
+    fi
+    if [ "$(st_get '.vlquic.enabled')" = true ]; then
+        _vlquic_apply_cert || return 1
+    fi
+    module_xray_install_core
 }
 
 install_execute_current_plan() {
@@ -6362,18 +6464,16 @@ install_execute_current_plan() {
     local _install_transaction=1 _install_hosts_pending=0
     command -v flock >/dev/null 2>&1 || { log_error "首次部署需要 flock，以保护并发操作"; return 1; }
     install_plan_validate || return 1
+    local -a _cforigin_cert_artifacts=()
     if [ "$(st_get '.cforigin.enabled')" = true ] && [ "${#_CFORIGIN_ISSUE[@]}" -gt 0 ]; then
         local _domain="${_CFORIGIN_ISSUE[2]}"
-        local -a _cforigin_cert_artifacts=("${_CERT_DIR}/${_domain}/fullchain.pem" "${_CERT_DIR}/${_domain}/privkey.pem")
-        local _plan_state="${_G_STATE}"
-        if _transaction_run "部署 CF Origin" _install_issue_cforigin_and_start; then
-            _CFORIGIN_ISSUE=()
-        else
-            _install_rc=1
-            _G_STATE="${_plan_state}"
-        fi
+        _cforigin_cert_artifacts=("${_CERT_DIR}/${_domain}/fullchain.pem" "${_CERT_DIR}/${_domain}/privkey.pem")
+    fi
+    if _transaction_run "部署 Xray-2go" _install_issue_certs_and_start; then
+        _CFORIGIN_ISSUE=()
+        _VLQUIC_ISSUE=()
     else
-        _transaction_run "部署 Xray-2go" module_xray_install_core || _install_rc=$?
+        _install_rc=$?
     fi
     if [ "${_install_rc}" -ne 0 ]; then
         log_error "安装失败"
@@ -6557,7 +6657,10 @@ _xhttp_validate_profile() {
 _xhttp_apply_profile() {
     local _module="$1" _profile="$2"
     st_set '.[$inbound_id].xhttp = $profile' --arg inbound_id "${_module}" --argjson profile "${_profile}" || return 1
-    if [ "$(st_get '.[$inbound_id].enabled' --arg inbound_id "${_module}")" = true ]; then
+    if { [ "${_module}" = reality ] && [ "$(st_get '.reality.network')" != xhttp ]; } ||
+       { [ "${_module}" = ff ] && [ "$(st_get '.ff.protocol')" != xhttp ]; }; then
+        st_persist
+    elif [ "$(st_get '.[$inbound_id].enabled' --arg inbound_id "${_module}")" = true ]; then
         _commit_inner
     else
         st_persist
@@ -6647,14 +6750,16 @@ _xhttp_edit_advanced() {
 
 _xhttp_edit_field() {
     local _module="$1" _runtime="$2" _field="$3" _label="$4" _raw='' _profile _server='{}'
-    if [ "${_module}" = argo ]; then _server=$(_argo_xhttp_server_extra) || return 1; fi
+    case "${_module}" in
+        argo|reality|ff) _server=$("_${_module}_xhttp_server_extra") || return 1 ;;
+    esac
     while prompt "${_label}（空行返回）: " _raw "${_raw}" && [ -n "${_raw}" ]; do
         _profile=$(st_get '
             ($path | split(".")) as $field | (.[$inbound_id].xhttp // {}) |
             if $field[0] == "server" then .server //= $server
             elif $field[0] == "client" then .client //= {} | .client.xmux //= {}
             else . end |
-            if $value == "-" and $path == "mode" and $inbound_id == "cforigin" then .mode = "stream-one"
+            if $value == "-" and $path == "mode" and $inbound_id != "argo" then .mode = "stream-one"
             elif $value == "-" and $path != "split.port" then delpaths([$field])
             else setpath($field; if ($value | test("^[0-9]+$")) then $value | tonumber else $value end) end
         ' --arg inbound_id "${_module}" --arg path "${_field}" --arg value "${_raw}" --argjson server "${_server}")
@@ -6891,8 +6996,9 @@ unified_menu_freeflow() {
         _menu_print_action 2 "修改传输协议"
         _menu_print_action 3 "修改监听端口"
         _menu_print_action 4 "修改 Host / 路径 path"
-        _menu_print_action 5 "切换 xPadding（仅 XHTTP）"
+        _menu_print_action 5 "切换旧版 xPadding（XHTTP 未配置服务端 Extra 时生效）"
         _menu_print_action 6 "查看当前节点摘要"
+        _menu_print_action x "XHTTP 参数与节点导出"
         if [ "${_runtime}" -eq 1 ]; then
             _hr
             _menu_print_action r "重启 xray2go 服务"
@@ -6901,7 +7007,7 @@ unified_menu_freeflow() {
         fi
         _menu_print_back
         _hr
-        prompt "请选择操作 $( [ "${_runtime}" -eq 1 ] && printf '(0-6/r/v/u)' || printf '(0-6)' ): " _c || return 0
+        prompt "请选择操作 $( [ "${_runtime}" -eq 1 ] && printf '(0-6/x/r/v/u)' || printf '(0-6/x)' ): " _c || return 0
         case "${_c:-}" in
             1) _unified_toggle_or_plan "${_runtime}" ff "${_active}" install_plan_ff_toggle || true ;;
             2) _unified_dispatch_or_plan "${_runtime}" ff update_mode install_plan_ff_update_mode || true ;;
@@ -6909,6 +7015,7 @@ unified_menu_freeflow() {
             4) _unified_dispatch_or_plan "${_runtime}" ff update_host_or_path install_plan_ff_update_host_or_path || true ;;
             5) _unified_runtime_fn_or_plan "${_runtime}" install_plan_ff_toggle_xpad _menu_toggle_xpad ff FreeFlow || true ;;
             6) log_info "FreeFlow: ${_summary}" ;;
+            x) _direct_xhttp_menu ff "${_runtime}" "${_proto}" && continue ;;
             r) _unified_runtime_only_fn "${_runtime}" module_dispatch ff restart || true ;;
             v) _unified_runtime_only_fn "${_runtime}" module_dispatch ff show || true ;;
             u)
@@ -6948,8 +7055,9 @@ unified_menu_reality() {
         _menu_print_action 2 "修改监听端口"
         _menu_print_action 3 "修改 SNI"
         _menu_print_action 4 "切换传输协议（TCP / XHTTP）"
-        _menu_print_action 5 "切换 xPadding（仅 XHTTP）"
+        _menu_print_action 5 "切换旧版 xPadding（XHTTP 未配置服务端 Extra 时生效）"
         _menu_print_action 6 "查看当前节点摘要"
+        _menu_print_action x "XHTTP 模式与 Extra"
         if [ "${_runtime}" -eq 1 ]; then
             _hr
             _menu_print_action k "重新生成密钥对"
@@ -6959,7 +7067,7 @@ unified_menu_reality() {
         fi
         _menu_print_back
         _hr
-        prompt "请选择操作 $( [ "${_runtime}" -eq 1 ] && printf '(0-6/k/r/v/u)' || printf '(0-6)' ): " _c || return 0
+        prompt "请选择操作 $( [ "${_runtime}" -eq 1 ] && printf '(0-6/x/k/r/v/u)' || printf '(0-6/x)' ): " _c || return 0
         case "${_c:-}" in
             1) _unified_toggle_or_plan "${_runtime}" reality "${_en}" install_plan_reality_toggle || true ;;
             2) _unified_dispatch_or_plan "${_runtime}" reality update_port install_plan_reality_update_port || true ;;
@@ -6967,6 +7075,7 @@ unified_menu_reality() {
             4) _unified_dispatch_or_plan "${_runtime}" reality update_transport install_plan_reality_update_transport || true ;;
             5) _unified_runtime_fn_or_plan "${_runtime}" install_plan_reality_toggle_xpad _menu_toggle_xpad reality Reality || true ;;
             6) log_info "Reality: ${_summary}" ;;
+            x) _direct_xhttp_menu reality "${_runtime}" "${_net}" && continue ;;
             k) _unified_runtime_only_fn "${_runtime}" module_dispatch reality regenerate_keys || true ;;
             r) _unified_runtime_only_fn "${_runtime}" module_dispatch reality restart || true ;;
             v) _unified_runtime_only_fn "${_runtime}" module_dispatch reality show || true ;;
@@ -7057,6 +7166,7 @@ unified_menu_vlquic() {
         _menu_print_action 3 "修改监听地址"
         _menu_print_action 4 "配置域名/证书"
         _menu_print_action 5 "查看当前节点摘要"
+        _menu_print_action x "XHTTP 参数与节点导出"
         if [ "${_runtime}" -eq 1 ]; then
             _hr
             _menu_print_action r "重启 xray2go 服务"
@@ -7065,13 +7175,14 @@ unified_menu_vlquic() {
         fi
         _menu_print_back
         _hr
-        prompt "请选择操作 $( [ "${_runtime}" -eq 1 ] && printf '(0-5/r/v/u)' || printf '(0-5)' ): " _c || return 0
+        prompt "请选择操作 $( [ "${_runtime}" -eq 1 ] && printf '(0-5/x/r/v/u)' || printf '(0-5/x)' ): " _c || return 0
         case "${_c:-}" in
             1) _unified_toggle_or_plan "${_runtime}" vlquic "${_en}" install_plan_vlquic_toggle || true ;;
             2) _unified_dispatch_or_plan "${_runtime}" vlquic update_port install_plan_vlquic_update_port || true ;;
             3) _unified_dispatch_or_plan "${_runtime}" vlquic update_listen install_plan_vlquic_update_listen || true ;;
             4) _unified_dispatch_or_plan "${_runtime}" vlquic update_cert install_plan_vlquic_update_cert || true ;;
             5) log_info "VLESS-XHTTP-H3: ${_summary}" ;;
+            x) _direct_xhttp_menu vlquic "${_runtime}" xhttp && continue ;;
             r) _unified_runtime_only_fn "${_runtime}" module_dispatch vlquic restart || true ;;
             v) _unified_runtime_only_fn "${_runtime}" module_dispatch vlquic show || true ;;
             u)
@@ -7087,6 +7198,84 @@ unified_menu_vlquic() {
         esac
         _pause
     done
+}
+
+_direct_xhttp_set_profile() {
+    local _module="$1" _runtime="$2" _raw="$3" _profile=null _invalid _label
+    _label=$(module_label "${_module}")
+    if [ "${_raw}" != null ]; then
+        _profile=$(_xhttp_validate_profile "${_raw}") || return 1
+        _invalid=$(jq -r '
+            if has("split") then "split（此字段用于 Argo）"
+            elif (.mode | type | IN("null","string") | not) then "mode"
+            elif (.server | type | IN("null","object") | not) then "server"
+            elif (.client | type | IN("null","object") | not) then "client"
+            else ["server","client"][] as $side | (.[$side] // {}) | keys[] as $key |
+                select($key | IN("path", "mode", "host", "extra", "xhttpModeH3")) | "\($side).\($key)"
+            end
+        ' <<< "${_profile}") || return 1
+        [ -z "${_invalid}" ] || { log_error "${_label} XHTTP 字段无效: ${_invalid}"; return 1; }
+        _profile=$(jq -ce --arg mode "$(st_get '.[$id].xhttp.mode // "stream-one"' --arg id "${_module}")" '.mode //= $mode' <<< "${_profile}") || return 1
+    fi
+    if [ "${_runtime}" = 1 ]; then
+        _transaction_run "更新 Reality XHTTP" _xhttp_apply_profile "${_module}" "${_profile}" || return 1
+        log_ok "${_label} XHTTP 配置已保存"
+    else
+        st_set '.[$id].xhttp = $profile' --arg id "${_module}" --argjson profile "${_profile}" || return 1
+        log_ok "${_label} XHTTP 已写入安装计划"
+    fi
+}
+
+_reality_xhttp_set_profile() { _direct_xhttp_set_profile reality "$@"; }
+_ff_xhttp_set_profile() { _direct_xhttp_set_profile ff "$@"; }
+_vlquic_xhttp_set_profile() { _direct_xhttp_set_profile vlquic "$@"; }
+
+_ff_xhttp_render_status() { _xhttp_render_status_with_legacy_padding ff; }
+
+_ff_xhttp_export_json() {
+    local _ip _stream
+    _ip=$(platform_get_realip)
+    [ -n "${_ip}" ] || { log_warn "无法获取服务器 IP，FreeFlow 节点已跳过"; return 1; }
+    _stream=$(_ff_xhttp_client_stream "${_ip}") || return 1
+    _ip="${_ip#[}"; _ip="${_ip%]}"
+    _xhttp_export_vless_outbound "${_ip}" "$(port_of ff)" "${_stream}"
+}
+
+_vlquic_xhttp_render_status() {
+    jq -r '
+        "  当前模式 \(.mode // "stream-one") · Padding \(.server.xPaddingBytes // "Xray 默认")",
+        "  XMUX \(if (.client.xmux // {} | length) == 0 then "Xray 默认" else .client.xmux | tojson end) · HTTP/3 (UDP)"
+    ' <<< "$(st_get '.vlquic.xhttp // {}')"
+}
+
+_vlquic_xhttp_export_json() {
+    local _domain _stream
+    _domain=$(st_get '.vlquic.domain')
+    [ -n "${_domain}" ] || { log_warn "请先配置 VLESS-XHTTP-H3 域名，再导出出站 JSON"; return 1; }
+    _stream=$(_vlquic_xhttp_client_stream "${_domain}") || return 1
+    _xhttp_export_vless_outbound "${_domain}" "$(port_of vlquic)" "${_stream}"
+}
+
+_reality_xhttp_render_status() { _xhttp_render_status_with_legacy_padding reality; }
+
+_xhttp_render_status_with_legacy_padding() {
+    local _module="$1" _server
+    _server=$(_xhttp_server_extra_with_legacy_padding "${_module}") || return 1
+    jq -r --argjson server "${_server}" --arg legacy "$(xpad_of "${_module}")" '
+        "  当前模式 \(.mode // "stream-one") · Padding \(
+            if .server == null and $legacy == "true" then "旧版设置"
+            else $server.xPaddingBytes // "Xray 默认" end)",
+        "  XMUX \(if (.client.xmux // {} | length) == 0 then "Xray 默认" else .client.xmux | tojson end)"
+    ' <<< "$(st_get '.[$id].xhttp // {}' --arg id "${_module}")"
+}
+
+_reality_xhttp_export_json() {
+    local _address _stream
+    _stream=$(_reality_xhttp_client_stream) || return 1
+    _address=$(platform_get_realip)
+    _address="${_address#[}"; _address="${_address%]}"
+    [ -n "${_address}" ] || { log_warn "无法获取服务器 IP，Reality 节点已跳过"; return 1; }
+    _xhttp_export_vless_outbound "${_address}" "$(port_of reality)" "${_stream}"
 }
 
 _cforigin_xhttp_set_profile() {
@@ -7132,18 +7321,18 @@ _cforigin_xhttp_render_status() {
     ' <<< "$(st_get '.cforigin.xhttp // {}')"
 }
 
-_cforigin_xhttp_export_menu() {
-    local _choice
+_direct_xhttp_export_menu() {
+    local _module="$1" _choice
     while true; do
-        log_title "══ 导出 CF Origin XHTTP 节点 ══"
+        log_title "══ 导出 $(module_label "${_module}") XHTTP 节点 ══"
         _menu_print_action 1 "分享链接"
         _menu_print_action 2 "客户端出站 JSON"
         _menu_print_back
         prompt '选择格式 (0-2): ' _choice || return 0
         case "${_choice}" in
             0) return 0 ;;
-            1) _cforigin_xhttp_link || true ;;
-            2) _cforigin_xhttp_export_json || true ;;
+            1) "_${_module}_xhttp_link" || true ;;
+            2) "_${_module}_xhttp_export_json" || true ;;
             *) log_error "无效选项，请按提示输入"; continue ;;
         esac
         _pause
@@ -7151,12 +7340,13 @@ _cforigin_xhttp_export_menu() {
     done
 }
 
-_cforigin_xhttp_menu() {
-    local _runtime="$1" _choice _mode _profile _input
-    [ "$(st_get '.cforigin.protocol')" = xhttp ] || { log_warn "请先选择 CF Origin 的 XHTTP 传输"; return 1; }
+_direct_xhttp_menu() {
+    local _module="$1" _runtime="$2" _transport="$3" _choice _mode _profile _input _label
+    _label=$(module_label "${_module}")
+    [ "${_transport}" = xhttp ] || { log_warn "请先选择 ${_label} 的 XHTTP 传输"; return 1; }
     while true; do
-        log_title "CF Origin / XHTTP"
-        _cforigin_xhttp_render_status
+        log_title "${_label} / XHTTP"
+        "_${_module}_xhttp_render_status"
         _menu_print_action 1 "选择传输模式"
         _menu_print_action 2 "编辑服务端和客户端 Extra JSON"
         _menu_print_action 3 "导出分享链接或客户端出站 JSON"
@@ -7176,19 +7366,23 @@ _cforigin_xhttp_menu() {
                     '') continue ;;
                     *) log_error "请输入 1–4 选择传输模式"; _pause; continue ;;
                 esac
-                _profile=$(st_get '.cforigin.xhttp // {} | .mode = $mode' --arg mode "${_mode}")
-                _cforigin_xhttp_set_profile "${_runtime}" "${_profile}" || true ;;
+                _profile=$(st_get '.[$id].xhttp // {} | .mode = $mode' --arg id "${_module}" --arg mode "${_mode}")
+                "_${_module}_xhttp_set_profile" "${_runtime}" "${_profile}" || true ;;
             2)
                 log_info 'JSON 字段: mode, server（入站 Extra）, client（客户端 Extra）'
-                _xhttp_edit_advanced cforigin "${_runtime}"
+                _xhttp_edit_advanced "${_module}" "${_runtime}"
                 continue ;;
-            3) _cforigin_xhttp_export_menu; continue ;;
-            4) _cforigin_xhttp_set_profile "${_runtime}" null || true ;;
-            5) _xhttp_edit_common cforigin "${_runtime}"; continue ;;
+            3) _direct_xhttp_export_menu "${_module}"; continue ;;
+            4) "_${_module}_xhttp_set_profile" "${_runtime}" null || true ;;
+            5) _xhttp_edit_common "${_module}" "${_runtime}"; continue ;;
             *) log_error "请输入 0–5 选择操作" ;;
         esac
         _pause
     done
+}
+
+_cforigin_xhttp_menu() {
+    _direct_xhttp_menu cforigin "$1" "$(st_get '.cforigin.protocol')"
 }
 
 unified_menu_cforigin() {
@@ -7456,6 +7650,9 @@ install_wizard_confirm() {
     printf "  CF-Origin : %s\n" "$(install_plan_module_summary cforigin)"
     if [ "$(st_get '.cforigin.enabled')" = true ] && [ "${#_CFORIGIN_ISSUE[@]}" -gt 0 ]; then
         printf '  CF-Origin 证书将在确认部署后签发。\n'
+    fi
+    if [ "$(st_get '.vlquic.enabled')" = true ] && [ "${#_VLQUIC_ISSUE[@]}" -gt 0 ]; then
+        printf '  XHTTP-H3 证书将在确认部署后签发。\n'
     fi
     _hr
     printf "  ${C_YLW}安装前会再次执行完整校验；确认后才开始安装。${C_RST}\n"
