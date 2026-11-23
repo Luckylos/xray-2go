@@ -3058,7 +3058,7 @@ module_ss2022_update_method() {
     _module_update_state_transaction "SS2022 加密方法更新" _module_ss2022_update_method_inner \
         "${_en}" "${_method}" "${_server}" "${_user}" || return 1
     log_ok "SS2022 加密方法已更新为 $_method（已重新生成密钥）"
-    [ "$_en" = "true" ] && { config_print_nodes ss2022 || true; }
+    if [ "$_en" = "true" ]; then config_print_nodes ss2022 || true; fi
 }
 
 _module_ss2022_regenerate_keys_inner() {
@@ -3079,7 +3079,7 @@ module_ss2022_regenerate_keys() {
     _module_update_state_transaction "SS2022 密钥轮换" _module_ss2022_regenerate_keys_inner \
         "${_en}" "${_server}" "${_user}" || return 1
     log_ok "SS2022 服务端/用户密钥已重新生成"
-    [ "$_en" = "true" ] && { config_print_nodes ss2022 || true; }
+    if [ "$_en" = "true" ]; then config_print_nodes ss2022 || true; fi
 }
 
 module_http_action() {
@@ -3178,7 +3178,7 @@ module_socks_update_auth() {
     st_set '.socks.user = $u | .socks.pass = $p' --arg u "${_user}" --arg p "${_pass}" || return 1
     _module_persist_after_optional_apply "${_en}" || return 1
     log_ok "SOCKS5 账号已更新: ${_user}"
-    [ "${_en}" = "true" ] && { config_print_nodes socks || true; }
+    if [ "${_en}" = "true" ]; then config_print_nodes socks || true; fi
 }
 
 
@@ -3191,7 +3191,7 @@ module_socks_update_user() {
     st_set '.socks.user = $u' --arg u "${_user}" || return 1
     _module_persist_after_optional_apply "${_en}" || return 1
     log_ok "SOCKS5 用户名已更新: ${_user}"
-    [ "${_en}" = "true" ] && { config_print_nodes socks || true; }
+    if [ "${_en}" = "true" ]; then config_print_nodes socks || true; fi
 }
 
 module_socks_update_pass() {
@@ -3202,7 +3202,7 @@ module_socks_update_pass() {
     st_set '.socks.pass = $p' --arg p "${_pass}" || return 1
     _module_persist_after_optional_apply "${_en}" || return 1
     log_ok "SOCKS5 密码已更新"
-    [ "${_en}" = "true" ] && { config_print_nodes socks || true; }
+    if [ "${_en}" = "true" ]; then config_print_nodes socks || true; fi
 }
 
 module_http_uninstall() {
@@ -3229,7 +3229,7 @@ module_http_update_auth() {
     st_set '.http.user = $u | .http.pass = $p' --arg u "${_user}" --arg p "${_pass}" || return 1
     _module_persist_after_optional_apply "${_en}" || return 1
     log_ok "HTTP 代理账号已更新: ${_user}"
-    [ "${_en}" = "true" ] && { config_print_nodes http || true; }
+    if [ "${_en}" = "true" ]; then config_print_nodes http || true; fi
 }
 
 module_http_update_user() {
@@ -3241,7 +3241,7 @@ module_http_update_user() {
     st_set '.http.user = $u' --arg u "${_user}" || return 1
     _module_persist_after_optional_apply "${_en}" || return 1
     log_ok "HTTP 代理用户名已更新: ${_user}"
-    [ "${_en}" = "true" ] && { config_print_nodes http || true; }
+    if [ "${_en}" = "true" ]; then config_print_nodes http || true; fi
 }
 
 module_http_update_pass() {
@@ -3252,7 +3252,7 @@ module_http_update_pass() {
     st_set '.http.pass = $p' --arg p "${_pass}" || return 1
     _module_persist_after_optional_apply "${_en}" || return 1
     log_ok "HTTP 代理密码已更新"
-    [ "${_en}" = "true" ] && { config_print_nodes http || true; }
+    if [ "${_en}" = "true" ]; then config_print_nodes http || true; fi
 }
 module_vlquic_uninstall() {
     _module_disable_transaction VLESS-XHTTP-H3 st_set '.vlquic.enabled = false | .vlquic.listen = "0.0.0.0" | .vlquic.domain = "" | .vlquic.cert = "" | .vlquic.key = "" | .vlquic.acme_method = "manual"' || return 1
@@ -3294,7 +3294,7 @@ module_reality_update_transport() {
     st_set '.reality.network = $n' --arg n "${_nn}" || return 1
     _module_persist_after_optional_apply "${_en}" || return 1
     log_ok "传输方式已切换: ${_nn}"
-    [ "${_en}" = "true" ] && { config_print_nodes reality || true; }
+    if [ "${_en}" = "true" ]; then config_print_nodes reality || true; fi
 }
 
 module_vltcp_update_listen() {
@@ -3320,7 +3320,7 @@ module_cforigin_update_protocol() {
     esac
     _module_persist_after_optional_apply "${_en}" || return 1
     log_ok "CF Origin 协议已更新: $(st_get '.cforigin.protocol')"
-    [ "${_en}" = "true" ] && { config_print_nodes cforigin || true; }
+    if [ "${_en}" = "true" ]; then config_print_nodes cforigin || true; fi
 }
 
 
@@ -3333,7 +3333,7 @@ module_cforigin_update_domain() {
     st_set '.cforigin.domain = $d' --arg d "${_domain}" || return 1
     _module_persist_after_optional_apply "${_en}" || return 1
     log_ok "CF Origin 域名已更新: ${_domain}"
-    [ "${_en}" = "true" ] && cforigin_print_cloudflare_hint
+    if [ "${_en}" = "true" ]; then cforigin_print_cloudflare_hint; fi
 }
 module_cforigin_update_path() {
     local _en _path _p _vp
@@ -3345,7 +3345,7 @@ module_cforigin_update_path() {
     st_set '.cforigin.path = $p' --arg p "${_vp}" || return 1
     _module_persist_after_optional_apply "${_en}" || return 1
     log_ok "path 已更新: ${_vp}"
-    [ "${_en}" = "true" ] && { config_print_nodes cforigin || true; }
+    if [ "${_en}" = "true" ]; then config_print_nodes cforigin || true; fi
 }
 
 module_cforigin_update_listen() {
@@ -3522,7 +3522,7 @@ module_reality_update_sni() {
     _module_apply_if_enabled "${_en}" || return 1
     st_persist || { log_error "state.json 写入失败"; return 1; }
     log_ok "SNI 已更新: ${_s}"
-    [ "${_en}" = "true" ] && { config_print_nodes reality || true; }
+    if [ "${_en}" = "true" ]; then config_print_nodes reality || true; fi
 }
 
 module_reality_regenerate_keys() {
@@ -3534,7 +3534,7 @@ module_reality_regenerate_keys() {
     [ "${_en}" = "true" ] && { config_apply || return 1; }
     st_persist || { log_error "state.json 写入失败"; return 1; }
     log_ok "密钥对已更新"
-    [ "${_en}" = "true" ] && { config_print_nodes reality || true; }
+    if [ "${_en}" = "true" ]; then config_print_nodes reality || true; fi
 }
 
 _module_vlquic_enable_prepare() {
@@ -3563,7 +3563,11 @@ module_vlquic_update_cert() {
     _en=$(st_get '.vlquic.enabled')
     vlquic_config_cert || return 1
     st_persist || { log_error "state.json 写入失败"; return 1; }
-    [ "${_en}" = "true" ] && { fw_reconcile; config_apply || return 1; config_print_nodes vlquic || true; }
+    if [ "${_en}" = "true" ]; then
+        fw_reconcile
+        config_apply || return 1
+        config_print_nodes vlquic || true
+    fi
 }
 
 module_cforigin_update_cert() {
@@ -3573,7 +3577,10 @@ module_cforigin_update_cert() {
     [ "${_en}" = "true" ] && { config_apply || return 1; }
     st_persist || { log_error "state.json 写入失败"; return 1; }
     log_ok "CF Origin 域名/证书已更新"
-    [ "${_en}" = "true" ] && { config_print_nodes cforigin; cforigin_print_cloudflare_hint; }
+    if [ "${_en}" = "true" ]; then
+        config_print_nodes cforigin
+        cforigin_print_cloudflare_hint
+    fi
 }
 
 module_cforigin_update_edge_port() {
@@ -5145,10 +5152,6 @@ _manage_module_entry_check() {
     [ -f "${CONFIG_FILE}" ] || { log_warn "请先完成 Xray-2go 安装"; sleep 1; return 1; }
 }
 
-_module_action_or_continue() {
-    module_dispatch "$@" || { _pause; return 1; }
-}
-
 check_argo() {
     module_status_action argo
 }
@@ -6167,9 +6170,9 @@ _unified_runtime_status_for() {
 _unified_runtime_toggle() {
     local _mod="$1" _enabled="$2"
     if [ "${_enabled}" = "true" ]; then
-        _module_action_or_continue "${_mod}" disable || return 1
+        module_dispatch "${_mod}" disable || return 1
     else
-        _module_action_or_continue "${_mod}" enable || return 1
+        module_dispatch "${_mod}" enable || return 1
     fi
 }
 
@@ -6207,7 +6210,7 @@ _unified_toggle_or_plan() {
 _unified_dispatch_or_plan() {
     local _runtime="$1" _mod="$2" _action="$3" _plan_fn="$4"
     if [ "${_runtime}" -eq 1 ]; then
-        _module_action_or_continue "${_mod}" "${_action}"
+        module_dispatch "${_mod}" "${_action}"
     else
         "${_plan_fn}"
     fi
@@ -6577,13 +6580,13 @@ unified_menu_argo() {
                 fi ;;
             9) log_info "Argo: ${_summary}" ;;
             x) _argo_xhttp_menu "${_runtime}" && continue ;;
-            r) _unified_runtime_only_fn "${_runtime}" _module_action_or_continue argo restart || true ;;
+            r) _unified_runtime_only_fn "${_runtime}" module_dispatch argo restart || true ;;
             h) _unified_runtime_only_fn "${_runtime}" argo_check_health || true ;;
-            v) _unified_runtime_only_fn "${_runtime}" _module_action_or_continue argo show || true ;;
+            v) _unified_runtime_only_fn "${_runtime}" module_dispatch argo show || true ;;
             u)
                 if [ "${_runtime}" -eq 1 ]; then
                     _menu_confirm_uninstall "Argo" || { _pause; continue; }
-                    _module_action_or_continue argo uninstall || continue
+                    module_dispatch argo uninstall || { _pause; continue; }
                     _pause; return 0
                 else
                     log_error "无效选项，请按提示输入"
@@ -6641,12 +6644,12 @@ unified_menu_freeflow() {
             4) _unified_dispatch_or_plan "${_runtime}" ff update_host_or_path install_plan_ff_update_host_or_path || true ;;
             5) _unified_runtime_fn_or_plan "${_runtime}" install_plan_ff_toggle_xpad _menu_toggle_xpad ff FreeFlow || true ;;
             6) log_info "FreeFlow: ${_summary}" ;;
-            r) _unified_runtime_only_fn "${_runtime}" _module_action_or_continue ff restart || true ;;
-            v) _unified_runtime_only_fn "${_runtime}" _module_action_or_continue ff show || true ;;
+            r) _unified_runtime_only_fn "${_runtime}" module_dispatch ff restart || true ;;
+            v) _unified_runtime_only_fn "${_runtime}" module_dispatch ff show || true ;;
             u)
                 if [ "${_runtime}" -eq 1 ]; then
                     _menu_confirm_uninstall "FreeFlow" || { _pause; continue; }
-                    _module_action_or_continue ff uninstall || continue
+                    module_dispatch ff uninstall || { _pause; continue; }
                     _pause; return 0
                 else
                     log_error "无效选项，请按提示输入"
@@ -6699,13 +6702,13 @@ unified_menu_reality() {
             4) _unified_dispatch_or_plan "${_runtime}" reality update_transport install_plan_reality_update_transport || true ;;
             5) _unified_runtime_fn_or_plan "${_runtime}" install_plan_reality_toggle_xpad _menu_toggle_xpad reality Reality || true ;;
             6) log_info "Reality: ${_summary}" ;;
-            k) _unified_runtime_only_fn "${_runtime}" _module_action_or_continue reality regenerate_keys || true ;;
-            r) _unified_runtime_only_fn "${_runtime}" _module_action_or_continue reality restart || true ;;
-            v) _unified_runtime_only_fn "${_runtime}" _module_action_or_continue reality show || true ;;
+            k) _unified_runtime_only_fn "${_runtime}" module_dispatch reality regenerate_keys || true ;;
+            r) _unified_runtime_only_fn "${_runtime}" module_dispatch reality restart || true ;;
+            v) _unified_runtime_only_fn "${_runtime}" module_dispatch reality show || true ;;
             u)
                 if [ "${_runtime}" -eq 1 ]; then
                     _menu_confirm_uninstall "Reality" || { _pause; continue; }
-                    _module_action_or_continue reality uninstall || continue
+                    module_dispatch reality uninstall || { _pause; continue; }
                     _pause; return 0
                 else
                     log_error "无效选项，请按提示输入"
@@ -6750,12 +6753,12 @@ unified_menu_vltcp() {
             2) _unified_dispatch_or_plan "${_runtime}" vltcp update_port install_plan_vltcp_update_port || true ;;
             3) _unified_dispatch_or_plan "${_runtime}" vltcp update_listen install_plan_vltcp_update_listen || true ;;
             4) log_info "VLESS-TCP: ${_summary}" ;;
-            r) _unified_runtime_only_fn "${_runtime}" _module_action_or_continue vltcp restart || true ;;
-            v) _unified_runtime_only_fn "${_runtime}" _module_action_or_continue vltcp show || true ;;
+            r) _unified_runtime_only_fn "${_runtime}" module_dispatch vltcp restart || true ;;
+            v) _unified_runtime_only_fn "${_runtime}" module_dispatch vltcp show || true ;;
             u)
                 if [ "${_runtime}" -eq 1 ]; then
                     _menu_confirm_uninstall "VLESS-TCP" || { _pause; continue; }
-                    _module_action_or_continue vltcp uninstall || continue
+                    module_dispatch vltcp uninstall || { _pause; continue; }
                     _pause; return 0
                 else
                     log_error "无效选项，请按提示输入"
@@ -6804,12 +6807,12 @@ unified_menu_vlquic() {
             3) _unified_dispatch_or_plan "${_runtime}" vlquic update_listen install_plan_vlquic_update_listen || true ;;
             4) _unified_dispatch_or_plan "${_runtime}" vlquic update_cert install_plan_vlquic_update_cert || true ;;
             5) log_info "VLESS-XHTTP-H3: ${_summary}" ;;
-            r) _unified_runtime_only_fn "${_runtime}" _module_action_or_continue vlquic restart || true ;;
-            v) _unified_runtime_only_fn "${_runtime}" _module_action_or_continue vlquic show || true ;;
+            r) _unified_runtime_only_fn "${_runtime}" module_dispatch vlquic restart || true ;;
+            v) _unified_runtime_only_fn "${_runtime}" module_dispatch vlquic show || true ;;
             u)
                 if [ "${_runtime}" -eq 1 ]; then
                     _menu_confirm_uninstall "VLESS-XHTTP-H3" || { _pause; continue; }
-                    _module_action_or_continue vlquic uninstall || continue
+                    module_dispatch vlquic uninstall || { _pause; continue; }
                     _pause; return 0
                 else
                     log_error "无效选项，请按提示输入"
@@ -6978,12 +6981,12 @@ unified_menu_cforigin() {
             9) _unified_dispatch_or_plan "${_runtime}" cforigin update_cert install_plan_cforigin_update_cert || true ;;
             a) log_info "CF Origin: ${_summary}" ;;
             x) _cforigin_xhttp_menu "${_runtime}" && continue ;;
-            r) _unified_runtime_only_fn "${_runtime}" _module_action_or_continue cforigin restart || true ;;
-            v) _unified_runtime_only_fn "${_runtime}" _module_action_or_continue cforigin show || true ;;
+            r) _unified_runtime_only_fn "${_runtime}" module_dispatch cforigin restart || true ;;
+            v) _unified_runtime_only_fn "${_runtime}" module_dispatch cforigin show || true ;;
             u)
                 if [ "${_runtime}" -eq 1 ]; then
                     _menu_confirm_uninstall "CF Origin" || { _pause; continue; }
-                    _module_action_or_continue cforigin uninstall || continue
+                    module_dispatch cforigin uninstall || { _pause; continue; }
                     _pause; return 0
                 else
                     log_error "无效选项，请按提示输入"
@@ -7033,12 +7036,12 @@ unified_menu_socks() {
             4) _unified_dispatch_or_plan "${_runtime}" socks update_user install_plan_socks_update_user || true ;;
             5) _unified_dispatch_or_plan "${_runtime}" socks update_pass install_plan_socks_update_pass || true ;;
             6) log_info "SOCKS5: ${_summary}" ;;
-            r) _unified_runtime_only_fn "${_runtime}" _module_action_or_continue socks restart || true ;;
-            v) _unified_runtime_only_fn "${_runtime}" _module_action_or_continue socks show || true ;;
+            r) _unified_runtime_only_fn "${_runtime}" module_dispatch socks restart || true ;;
+            v) _unified_runtime_only_fn "${_runtime}" module_dispatch socks show || true ;;
             u)
                 if [ "${_runtime}" -eq 1 ]; then
                     _menu_confirm_uninstall "SOCKS5" || { _pause; continue; }
-                    _module_action_or_continue socks uninstall || continue
+                    module_dispatch socks uninstall || { _pause; continue; }
                     _pause; return 0
                 else
                     log_error "无效选项，请按提示输入"
@@ -7089,12 +7092,12 @@ unified_menu_ss2022() {
             4) _unified_dispatch_or_plan "$_runtime" ss2022 update_method install_plan_ss2022_update_method || true ;;
             5) _unified_dispatch_or_plan "$_runtime" ss2022 regenerate_keys install_plan_ss2022_regenerate_keys || true ;;
             6) log_info "SS2022: $_summary" ;;
-            r) _unified_runtime_only_fn "$_runtime" _module_action_or_continue ss2022 restart || true ;;
-            v) _unified_runtime_only_fn "$_runtime" _module_action_or_continue ss2022 show || true ;;
+            r) _unified_runtime_only_fn "$_runtime" module_dispatch ss2022 restart || true ;;
+            v) _unified_runtime_only_fn "$_runtime" module_dispatch ss2022 show || true ;;
             u)
                 if [ "$_runtime" -eq 1 ]; then
                     _menu_confirm_uninstall "Shadowsocks 2022" || { _pause; continue; }
-                    _module_action_or_continue ss2022 uninstall || continue
+                    module_dispatch ss2022 uninstall || { _pause; continue; }
                     _pause; return 0
                 else
                     log_error "无效选项，请按提示输入"
@@ -7144,12 +7147,12 @@ unified_menu_http() {
             4) _unified_dispatch_or_plan "${_runtime}" http update_user install_plan_http_update_user || true ;;
             5) _unified_dispatch_or_plan "${_runtime}" http update_pass install_plan_http_update_pass || true ;;
             6) log_info "HTTP 代理: ${_summary}" ;;
-            r) _unified_runtime_only_fn "${_runtime}" _module_action_or_continue http restart || true ;;
-            v) _unified_runtime_only_fn "${_runtime}" _module_action_or_continue http show || true ;;
+            r) _unified_runtime_only_fn "${_runtime}" module_dispatch http restart || true ;;
+            v) _unified_runtime_only_fn "${_runtime}" module_dispatch http show || true ;;
             u)
                 if [ "${_runtime}" -eq 1 ]; then
                     _menu_confirm_uninstall "HTTP 代理" || { _pause; continue; }
-                    _module_action_or_continue http uninstall || continue
+                    module_dispatch http uninstall || { _pause; continue; }
                     _pause; return 0
                 else
                     log_error "无效选项，请按提示输入"

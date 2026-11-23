@@ -722,7 +722,7 @@ def test_single_file_module_dispatch_actions():
         assert_true(fn in TEXT, f"module action helper missing: {fn}")
     for marker in ['# core/global actions', '# Common module actions are dispatched from the registry above.', '# field/config update actions', '# key/toggle actions', '# complex/specialized actions']:
         assert_true(marker in dispatch_body, f"module_dispatch should be grouped for readability: {marker}")
-    assert_true('_module_action_or_continue reality restart' in TEXT and '_module_action_or_continue vltcp show' in TEXT, "module menus should route representative actions through shared dispatch wrapper")
+    assert_true('module_dispatch reality restart' in TEXT and 'module_dispatch vltcp show' in TEXT, "module menus should route representative actions through shared dispatch")
 
 
 def test_single_file_module_enable_disable_actions():
@@ -795,7 +795,7 @@ def test_single_file_module_transaction_helpers():
     assert_true('_module_update_state_transaction()' in TEXT and '_module_update_listen_transaction()' in TEXT, "state update transaction helpers missing")
     for body_name in ['unified_menu_freeflow()', 'unified_menu_reality()', 'unified_menu_vltcp()', 'unified_menu_cforigin()']:
         body = TEXT[TEXT.index(body_name):TEXT.index('\n}\n', TEXT.index(body_name))]
-        assert_true('_module_action_or_continue' in body or '_unified_runtime_toggle' in body, f"{body_name} live actions should route through shared dispatcher/toggle helpers")
+        assert_true('module_dispatch' in body or '_unified_runtime_toggle' in body, f"{body_name} live actions should route through shared dispatcher/toggle helpers")
     assert_true('_module_apply_if_enabled' in TEXT, "enabled-only config updates should use shared apply helper")
     assert_true('_module_persist_after_optional_apply()' in TEXT, "legacy modules should retain shared optional-apply helper")
     for proto in ['socks', 'http', 'vltcp', 'vlquic']:
@@ -3300,6 +3300,30 @@ grep -q 'Shadowsocks 2022 端口已更新: 10007（TCP/UDP）' "$_msg_file" && p
     assert_true("fail_rc=1 mem=8388 file=no" in out, f"port update must roll back in-memory state even without state.json: {out}")
     assert_true("ok_rc=0 mem=10007 disk=10007" in out, f"port update must persist the new port: {out}")
     assert_true("msg=ok" in out, f"port update message should name the module and protocol: {out}")
+
+
+def test_management_action_pauses_once():
+    out = run_bash(r'''
+        source ./xray_2go.sh
+        st_init
+        st_set '.cforigin.enabled=false | .cforigin.protocol="ws"'
+        st_persist
+        _manage_module_entry_check() { return 0; }
+        _unified_runtime_status_for() { return 0; }
+        clear() { :; }
+        prompt() { IFS= read -r "$2"; }
+        _pause() { printf 'ACTION_PAUSE\n'; }
+        module_cforigin_uninstall() { printf 'UNINSTALL_RAN\n'; }
+        unified_menu_cforigin runtime <<< $'2\n3\n2\n9\nu\nn\n0'
+        jq -e '.cforigin.enabled == false and .cforigin.protocol == "xhttp"' "${STATE_FILE}" >/dev/null || exit 1
+        printf 'CHECK_STATUS\n'
+        module_dispatch cforigin update_protocol <<< '3' || exit 1
+        printf 'UPDATE_RETURNED_SUCCESS\n'
+    ''', timeout=30)
+    menu_out, _, action_out = out.partition('CHECK_STATUS')
+    assert menu_out.count('ACTION_PAUSE') == 3, menu_out
+    assert '无效选项' in menu_out and 'UNINSTALL_RAN' not in menu_out, menu_out
+    assert 'UPDATE_RETURNED_SUCCESS' in action_out and 'ACTION_PAUSE' not in action_out, action_out
 
 
 def test_menu_back_redraws_parent_without_pause():
