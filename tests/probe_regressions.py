@@ -1970,6 +1970,7 @@ def test_argo_xhttp_profiles_and_shared_reality_inbound():
         st_init
         platform_get_realip() { printf '%s\n' '203.0.113.5'; }
         st_set '.argo.enabled=true | .argo.protocol="xhttp" | .argo.domain="argo.example.com" |
+            .cfip="edge.example.com" | .cfport=8443 |
             .reality.enabled=true | .reality.sni="target.example.com" | .reality.sid="0123456789abcdef" |
             .reality.pbk="fixture_public_key" | .reality.pvk="fixture_private_key"'
         plugin_refresh_runtime
@@ -1986,8 +1987,10 @@ def test_argo_xhttp_profiles_and_shared_reality_inbound():
             any(.[]; .streamSettings.security == "reality" and .settings.clients[0].flow == "xtls-rprx-vision")' >/dev/null
         fw_desired_rules | grep -qx 28443/tcp
         _argo_xhttp_client_stream split | jq -e '
+            .security == "reality" and .realitySettings.password == "fixture_public_key" and
             .xhttpSettings.extra.xmux.maxConcurrency == 1 and
-            .xhttpSettings.extra.downloadSettings.realitySettings.password == "fixture_public_key" and
+            .xhttpSettings.extra.downloadSettings.security == "tls" and
+            .xhttpSettings.extra.downloadSettings.tlsSettings.serverName == "argo.example.com" and
             .xhttpSettings.extra.downloadSettings.xhttpSettings.extra.xPaddingBytes == "200-500" and
             .xhttpSettings.extra.downloadSettings.xhttpSettings.extra.xmux.maxConnections == 2' >/dev/null
         links=$(plugin_collect_links argo)
@@ -2001,19 +2004,37 @@ split = next(link for link in links if link.fragment == "Argo-XHTTP-Split")
 ordinary = parse_qs(normal.query)
 separated = parse_qs(split.query)
 assert "downloadSettings" not in json.loads(ordinary["extra"][0])
-assert separated["mode"] == ["packet-up"]
-assert json.loads(separated["extra"][0])["downloadSettings"]["port"] == 28443
+assert split.hostname == "203.0.113.5" and split.port == 28443
+assert separated["mode"] == ["packet-up"] and separated["security"] == ["reality"]
+assert separated["sni"] == ["target.example.com"] and separated["pbk"] == ["fixture_public_key"]
+assert ordinary["security"] == ["tls"] and normal.hostname == "edge.example.com"
+assert json.loads(separated["extra"][0])["downloadSettings"]["port"] == 8443
 '
         st_set '.reality.sid="abcdef"'
-        _argo_xhttp_client_stream split | jq -e '.xhttpSettings.extra.downloadSettings.realitySettings.shortId == "abcdef"' >/dev/null
+        _argo_xhttp_client_stream split | jq -e '.realitySettings.shortId == "abcdef"' >/dev/null
         _argo_xhttp_set_profile 0 '{"split":{"port":28443}}'
         _argo_xhttp_set_profile 0 '{"split":{"port":28443,"download":{"address":"","port":null,"network":null,"security":null,"xhttpSettings":{"path":null}}}}'
-        _argo_xhttp_export_json split | jq -e '.streamSettings.xhttpSettings.extra.downloadSettings |
-            .address == "203.0.113.5" and .port == 28443 and .network == "xhttp" and .security == "reality" and
-            .xhttpSettings.path == "/argo" and .realitySettings.password == "fixture_public_key"' >/dev/null
+        _argo_xhttp_export_json split | jq -e '
+            (.settings.vnext[0] | .address == "203.0.113.5" and .port == 28443) and
+            (.streamSettings.xhttpSettings.extra.downloadSettings |
+                .address == "edge.example.com" and .port == 8443 and .network == "xhttp" and .security == "tls" and
+                .xhttpSettings.path == "/argo" and .xhttpSettings.host == "argo.example.com" and
+                .tlsSettings.serverName == "argo.example.com" and (has("realitySettings") | not))' >/dev/null
         _argo_xhttp_set_profile 0 '{"split":{"port":28443,"download":{"address":"[2001:db8::5]","port":28444,"xhttpSettings":{"path":"/custom"}}}}'
         _argo_xhttp_export_json split | jq -e '.streamSettings.xhttpSettings.extra.downloadSettings |
             .address == "2001:db8::5" and .port == 28444 and .xhttpSettings.path == "/custom"' >/dev/null
+        _argo_xhttp_set_profile 0 '{"split":{"port":28443,"download":{"security":"reality"}}}' && exit 1
+        st_set '.argo.xhttp.split.download = {security:"reality",realitySettings:{publicKey:"legacy-key"}}'
+        platform_get_realip() { printf '%s\n' '2001:db8::10'; }
+        _argo_xhttp_export_json split | jq -e '
+            .settings.vnext[0].address == "2001:db8::10" and
+            (.streamSettings.xhttpSettings.extra.downloadSettings |
+                .address == "edge.example.com" and .security == "tls" and (has("realitySettings") | not))' >/dev/null
+        [[ "$(_argo_xhttp_link split)" == *"@[2001:db8::10]:28443?"* ]]
+        prompt() { IFS= read -r "$2"; }
+        _pause() { :; }
+        _xhttp_edit_field argo 0 split.mode '模式' <<< stream-up
+        jq -e '.argo.xhttp.split | .mode == "stream-up" and .download == {}' <<< "${_G_STATE}" >/dev/null
         _argo_xhttp_set_profile 0 '{"split":{"port":28443,"mode":"stream-one"}}' && exit 1
         _argo_xhttp_set_profile 0 '{"client":{"xmux":{"maxConcurrency":"1-2","maxConnections":3}}}' && exit 1
         st_set '.reality.enabled=false'
@@ -2159,7 +2180,7 @@ def test_argo_xhttp_editor_and_selected_exports():
     ''', timeout=40)
     assert_true(out.count('Advanced input starts empty') == 2, out)
     for marker in ('server.xPaddingBytes', 'client.xmux.maxConnections', '当前 XHTTP JSON:',
-                   'Padding 旧版设置', '分离下行 TCP 28443', 'Argo editor state verified'):
+                   'Padding 旧版设置', 'REALITY 上行 TCP 28443', 'Argo editor state verified'):
         assert_true(marker in out, f'Missing {marker}: {out}')
     links = [urlsplit(line) for line in out.splitlines() if line.startswith('vless://')]
     assert [link.fragment for link in links] == ['Argo-XHTTP', 'Argo-XHTTP-Split']
@@ -2169,31 +2190,36 @@ def test_argo_xhttp_editor_and_selected_exports():
     outbound, _ = decoder.raw_decode(out[out.index('{\n  "protocol": "vless"'):])
     assert outbound['streamSettings']['xhttpSettings']['extra'] == split_extra
     expected_public_key = 'fixture-public'
-    assert split_extra['downloadSettings']['realitySettings']['password'] == expected_public_key
+    assert outbound['streamSettings']['realitySettings']['password'] == expected_public_key
+    assert parse_qs(links[1].query)['pbk'] == [expected_public_key]
+    assert links[1].hostname == '192.0.2.10' and links[1].port == 28443
+    assert split_extra['downloadSettings']['security'] == 'tls'
     assert parse_qs(links[0].query)['mode'] == ['auto']
     assert parse_qs(links[1].query)['mode'] == ['stream-up']
     assert outbound['streamSettings']['xhttpSettings']['mode'] == 'stream-up'
     assert out.count('{\n  "protocol": "vless"') == 1
-    assert all('support-x25519mlkem768' not in parse_qs(link.query) for link in links)
+    assert 'support-x25519mlkem768' not in parse_qs(links[0].query)
+    assert parse_qs(links[1].query)['support-x25519mlkem768'] == ['true']
     assert 'support-x25519mlkem768' not in json.dumps(outbound)
     provider, _ = decoder.raw_decode(out[out.index('{\n  "proxies": ['):])
     proxy, = provider['proxies']
     assert proxy['type'] == 'vless' and proxy['network'] == 'xhttp' and proxy['tls'] is True
-    assert proxy['servername'] == 'tunnel.example.com' and proxy['client-fingerprint'] == 'chrome'
-    assert 'reality-opts' not in proxy
+    assert proxy['server'] == '192.0.2.10' and proxy['port'] == 28443
+    assert proxy['servername'] == 'example.com' and proxy['client-fingerprint'] == 'chrome'
+    assert proxy['reality-opts'] == {'public-key': expected_public_key, 'short-id': 'abcd',
+                                     'support-x25519mlkem768': True}
     xhttp = proxy['xhttp-opts']
     assert xhttp['mode'] == 'stream-up' and xhttp['x-padding-bytes'] == '128-768'
     assert xhttp['reuse-settings']['max-concurrency'] == '4'
     down = xhttp['download-settings']
-    assert down == {'server': '192.0.2.10', 'port': 28443, 'tls': True, 'path': '/argo',
-                    'servername': 'example.com', 'client-fingerprint': 'chrome',
-                    'reuse-settings': {'max-connections': '5'},
-                    'reality-opts': {'public-key': expected_public_key, 'short-id': 'abcd',
-                                     'support-x25519mlkem768': True}}
+    assert down == {'server': 'cf.tencentapp.cn', 'port': 443, 'tls': True, 'path': '/argo',
+                    'host': 'tunnel.example.com', 'servername': 'tunnel.example.com',
+                    'client-fingerprint': 'chrome', 'reuse-settings': {'max-connections': '5'},
+                    'reality-opts': {'public-key': ''}}
     tls_output = next(line[9:] for line in out.splitlines() if line.startswith('TLS_DOWN='))
     tls_down = json.loads(tls_output)['proxies'][0]['xhttp-opts']['download-settings']
     assert tls_down['tls'] is True and tls_down['servername'] == 'down.example.com' and tls_down['alpn'] == ['h2']
-    assert 'reality-opts' not in tls_down
+    assert tls_down['reality-opts'] == {'public-key': ''}
     assert 'fixture-private' not in out
 
 

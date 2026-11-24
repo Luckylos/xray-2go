@@ -125,7 +125,7 @@ sudo ./xray_2go.sh
 
 在 Argo 菜单选择 VLESS + XHTTP，再按 `x`。配置页会显示当前模式、Padding、XMUX 和分离状态。按 `7` 可逐项设置常用参数，输入 `-` 清除对应覆盖。按 `4` 先选普通或分离节点，再选分享链接或客户端出站 JSON。
 
-启用分离时，选择一个独立且可从公网访问的 TCP 端口。脚本会让该端口的 Reality 下行与 Argo 上行共用本机 `/argo` 入站。原 Reality 节点继续使用自己的端口。Cloudflare Tunnel 仍使用原 Argo 回源。若云平台有安全组，请同步开放新端口。
+分离节点的上行使用 **XHTTP + REALITY**，直连服务器的独立公网 TCP 端口。下行使用 **XHTTP + TLS**，通过 Cloudflare CDN 和 Tunnel 回源。两条链路汇入同一个本机 `/argo` 入站。启用分离时，请为 REALITY 上行选一个可从公网访问的 TCP 端口，并在云平台安全组放行。
 
 按 `2` 打开高级 Extra 编辑。当前配置显示在提示上方，可直接粘贴新的单行 JSON，空行返回。校验失败会指出对应字段，可修正后重新粘贴。`server` 配置入站 Extra，`client` 配置普通客户端和分离上行 Extra，`split.download` 覆盖分离下行参数。
 
@@ -142,7 +142,9 @@ sudo ./xray_2go.sh
 }
 ```
 
-自动下行读取本机公网地址和 Reality 的 SNI、公钥及 Short ID。更换密钥后请重新导出。`split.download` 可覆盖对外地址、端口、路径、Host 和安全层。覆盖路径时，转发后的请求仍需进入同一个 `/argo` 入站。`stream-up` 需要沿途支持流式上传，分离默认使用 `packet-up`。
+上行自动使用本机公网地址、`split.port` 和 Reality 的 SNI、公钥及 Short ID。下行默认使用 Argo 的 CDN 地址、端口和域名，域名同时用作 TLS SNI 和 HTTP Host。`split.download` 可覆盖 CDN 地址、端口、路径、Host 和 TLS 参数。覆盖路径时，转发后的请求仍需进入同一个 `/argo` 入站。分离默认使用 `packet-up`，也可在上行选择 `stream-up`。
+
+升级后请重新导出并替换已导入的分离节点。旧版下行安全层会自动切换为 TLS。如果曾在 `split.download` 中手工指定 REALITY 直连地址或端口，请清除这些覆盖，或改为实际的 CDN 参数。
 
 Argo 工作台的 `h` 探测域名根路径，HTTP 请求上限为 15 秒。菜单会显示返回状态码，例如 `404`，并单独提示 `5xx` 和未收到 HTTP 响应。请通过客户端验证节点连通。
 
@@ -150,7 +152,7 @@ Argo 工作台的 `h` 探测域名根路径，HTTP 请求上限为 15 秒。菜�
 
 重新导出的直连 Reality TCP Vision 和 XHTTP 链接包含 `&support-x25519mlkem768=true`。Mihomo v1.19.34 和支持该参数的 MiSub 内置转换器会将它写为 `reality-opts.support-x25519mlkem768: true`。请重新导出并替换订阅源里的旧链接，再刷新客户端订阅。
 
-Argo XHTTP 分离节点可在 Argo 工作台按 `7` → `4` → `2` → `3` 导出 Mihomo 代理提供者配置。将输出保存为 JSON 文件，作为本地 `proxy-provider` 使用，也可把其中的节点加入现有 Mihomo 配置的 `proxies` 列表。下载侧使用 Reality 时，配置会在 `xhttp-opts.download-settings.reality-opts` 下启用该开关。
+Argo XHTTP 分离节点可在 Argo 工作台按 `7` → `4` → `2` → `3` 导出 Mihomo 代理提供者配置。将输出保存为 JSON 文件，作为本地 `proxy-provider` 使用，也可把其中的节点加入现有 Mihomo 配置的 `proxies` 列表。配置在上行 `reality-opts` 下启用 ML-KEM 兼容开关，并在 `xhttp-opts.download-settings` 中显式清除下行继承的 REALITY 公钥。
 
 ### Reality XHTTP 配置
 

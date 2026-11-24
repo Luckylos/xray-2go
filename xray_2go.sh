@@ -1375,44 +1375,42 @@ _xhttp_client_visible_server_extra() {
 }
 
 _argo_xhttp_download_settings() {
-    local _profile="$1" _server _address
-    _argo_xhttp_split_active || return 1
+    local _profile="$1" _host="$2" _server
     _server=$(_xhttp_server_extra argo) || return 1
     _server=$(_xhttp_client_visible_server_extra <<< "${_server}") || return 1
-    _address=$(jq -r '.split.download.address // empty' <<< "${_profile}") || return 1
-    [ -n "${_address}" ] || _address=$(platform_get_realip)
-    _address="${_address#[}"; _address="${_address%]}"
-    [ -n "${_address}" ] || return 1
-    jq -ce --arg address "${_address}" --arg sni "$(st_get '.reality.sni')" \
-        --arg public "$(st_get '.reality.pbk')" --arg sid "$(st_get '.reality.sid')" --argjson server "${_server}" '
-        .split as $split | ($split.download // {} | with_entries(select(.value != null))) as $override |
-        ({network:"xhttp",security:"reality",xhttpSettings:{extra:$server}} * $override) |
-        .address = $address | .port //= $split.port | .xhttpSettings.path //= "/argo" |
-        .xhttpSettings.extra //= $server |
-        if .security == "reality" then
-            .realitySettings = ({serverName:$sni,fingerprint:"chrome",shortId:$sid}
-                + (if ($override.realitySettings // {} | has("publicKey")) then {} else {password:$public} end)
-                + ($override.realitySettings // {})) |
-            select((.realitySettings.password // .realitySettings.publicKey // "") | length > 0)
-        else del(.realitySettings) end
+    jq -ce --arg address "$(st_get '.cfip')" --argjson port "$(st_get '.cfport')" \
+        --arg host "${_host}" --argjson server "${_server}" '
+        (.split.download // {} | del(.security) | with_entries(select(.value != null))) as $override |
+        ({address:$address,port:$port,network:"xhttp",security:"tls",
+          tlsSettings:{serverName:$host,fingerprint:"chrome"},
+          xhttpSettings:{path:"/argo",host:$host,extra:$server}} * $override) |
+        .address = ((.address | select(length > 0)) // $address | ltrimstr("[") | rtrimstr("]")) |
+        .xhttpSettings.path //= "/argo" | .xhttpSettings.host //= $host |
+        .xhttpSettings.extra //= $server | .tlsSettings.serverName //= $host
     ' <<< "${_profile}"
 }
 
 _argo_xhttp_client_stream() {
-    local _kind="$1" _profile _settings _host _down _mode
+    local _kind="$1" _profile _settings _host _down _public
     _host=$(st_get '.argo.domain') || return 1
     _settings=$(_xhttp_client_settings argo /argo "${_host}") || return 1
     if [ "${_kind}" = split ]; then
-        _profile=$(st_get '.argo.xhttp // {}') || return 1
-        _down=$(_argo_xhttp_download_settings "${_profile}") || return 1
-        _mode=$(jq -r '.split.mode // "packet-up"' <<< "${_profile}") || return 1
-        _settings=$(jq -c --arg mode "${_mode}" --argjson down "${_down}" '
-            .mode = $mode | .extra.downloadSettings = $down
-        ' <<< "${_settings}") || return 1
+        _argo_xhttp_split_active || return 1
+        _public=$(st_get '.reality.pbk') || return 1
+        [ -n "${_public}" ] || return 1
+        _profile=$(_xhttp_saved_profile argo) || return 1
+        _down=$(_argo_xhttp_download_settings "${_profile}" "${_host}") || return 1
+        jq -c --arg mode "$(jq -r '.split.mode // "packet-up"' <<< "${_profile}")" --argjson down "${_down}" \
+            --arg sni "$(st_get '.reality.sni')" --arg public "${_public}" --arg sid "$(st_get '.reality.sid')" '
+            {network:"xhttp",security:"reality",
+             realitySettings:{serverName:$sni,fingerprint:"chrome",password:$public,shortId:$sid},
+             xhttpSettings:(.mode = $mode | .extra.downloadSettings = $down)}
+        ' <<< "${_settings}"
+    else
+        jq -c --arg host "${_host}" '
+            {network:"xhttp",security:"tls",tlsSettings:{serverName:$host,fingerprint:"chrome"},xhttpSettings:.}
+        ' <<< "${_settings}"
     fi
-    jq -c --arg host "${_host}" '
-        {network:"xhttp",security:"tls",tlsSettings:{serverName:$host,fingerprint:"chrome"},xhttpSettings:.}
-    ' <<< "${_settings}"
 }
 
 _xhttp_client_settings() {
@@ -1528,17 +1526,20 @@ _cforigin_xhttp_link() {
 }
 
 _argo_xhttp_link() {
-    local _kind="$1" _stream _mode _extra _domain _address _suffix=''
-    _stream=$(_argo_xhttp_client_stream "${_kind}") || return 1
-    _mode=$(jq -r '.xhttpSettings.mode' <<< "${_stream}") || return 1
-    _extra=$(jq -r '.xhttpSettings.extra // empty | @uri' <<< "${_stream}") || return 1
-    _domain=$(st_get '.argo.domain')
-    _address=$(st_get '.cfip') || return 1
-    if [[ "${_address}" == *:* && "${_address}" != \[*\] ]]; then _address="[${_address}]"; fi
-    [ "${_kind}" != split ] || _suffix=-Split
-    printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=chrome&type=xhttp&host=%s&path=%%2Fargo&mode=%s%s#Argo-XHTTP%s\n' \
-        "$(st_get '.uuid')" "${_address}" "$(st_get '.cfport')" "${_domain}" "${_domain}" \
-        "${_mode}" "${_extra:+&extra=${_extra}}" "${_suffix}"
+    local _outbound
+    _outbound=$(_argo_xhttp_export_json "$1") || return 1
+    jq -r '
+        .settings.vnext[0] as $peer | .streamSettings as $stream | $stream.xhttpSettings as $xhttp |
+        ($peer.address | if contains(":") then "[" + . + "]" else . end) as $address |
+        ($stream.realitySettings // $stream.tlsSettings) as $security |
+        "vless://\($peer.users[0].id)@\($address):\($peer.port)?encryption=none&security=\($stream.security)" +
+        "&sni=\($security.serverName | @uri)&fp=chrome&type=xhttp&host=\($xhttp.host | @uri)&path=\($xhttp.path | @uri)&mode=\($xhttp.mode)" +
+        (if $stream.security == "reality" then
+            "&pbk=\($security.password | @uri)&sid=\($security.shortId | @uri)&support-x25519mlkem768=true"
+        else "" end) +
+        (if $xhttp.extra then "&extra=\($xhttp.extra | @uri)" else "" end) +
+        (if $stream.security == "reality" then "#Argo-XHTTP-Split" else "#Argo-XHTTP" end)
+    ' <<< "${_outbound}"
 }
 
 _argo_xhttp_split_inbound() {
@@ -1635,7 +1636,7 @@ _plg_argo_link() {
         xhttp)
             _argo_xhttp_link normal || return 1
             if _argo_xhttp_split_active; then
-                _argo_xhttp_link split || log_warn "Argo XHTTP 分离节点暂不可导出，请检查 Reality 公钥和下行地址"
+                _argo_xhttp_link split || log_warn "Argo XHTTP 分离节点暂不可导出，请检查 Reality 公钥和公网地址"
             fi ;;
         *)
             printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=chrome&type=ws&host=%s&path=%%2Fargo%%3Fed%%3D2560#Argo-WS\n' \
@@ -6624,13 +6625,11 @@ _xhttp_validate_profile() {
             require($path + ".scMinPostsIntervalMs"; if has("scMinPostsIntervalMs") then .scMinPostsIntervalMs | . == -1 or range(0) else true end) |
             require($path + ".noGRPCHeader"; if has("noGRPCHeader") then .noGRPCHeader | type == "boolean" else true end);
         def download:
-            require("split.download"; only(["address","port","network","security","realitySettings","tlsSettings","xhttpSettings","sockopt"])) |
+            require("split.download"; only(["address","port","network","security","tlsSettings","xhttpSettings","sockopt"])) |
             require("split.download.address"; (.address // "") | type == "string" and test("^[a-zA-Z0-9_.:\\[\\]-]*$")) |
             require("split.download.port"; (.port // 1) | port) |
             require("split.download.network"; (.network // "xhttp") == "xhttp") |
-            require("split.download.security"; (.security // "reality") | IN("reality","tls","none")) |
-            require("split.download.realitySettings"; (.realitySettings // {}) |
-                only(["serverName","fingerprint","password","publicKey","shortId","spiderX"]) and all(.[]; type == "string")) |
+            require("split.download.security"; (.security // "tls") == "tls") |
             require("split.download.tlsSettings"; (.tlsSettings // {}) | type == "object" and (has("certificates") | not)) |
             require("split.download.sockopt"; (.sockopt // {}) | type == "object") |
             checked((.xhttpSettings // {}) |
@@ -6683,11 +6682,11 @@ _xhttp_apply_profile() {
 _argo_xhttp_check_split_port() {
     local _port="$1" _old_port="$2"
     if [ "${_port}" = "$(port_of argo)" ] || [ "${_port}" = "$(port_of reality)" ]; then
-        log_error "split.port：分离下行端口 ${_port} 须与 Argo 回源和 Reality 端口不同"
+        log_error "split.port：REALITY 上行端口 ${_port} 须与 Argo 回源和 Reality 端口不同"
         return 1
     fi
     if [ "${_port}" != "${_old_port}" ] && port_mgr_in_use "${_port}"; then
-        log_error "split.port：分离下行端口已被占用（${_port}）"
+        log_error "split.port：REALITY 上行端口已被占用（${_port}）"
         return 1
     fi
 }
@@ -6737,18 +6736,24 @@ _xhttp_export_vless_outbound() {
 }
 
 _argo_xhttp_export_json() {
-    local _stream _address
+    local _stream _address _port
     _stream=$(_argo_xhttp_client_stream "$1") || return 1
-    _address=$(st_get '.cfip') || return 1
+    if [ "$1" = split ]; then
+        _address=$(platform_get_realip) || return 1
+        _port=$(st_get '.argo.xhttp.split.port') || return 1
+    else
+        _address=$(st_get '.cfip') || return 1
+        _port=$(st_get '.cfport') || return 1
+    fi
     _address="${_address#[}"
-    _xhttp_export_vless_outbound "${_address%]}" "$(st_get '.cfport')" "${_stream}"
+    [ -n "${_address%]}" ] || return 1
+    _xhttp_export_vless_outbound "${_address%]}" "${_port}" "${_stream}"
 }
 
 _argo_xhttp_export_mihomo() {
-    local _stream
-    _stream=$(_argo_xhttp_client_stream split) || return 1
-    jq -n --arg address "$(st_get '.cfip')" --argjson port "$(st_get '.cfport')" \
-        --arg uuid "$(st_get '.uuid')" --argjson stream "$_stream" '
+    local _outbound
+    _outbound=$(_argo_xhttp_export_json split) || return 1
+    jq '
         def omit_null: with_entries(select(.value != null));
         def string_or_null: if . == null then null else tostring end;
         def reuse_settings:
@@ -6775,25 +6780,23 @@ _argo_xhttp_export_mihomo() {
              "sc-max-each-post-bytes": (.extra.scMaxEachPostBytes | string_or_null),
              "sc-min-posts-interval-ms": (.extra.scMinPostsIntervalMs | string_or_null),
              "reuse-settings": (.extra.xmux | reuse_settings)} | omit_null;
+        .settings.vnext[0] as $peer | .streamSettings as $stream |
         $stream.xhttpSettings.extra.downloadSettings as $down |
-        ($down.security == "reality") as $reality |
         ($down.xhttpSettings | {path,host,headers:(.headers // .extra.headers),
                                "reuse-settings":(.extra.xmux | reuse_settings)}) +
-        {server: ($down.address | ltrimstr("[") | rtrimstr("]")), port:$down.port,
-         tls: ($down.security != "none"),
-         servername: ($down.realitySettings.serverName // $down.tlsSettings.serverName),
-         "client-fingerprint": ($down.realitySettings.fingerprint // $down.tlsSettings.fingerprint),
-         alpn: $down.tlsSettings.alpn, "skip-cert-verify": $down.tlsSettings.allowInsecure,
-         "reality-opts": (if $reality then
-             {"public-key": ($down.realitySettings.password // $down.realitySettings.publicKey),
-              "short-id": $down.realitySettings.shortId, "support-x25519mlkem768": true}
-             else null end)} | omit_null | . as $download |
-        {proxies: [{name:"Argo-XHTTP-Split", type:"vless", server:($address | ltrimstr("[") | rtrimstr("]")),
-                    port:$port, uuid:$uuid, udp:true, tls:true, network:"xhttp",
-                    servername:$stream.tlsSettings.serverName,
-                    "client-fingerprint":$stream.tlsSettings.fingerprint,
+        {server:$down.address, port:$down.port, tls:true, servername:$down.tlsSettings.serverName,
+         "client-fingerprint":$down.tlsSettings.fingerprint,
+         alpn:$down.tlsSettings.alpn, "skip-cert-verify":$down.tlsSettings.allowInsecure,
+         "reality-opts":{"public-key":""}} | omit_null | . as $download |
+        {proxies: [{name:"Argo-XHTTP-Split", type:"vless", server:$peer.address,
+                    port:$peer.port, uuid:$peer.users[0].id, udp:true, tls:true, network:"xhttp",
+                    servername:$stream.realitySettings.serverName,
+                    "client-fingerprint":$stream.realitySettings.fingerprint,
+                    "reality-opts":{"public-key":$stream.realitySettings.password,
+                                    "short-id":$stream.realitySettings.shortId,
+                                    "support-x25519mlkem768":true},
                     "xhttp-opts": ($stream.xhttpSettings | xhttp_opts | . + {"download-settings":$download})}]}
-    '
+    ' <<< "${_outbound}"
 }
 
 _argo_xhttp_render_status() {
@@ -6805,14 +6808,14 @@ _argo_xhttp_render_status() {
         (if .server == null and $legacy == "true" and $server.xPaddingBytes != null then
             "（\($server.xPaddingBytes)）" else "" end),
         "XMUX \(if ($xmux | length) == 0 then "Xray 默认" else $xmux | tojson end)",
-        (if .split == null then "分离下行 已关闭"
-         else "分离下行 TCP \(.split.port) · \(.split.mode // "packet-up")" end)
+        (if .split == null then "上下行分离 已关闭"
+         else "REALITY 上行 TCP \(.split.port) · \(.split.mode // "packet-up") / Cloudflare TLS 下行" end)
     ' <<< "$(st_get '.argo.xhttp // {}')"
 }
 
 _xhttp_edit_advanced() {
     local _module="$1" _runtime="$2" _current _draft
-    _current=$(st_get '.[$inbound_id].xhttp // {}' --arg inbound_id "${_module}" | jq -c .) || return 1
+    _current=$(_xhttp_saved_profile "${_module}" | jq -c '. // {}') || return 1
     printf '当前 XHTTP JSON: %s\n' "${_current}"
     while prompt '编辑单行 JSON（可直接粘贴，空行返回）: ' _draft '' && [ -n "${_draft}" ]; do
         if "_${_module}_xhttp_set_profile" "${_runtime}" "${_draft}"; then
@@ -6822,10 +6825,14 @@ _xhttp_edit_advanced() {
     done
 }
 
-# 旧配置以 false 表示未设置 Extra，编辑已有配置时按缺省处理。
+# 读取已保存的 XHTTP 配置时，将旧版占位值和 Argo 的旧下行安全层视为缺省。
 _xhttp_saved_profile() {
     st_get '.[$id].xhttp | (if type == "object" then
-        with_entries(select(((.key | IN("server", "client", "mode")) and (.value == false)) | not))
+        with_entries(select(((.key | IN("server", "client", "mode")) and (.value == false)) | not)) |
+        if $id == "argo" and (.split.download | type == "object") then
+            del(.split.download.realitySettings) |
+            if (.split.download.security | IN("reality", "none")) then del(.split.download.security) else . end
+        else . end
         else null end) | tojson' --arg id "$1"
 }
 
@@ -6875,7 +6882,7 @@ _xhttp_edit_common() {
             7)
                 if [ "${_module}" != argo ]; then log_error "无效选项，请按提示输入"; continue; fi
                 if [ "$(st_get '.argo.xhttp.split | type')" != object ]; then
-                    log_warn "请先在上一级启用分离下行"
+                    log_warn "请先在上一级启用上下行分离"
                     continue
                 fi
                 _field=split.mode; _label='packet-up 或 stream-up'
@@ -6894,7 +6901,7 @@ _argo_xhttp_export_menu() {
         if _argo_xhttp_split_active; then
             _menu_print_action 2 "分离 XHTTP"
         else
-            _menu_print_action 2 "分离 XHTTP（下行未启用）"
+            _menu_print_action 2 "分离 XHTTP（未启用）"
         fi
         _menu_print_back
         prompt '选择节点 (0-2): ' _choice || return 0
@@ -6903,7 +6910,7 @@ _argo_xhttp_export_menu() {
             1) _kind=normal; _label='普通 XHTTP' ;;
             2)
                 if ! _argo_xhttp_split_active; then
-                    log_warn "请先启用分离下行"
+                    log_warn "请先启用上下行分离"
                     continue
                 fi
                 _kind='split'; _label='分离 XHTTP'
@@ -6948,7 +6955,7 @@ _argo_xhttp_menu() {
         _argo_xhttp_render_status
         _menu_print_action 1 "使用 Xray 默认参数（auto，清空 Extra 和分离）"
         _menu_print_action 2 "高级 Extra 与下行覆盖（单行 JSON）"
-        _menu_print_action 3 "启用分离下行或修改端口"
+        _menu_print_action 3 "启用分离或修改 REALITY 上行端口"
         _menu_print_action 4 "导出分享链接或客户端出站 JSON"
         _menu_print_action 5 "恢复旧版 xPadding 配置"
         _menu_print_action 6 "关闭分离，保留 Extra"
@@ -6962,7 +6969,7 @@ _argo_xhttp_menu() {
                 log_info 'JSON 字段: mode, server（入站 Extra）, client（客户端 Extra）, split（port/mode/download）'
                 _xhttp_edit_advanced argo "${_runtime}"
                 continue ;;
-            3) _xhttp_edit_field argo "${_runtime}" split.port 'Reality 分离下行端口（独立于现有 Reality）'; continue ;;
+            3) _xhttp_edit_field argo "${_runtime}" split.port 'REALITY 上行端口（独立于现有 Reality）'; continue ;;
             4) _argo_xhttp_export_menu; continue ;;
             5) _argo_xhttp_set_profile "${_runtime}" null ;;
             6)
