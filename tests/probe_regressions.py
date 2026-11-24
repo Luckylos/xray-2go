@@ -839,6 +839,75 @@ def test_firewall_reconcile_preserves_rules_on_plugin_port_failure():
     assert 'UNEXPECTED_RULE_CHANGE' not in result.stdout
 
 
+def test_runtime_field_save_reconciles_custom_plugin_ports_and_rolls_back():
+    run_bash(r'''
+        source ./xray_2go.sh
+        set -e
+        st_init
+        st_set '.socks.enabled = true | .socks.listen = "127.0.0.1"'
+        mkdir -p "$PLUGIN_DIR"
+        cat > "$PLUGIN_DIR/custom.sh" <<'PLUGIN'
+_plg_custom_enabled() { return 0; }
+_plg_custom_link() { :; }
+_plg_custom_port() {
+    case "$(st_get '.socks.listen')" in
+        127.0.0.1) printf 29001 ;;
+        127.0.0.2) printf 29002 ;;
+        127.0.0.3) printf 29003 ;;
+    esac
+}
+_plg_custom_ports() { printf '%s/tcp\n' "$(_plg_custom_port)"; }
+_plg_custom_inbound() { printf '{"tag":"custom","port":%s,"protocol":"socks"}\n' "$(_plg_custom_port)"; }
+PLUGIN
+        _PLUGIN_REGISTRY=(socks custom)
+        _plugin_write_socks > "$PLUGIN_DIR/socks.sh"
+        source "$PLUGIN_DIR/socks.sh"
+        source "$PLUGIN_DIR/custom.sh"
+        svc_exec() { return 1; }
+        svc_is_enabled() { return 1; }
+        svc_reload_daemon() { return 0; }
+        platform_get_realip() { printf '203.0.113.10'; }
+        _fw_select_backend() { printf ufw; }
+        _fw_remove_rule() { return 0; }
+        _fw_open_port_backend() {
+            [[ $2 != 29003 ]] || return 1
+            _fw_mark_rule "$@"
+        }
+        _commit
+        prompt() { IFS= read -r "$2"; }
+        module_socks_update_listen <<< '127.0.0.2'
+        jq -e '.inbounds[] | select(.tag == "custom") | .port == 29002' "$CONFIG_FILE"
+        grep -Fxq 'ufw:29002/tcp' "$_FW_RULES_FILE" || exit 41
+        if grep -Fxq 'ufw:29001/tcp' "$_FW_RULES_FILE"; then exit 42; fi
+        if module_socks_update_listen <<< '127.0.0.3'; then exit 43; fi
+        jq -e '.socks.listen == "127.0.0.2"' "$STATE_FILE"
+        jq -e '.inbounds[] | select(.tag == "custom") | .port == 29002' "$CONFIG_FILE"
+        grep -Fxq 'ufw:29002/tcp' "$_FW_RULES_FILE"
+    ''', timeout=50)
+
+
+def test_builtin_plugin_refresh_and_cleanup_share_file_ownership():
+    result = run_bash_result(r'''
+        source ./xray_2go.sh
+        set -e
+        st_init
+        mkdir -p "$PLUGIN_DIR"
+        printf '%s\n' '# unmanaged file' 'touch "$WORK_DIR/unmanaged-sourced"' > "$PLUGIN_DIR/argo.sh"
+        cp "$PLUGIN_DIR/argo.sh" "$WORK_DIR/original"
+        printf '%s\n' '# xray-2go plugin: socks (previous template)' > "$PLUGIN_DIR/socks.sh"
+        plugin_refresh_runtime
+        cmp "$WORK_DIR/original" "$PLUGIN_DIR/argo.sh" || exit 52
+        [[ ! -e $WORK_DIR/unmanaged-sourced ]]
+        [[ " ${_PLUGIN_REGISTRY[*]} " == *' argo '* ]]
+        declare -F _plg_argo_inbound >/dev/null
+        grep -Fq '_plg_socks_inbound()' "$PLUGIN_DIR/socks.sh"
+        _uninstall_managed_files
+        cmp "$WORK_DIR/original" "$PLUGIN_DIR/argo.sh"
+        [[ ! -e $PLUGIN_DIR/socks.sh ]]
+    ''')
+    assert result.returncode == 0, result.stdout
+
+
 def test_plugin_loader_validates_before_source_and_loads_in_subshell():
     body = TEXT[TEXT.index('plugin_load_all()'):TEXT.index('plugin_install_builtins()')]
     assert_true('val_plugin_name "${_name}"' in body, "plugin loader must validate plugin filename before source")
@@ -1070,12 +1139,13 @@ def test_single_file_menu_render_helpers():
 
 def test_single_file_module_transaction_helpers():
     helper_area = TEXT[TEXT.index('_module_disable_commit()'):TEXT.index('# ==============================================================================', TEXT.index('_module_disable_commit()'))]
-    assert_true('_module_enable_commit()' in helper_area and '_module_apply_if_enabled()' in helper_area, "module transaction helpers missing")
+    assert_true('_module_enable_commit()' in helper_area and '_module_save_fields_inner()' in helper_area, "module transaction helpers missing")
     assert_true('_module_update_state_transaction()' in TEXT and '_module_update_listen_transaction()' in TEXT, "state update transaction helpers missing")
     for body_name in ['unified_menu_freeflow()', 'unified_menu_reality()', 'unified_menu_vltcp()', 'unified_menu_cforigin()']:
         body = TEXT[TEXT.index(body_name):TEXT.index('\n}\n', TEXT.index(body_name))]
         assert_true('module_dispatch' in body or '_unified_runtime_toggle' in body, f"{body_name} live actions should route through shared dispatcher/toggle helpers")
-    assert_true('_module_apply_if_enabled' in TEXT, "enabled-only config updates should use shared apply helper")
+    save_body = TEXT[TEXT.index('_module_save_fields_inner()'):TEXT.index('\n}\n', TEXT.index('_module_save_fields_inner()'))]
+    assert_true('_commit_inner' in save_body and 'st_persist' in save_body, "field saves should commit enabled modules and only persist disabled modules")
     assert_true('_module_save_fields()' in TEXT, "field updates should share a transaction")
     for proto in ['socks', 'http', 'vltcp', 'vlquic']:
         assert_true(f'module_update_listen_action {proto}' in TEXT, f'{proto} listen wrapper/dispatcher should delegate to canonical action')
@@ -1128,7 +1198,7 @@ def test_commit_helpers_fail_closed_on_firewall_reconcile():
 
 
 def test_socks5_module_option_and_plugin_contract():
-    assert_true('_plugin_write_socks()' in TEXT and '_plugin_write_socks' in TEXT[TEXT.index('plugin_install_builtins()'):TEXT.index('# ==============================================================================', TEXT.index('plugin_install_builtins()'))], "SOCKS5 built-in plugin must be installed")
+    assert_true('_plugin_write_socks()' in TEXT, "SOCKS5 built-in plugin must be installed")
     assert_true('_MODULE_IDS="argo ff reality vltcp vlquic cforigin socks http ss2022"' in TEXT, "module registry must include socks and http")
     assert_true('[socks]="SOCKS5"' in TEXT and '[socks]=unified_menu_socks' in TEXT, "SOCKS5 registry metadata missing")
     assert_true('_MODULE_ENABLE_FN' in TEXT and '_MODULE_UPDATE_PORT_FN' in TEXT and 'module_registry_dispatch_common' in TEXT, "SOCKS5 common actions must use registry dispatch")
@@ -1151,7 +1221,7 @@ def test_socks5_link_is_generated_and_displayed():
 
 
 def test_http_proxy_module_option_and_plugin_contract():
-    assert_true('_plugin_write_http()' in TEXT and '_plugin_write_http' in TEXT[TEXT.index('plugin_install_builtins()'):TEXT.index('# ==============================================================================', TEXT.index('plugin_install_builtins()'))], "HTTP proxy built-in plugin must be installed")
+    assert_true('_plugin_write_http()' in TEXT, "HTTP proxy built-in plugin must be installed")
     assert_true('[http]="HTTP 代理"' in TEXT and '[http]=unified_menu_http' in TEXT, "HTTP proxy registry metadata missing")
     assert_true('_MODULE_ENABLE_FN' in TEXT and '_MODULE_UPDATE_PORT_FN' in TEXT and 'module_registry_dispatch_common' in TEXT, "HTTP proxy common actions must use registry dispatch")
     for token in ['http:update_auth)', 'http:update_user)', 'http:update_pass)']:
@@ -2032,6 +2102,23 @@ def test_argo_xhttp_menu_and_runtime_rollback():
     assert_true('simulated commit failure' in out and 'Argo XHTTP rollback verified' in out, out)
 
 
+def test_argo_xhttp_legacy_and_profile_exports_share_uri_authority():
+    run_bash(r"""
+        source ./xray_2go.sh
+        st_init
+        st_set '.argo.enabled = true | .argo.protocol = "xhttp" | .argo.auth_protocol = "vless" |
+                .argo.domain = "fixture.invalid" | .cfip = "2001:db8::3" | del(.argo.xhttp)'
+        plugin_refresh_runtime || exit 1
+        legacy=$(_plg_argo_link) || exit 2
+        explicit=$(_argo_xhttp_link normal) || exit 3
+        [[ $legacy == "$explicit" && $legacy == *@\[2001:db8::3\]:* ]] || exit 4
+        _argo_xhttp_export_json normal | jq -e '.settings.vnext[0].address == "2001:db8::3"' >/dev/null || exit 5
+        st_set '.cfip = "[2001:db8::3]"'
+        [[ $(_plg_argo_link) == "$legacy" ]] || exit 6
+        _argo_xhttp_export_json normal | jq -e '.settings.vnext[0].address == "2001:db8::3"' >/dev/null || exit 7
+    """)
+
+
 def test_argo_xhttp_editor_and_selected_exports():
     import json
     from urllib.parse import parse_qs, urlsplit
@@ -2050,7 +2137,12 @@ def test_argo_xhttp_editor_and_selected_exports():
         candidate='{"client":{"xmux":{"maxConcurrency":2,"maxConnections":3}}}'
         fixed='{"mode":"auto","server":{"xPaddingBytes":"128-768"},"client":{"xmux":{"maxConcurrency":2}},"split":{"port":28443,"download":{"xhttpSettings":{"extra":{"xmux":{"maxConnections":5}}}}}}'
         prompt() {
-            if [ "${3:-}" = "$candidate" ]; then printf 'Advanced draft retained\n'; fi
+            if [ "$2" = _draft ] && [[ "$1" == '编辑单行 JSON'* ]]; then
+                [[ "$#" -eq 3 && -z "$3" ]] || exit 1
+                printf 'Advanced input starts empty\n'
+            elif [ "$2" = _raw ]; then
+                [[ "$#" -eq 3 && -z "$3" ]] || exit 1
+            fi
             IFS= read -r "$2"
         }
         _argo_xhttp_menu 0 <<< $'7\n2\n900-100\n128-768\n3\n2\n0\n0'
@@ -2065,7 +2157,8 @@ def test_argo_xhttp_editor_and_selected_exports():
         printf 'TLS_DOWN=%s\n' "$(_argo_xhttp_export_mihomo | jq -c .)"
         printf 'Argo editor state verified\n'
     ''', timeout=40)
-    for marker in ('server.xPaddingBytes', 'client.xmux.maxConnections', 'Advanced draft retained',
+    assert_true(out.count('Advanced input starts empty') == 2, out)
+    for marker in ('server.xPaddingBytes', 'client.xmux.maxConnections', '当前 XHTTP JSON:',
                    'Padding 旧版设置', '分离下行 TCP 28443', 'Argo editor state verified'):
         assert_true(marker in out, f'Missing {marker}: {out}')
     links = [urlsplit(line) for line in out.splitlines() if line.startswith('vless://')]
@@ -2701,7 +2794,9 @@ def test_cforigin_xhttp_menu_profiles_and_links():
         rejected='{"client":{"xhttpModeH3":true}}'
         corrected='{"server":{"xPaddingBytes":"128-768","scMaxBufferedPosts":35},"client":{"xmux":{"maxConnections":3}}}'
         prompt() {
-            if [ "${3:-}" = "$rejected" ]; then printf 'Origin draft retained\n'; fi
+            if [ "$2" = _draft ] && [[ "$1" == '编辑单行 JSON'* ]]; then
+                [[ "$#" -eq 3 && -z "$3" ]] || exit 1
+            fi
             IFS= read -r "$2"
         }
         _cforigin_xhttp_menu 0 <<< $'2\n'"$rejected"$'\n'"$corrected"$'\n5\n3\n4\n0\n3\n1\n3\n2\n0'
@@ -2715,7 +2810,7 @@ def test_cforigin_xhttp_menu_profiles_and_links():
         printf 'CF Origin generated outputs verified\n'
     ''', timeout=35)
     assert_true('CF Origin generated outputs verified' in out, out)
-    assert_true('Origin draft retained' in out and 'client.xhttpModeH3' in out, out)
+    assert_true('当前 XHTTP JSON:' in out and 'client.xhttpModeH3' in out, out)
     exported_link = next(line for line in out.splitlines() if line.startswith('vless://'))
     assert_true(f'H3={exported_link}' in out, out)
     json_start = '{\n  "protocol": "vless"'
@@ -4370,6 +4465,110 @@ def test_direct_h3_plan_defers_certificate_issuance():
     assert out.count('H3_ISSUER_CALLED') == 2 and out.count('CORE_CALLED') == 1, out
 
 
+def test_draft_and_runtime_reuse_transport_and_port_input_rules():
+    run_bash(r"""
+        source ./xray_2go.sh
+        st_init
+        st_set '.ff.enabled = false | .ff.protocol = "ws" |
+                .cforigin.protocol = "xhttp" | .cforigin.edge_h3 = true | .ports.argo = 12345'
+        prompt() { IFS= read -r "$2"; }
+        before=$_G_STATE
+        if install_plan_ff_update_mode <<< '4'; then exit 1; fi
+        [[ "$_G_STATE" == "$before" ]] || exit 2
+        if install_plan_cforigin_update_protocol <<< '9'; then exit 3; fi
+        [[ "$_G_STATE" == "$before" ]] || exit 4
+        install_plan_cforigin_update_protocol <<< '2' || exit 5
+        [[ $(st_get '.cforigin.protocol') == httpupgrade && $(st_get '.cforigin.edge_h3') == false ]] || exit 6
+        port_mgr_in_use() { return 1; }
+        port_mgr_random_proto() { printf '%s' 23456; }
+        install_plan_argo_update_port <<< '' || exit 7
+        [[ $(port_of argo) == 12345 ]] || exit 8
+        _commit_port_change() { [[ $1 == cforigin && $2 == 23456 ]]; }
+        cforigin_print_cloudflare_hint() { :; }
+        module_cforigin_update_port <<< '' || exit 9
+    """)
+
+
+def test_draft_listen_and_ports_share_input_results():
+    run_bash(r"""
+        source ./xray_2go.sh
+        st_init
+        prompt() { IFS= read -r "$2"; }
+        for module in vltcp socks http cforigin vlquic ss2022; do
+            before=$_G_STATE
+            if "install_plan_${module}_update_listen" <<< 'invalid address'; then exit 1; fi
+            "install_plan_${module}_update_listen" <<< '' || exit 2
+            [[ $_G_STATE == "$before" ]] || exit 3
+            "install_plan_${module}_update_listen" <<< '127.0.0.1' || exit 4
+            [[ $(st_get '.[$id].listen' --arg id "$module") == 127.0.0.1 ]] || exit 5
+        done
+        port_mgr_in_use() { [[ $1 == 23456 ]]; }
+        port_mgr_in_use_udp() { [[ $1 == 23457 ]]; }
+        before=$_G_STATE
+        if install_plan_ff_update_port <<< 'invalid'; then exit 6; fi
+        [[ $_G_STATE == "$before" ]] || exit 7
+        install_plan_ff_update_port <<< '23456' || exit 8
+        install_plan_vlquic_update_port <<< '23457' || exit 9
+        [[ $(port_of ff) == 23456 && $(port_of vlquic) == 23457 ]] || exit 10
+        for port in 23456 23457; do
+            output=$(install_plan_ss2022_update_port <<< "$port" 2>&1) || exit 11
+            [[ $output == *"TCP/UDP/$port 已被占用"* ]] || exit 12
+        done
+    """)
+
+
+def test_argo_cleanup_and_host_restoration_report_failure():
+    run_bash(r"""
+        source ./xray_2go.sh
+        st_init
+        st_set '.argo.enabled = true'
+        svc_exec_mut() { return 1; }
+        svc_exec() { [[ $1 == status ]]; }
+        svc_is_enabled() { return 0; }
+        _module_disable_commit() { return 0; }
+        if module_argo_disable_inner; then exit 1; fi
+        if module_argo_uninstall_inner; then exit 2; fi
+        [[ $(st_get '.argo.enabled') == true ]] || exit 3
+        mkdir -p "$WORK_DIR" "$(dirname "$_SYSCTL_FILE")"
+        printf 'fixture\n' > "$_HOSTS_BAK"
+        cp() { return 1; }
+        if lifecycle_rollback_hosts; then exit 4; fi
+        printf '# xray2go managed - do not edit manually\n' > "$_SYSCTL_FILE"
+        rm() { return 1; }
+        if lifecycle_rollback_sysctl; then exit 5; fi
+    """)
+
+
+def test_argo_unchanged_credentials_skip_apply_and_health_probe():
+    run_bash(r"""
+        source ./xray_2go.sh
+        st_init
+        st_set '.argo.enabled = true | .argo.protocol = "ws" |
+                .argo.auth_protocol = "trojan" | .argo.trojan_password = "fixture_password"'
+        prompt_secret() { IFS= read -r "$2"; }
+        argo_apply_fixed_tunnel_from_state() { exit 1; }
+        argo_check_health() { exit 2; }
+        for action in auth trojan_password; do
+            module_argo_update_action "$action" <<< '' || exit 3
+        done
+    """)
+
+
+def test_xhttp_profile_writers_share_reserved_fields():
+    run_bash(r"""
+        source ./xray_2go.sh
+        st_init
+        for module in argo reality ff vlquic cforigin; do
+            before=$_G_STATE
+            for profile in '{"server":{"path":"/elsewhere"}}' '{"client":{"mode":"auto"}}' '{"client":{"xhttpModeH3":true}}'; do
+                if "_${module}_xhttp_set_profile" 0 "$profile"; then exit 1; fi
+                [[ "$_G_STATE" == "$before" ]] || exit 2
+            done
+            "_${module}_xhttp_set_profile" 0 '{"server":{"xPaddingBytes":"128-768"}}' || exit 3
+        done
+    """)
+
+
 def test_port_prompt_distinguishes_eof_from_blank():
     out = run_bash(r'''
         source ./xray_2go.sh
@@ -4525,7 +4724,6 @@ def test_ss2022_port_updates_cover_tcp_and_udp():
     assert_true("port_mgr_in_use_both" in TEXT, "dual-protocol port occupancy helper is missing")
     assert_true("port_mgr_random_proto" in TEXT, "random port selection helper is missing")
     assert_true("module_update_port_action ss2022 both" in TEXT, "SS2022 port updates must check TCP and UDP")
-    assert_true("port_mgr_in_use_both" in _function_body("install_plan_ss2022_update_port"), "install-plan SS2022 port validation must check both protocols")
 
     out = run_bash("""
 source ./xray_2go.sh

@@ -127,7 +127,7 @@ sudo ./xray_2go.sh
 
 启用分离时，选择一个独立且可从公网访问的 TCP 端口。脚本会让该端口的 Reality 下行与 Argo 上行共用本机 `/argo` 入站。原 Reality 节点继续使用自己的端口。Cloudflare Tunnel 仍使用原 Argo 回源。若云平台有安全组，请同步开放新端口。
 
-按 `2` 打开高级 Extra 编辑。可直接修改预填的 JSON，也可以清空后粘贴单行配置。校验失败会指出对应字段，并保留输入供修改。`server` 配置入站 Extra，`client` 配置普通客户端和分离上行 Extra，`split.download` 覆盖分离下行参数。
+按 `2` 打开高级 Extra 编辑。当前配置显示在提示上方，可直接粘贴新的单行 JSON，空行返回。校验失败会指出对应字段，可修正后重新粘贴。`server` 配置入站 Extra，`client` 配置普通客户端和分离上行 Extra，`split.download` 覆盖分离下行参数。
 
 ```json
 {
@@ -156,7 +156,7 @@ Argo XHTTP 分离节点可在 Argo 工作台按 `7` → `4` → `2` → `3` 导�
 
 在 Reality 工作台按 `4` 选择 XHTTP，再按 `x`。已安装的工作台和高级部署计划都提供这个入口。默认使用 `stream-one` 和根路径 `/`。切回 TCP Vision 后，保存的 XHTTP 配置可在下次切换时继续使用。
 
-按 `1` 选择模式，按 `2` 编辑预填的服务端和客户端 Extra JSON，按 `5` 逐项设置 Padding 和 XMUX，按 `3` 导出分享链接或客户端出站 JSON。设置服务端 Extra 后，该配置优先于上一级的旧版 xPadding 开关。在 XHTTP 页面按 `4` 可恢复 `stream-one` 和旧版 Padding 行为。
+按 `1` 选择模式，按 `2` 查看当前 Extra 并粘贴新的单行 JSON，按 `5` 逐项设置 Padding 和 XMUX，按 `3` 导出分享链接或客户端出站 JSON。设置服务端 Extra 后，该配置优先于上一级的旧版 xPadding 开关。在 XHTTP 页面按 `4` 可恢复 `stream-one` 和旧版 Padding 行为。
 
 ### FreeFlow 与直连 VLESS-XHTTP-H3 配置
 
@@ -170,7 +170,7 @@ FreeFlow 按 `2` 选择 XHTTP 后进入 `x`，直连 VLESS-XHTTP-H3 可直接进
 
 在 CF Origin 工作台按 `2` 选择 XHTTP，再按 `x`。高级部署计划和已安装的工作台都提供该入口，页面会显示当前模式、Padding、XMUX 和 Edge HTTP/3 状态。按 `5` 逐项设置常用参数，输入 `-` 恢复该项默认值。按 `3` 选择分享链接或客户端出站 JSON。默认传输模式为 `stream-one`。
 
-按 `2` 可修改预填的高级 Extra JSON。校验失败时会指出具体字段并保留输入。也可以清空后粘贴下面的单行示例，其中 `server` 设置入站 Padding，`client` 设置客户端 XMUX，省略 `mode` 时沿用当前模式。
+按 `2` 查看当前高级 Extra JSON，可直接粘贴下面的单行示例。其中 `server` 设置入站 Padding，`client` 设置客户端 XMUX，省略 `mode` 时沿用当前模式。
 
 ```json
 {"server":{"xPaddingBytes":"128-768"},"client":{"xmux":{"maxConnections":4}}}
@@ -190,6 +190,8 @@ FreeFlow 按 `2` 选择 XHTTP 后进入 `x`，直连 VLESS-XHTTP-H3 可直接进
 - 主脚本安装位置：`/usr/local/bin/xray2go`
 
 当 `state.json` 无法读取为 JSON 对象时，交互启动会列出可读取的备份。选择一个编号恢复，损坏文件会保留为 `state.json.corrupt.*`。回车退出可保留现场。
+
+内置插件名由脚本保留。启动时会刷新有对应托管标记的内置插件文件。同名文件缺少托管标记时会保留原件，运行时仍使用脚本自带的实现。自定义插件请使用独立文件名。
 
 插件的 `ports` 接口每行返回一个 `端口` 或 `端口/tcp`、`端口/udp`，省略协议时按 TCP 处理。`link` 接口每行返回一个 `scheme://…` 分享链接，支持插件自定义的 scheme。诊断信息写到标准错误。模块页仅显示对应插件的链接，主菜单 `1` 汇总所有模块。
 

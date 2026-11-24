@@ -71,10 +71,10 @@ readonly _XRAY_MIRRORS=(
 )
 
 readonly _XPAD_JSON='{"xPaddingObfsMode":true,"xPaddingMethod":"tokenish","xPaddingPlacement":"queryInHeader","xPaddingHeader":"X-Cache","xPaddingKey":"_Luckylos"}'
-readonly _XPAD_QS='%22xPaddingObfsMode%22%3Atrue%2C%22xPaddingMethod%22%3A%22tokenish%22%2C%22xPaddingPlacement%22%3A%22queryInHeader%22%2C%22xPaddingHeader%22%3A%22X-Cache%22%2C%22xPaddingKey%22%3A%22_Luckylos%22'
 
 # 动态插件注册表（由 plugin_load_all 填充，非 readonly）
 _PLUGIN_REGISTRY=()
+readonly -a _BUILTIN_PLUGINS=(argo ff reality vltcp socks ss2022 http vlquic cforigin)
 # 插件快照缓存（按当前 state stamp 复用，避免重复遍历 registry）
 _PLUGIN_SNAPSHOT_STAMP=""
 _PLUGIN_SNAPSHOT_PORTS=""
@@ -152,7 +152,7 @@ die()       { log_error "$1"; exit "${2:-1}"; }
 
 prompt() {
     printf '%s%s%s' "${C_RED}" "$1" "${C_RST}" >&2
-    if [ -n "${3:-}" ]; then
+    if [ "$#" -ge 3 ]; then
         read -e -r -i "$3" "$2" </dev/tty
     else
         read -r "$2" </dev/tty
@@ -1140,13 +1140,18 @@ plugin_load_all() {
     _plugin_path_safe "${PLUGIN_DIR}" || return 1
     local _f _name
     for _f in "${PLUGIN_DIR}"/*.sh; do
-        [ -f "${_f}" ] || continue
         _name=$(basename "${_f}" .sh)
-        val_plugin_name "${_name}" >/dev/null || { log_warn "插件文件名不合法，已跳过且未加载: ${_f}"; continue; }
-        _plugin_contract_ok "${_f}" "${_name}" || continue
-        # 合约已在子 shell 校验通过，此处才加载到当前 shell。
-        # shellcheck source=/dev/null
-        source "${_f}" || { log_warn "插件加载失败: ${_f}"; continue; }
+        if [[ " ${_BUILTIN_PLUGINS[*]} " == *" ${_name} "* ]]; then
+            # 保留名的运行时实现始终来自脚本自带模板。
+            # shellcheck source=/dev/null
+            source <("_plugin_write_${_name}") || return 1
+        else
+            [ -f "${_f}" ] || continue
+            val_plugin_name "${_name}" >/dev/null || { log_warn "插件文件名不合法，已跳过且未加载: ${_f}"; continue; }
+            _plugin_contract_ok "${_f}" "${_name}" || continue
+            # shellcheck source=/dev/null
+            source "${_f}" || { log_warn "插件加载失败: ${_f}"; continue; }
+        fi
         _PLUGIN_REGISTRY+=( "${_name}" )
         log_info "插件已加载: ${_name}"
     done
@@ -1309,20 +1314,33 @@ plugin_collect_inbounds() {
     printf '%s' "${_PLUGIN_SNAPSHOT_INBOUNDS}"
 }
 
-# 将所有内置协议插件写入 PLUGIN_DIR（首次运行或插件缺失时调用）
+_plugin_is_managed_builtin() {
+    [ -f "$1" ] && [ ! -L "$1" ] &&
+        grep -Eq "^# xray-2go plugin: $2( |$)" "$1"
+}
+
 plugin_install_builtins() {
-    mkdir -p "${PLUGIN_DIR}"
-    # 内置插件属于脚本本体的一部分：每次运行刷新，确保主脚本更新能同步下发。
-    # 用户自定义插件请使用其它文件名，避免与下列内置插件重名。
-    _plugin_write_argo
-    _plugin_write_ff
-    _plugin_write_reality
-    _plugin_write_vltcp
-    _plugin_write_socks
-    _plugin_write_ss2022
-    _plugin_write_http
-    _plugin_write_vlquic
-    _plugin_write_cforigin
+    local _name _path _tmp _replace
+    mkdir -p "${PLUGIN_DIR}" || return 1
+    [ ! -L "${PLUGIN_DIR}" ] && _plugin_path_safe "${PLUGIN_DIR}" || return 1
+    for _name in "${_BUILTIN_PLUGINS[@]}"; do
+        _path="${PLUGIN_DIR}/${_name}.sh"
+        _replace=-nT
+        if [ -e "${_path}" ] || [ -L "${_path}" ]; then
+            if ! _plugin_is_managed_builtin "${_path}" "${_name}"; then
+                log_warn "保留归属未确认的插件文件: ${_path}（内置实现仍可用）"
+                continue
+            fi
+            _replace=-fT
+        fi
+        _tmp=$(mktemp "${PLUGIN_DIR}/.builtin.XXXXXX") || return 1
+        if ! "_plugin_write_${_name}" > "${_tmp}" || ! chmod 644 "${_tmp}" ||
+           ! mv "${_replace}" -- "${_tmp}" "${_path}"; then
+            rm -f -- "${_tmp}"
+            return 1
+        fi
+        [ ! -f "${_tmp}" ] || rm -f -- "${_tmp}" || return 1
+    done
 }
 
 # ==============================================================================
@@ -1510,14 +1528,16 @@ _cforigin_xhttp_link() {
 }
 
 _argo_xhttp_link() {
-    local _kind="$1" _stream _mode _extra _domain _suffix=''
+    local _kind="$1" _stream _mode _extra _domain _address _suffix=''
     _stream=$(_argo_xhttp_client_stream "${_kind}") || return 1
     _mode=$(jq -r '.xhttpSettings.mode' <<< "${_stream}") || return 1
     _extra=$(jq -r '.xhttpSettings.extra // empty | @uri' <<< "${_stream}") || return 1
     _domain=$(st_get '.argo.domain')
+    _address=$(st_get '.cfip') || return 1
+    if [[ "${_address}" == *:* && "${_address}" != \[*\] ]]; then _address="[${_address}]"; fi
     [ "${_kind}" != split ] || _suffix=-Split
     printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=chrome&type=xhttp&host=%s&path=%%2Fargo&mode=%s%s#Argo-XHTTP%s\n' \
-        "$(st_get '.uuid')" "$(st_get '.cfip')" "$(st_get '.cfport')" "${_domain}" "${_domain}" \
+        "$(st_get '.uuid')" "${_address}" "$(st_get '.cfport')" "${_domain}" "${_domain}" \
         "${_mode}" "${_extra:+&extra=${_extra}}" "${_suffix}"
 }
 
@@ -1535,7 +1555,7 @@ _argo_xhttp_split_inbound() {
 }
 
 _plugin_write_argo() {
-cat > "${PLUGIN_DIR}/argo.sh" << 'PLUGIN_EOF'
+cat << 'PLUGIN_EOF'
 # xray-2go plugin: argo
 # 接口：_plg_argo_inbound / _plg_argo_link / _plg_argo_ports / _plg_argo_enabled
 
@@ -1595,7 +1615,7 @@ _plg_argo_inbound() {
 
 _plg_argo_link() {
     _plg_argo_enabled || return 0
-    local _domain _proto _auth _uuid _password _cfip _cfport _xqs
+    local _domain _proto _auth _uuid _password _cfip _cfport
     _domain=$(st_get '.argo.domain')
     [ -n "${_domain:-}" ] && [ "${_domain}" != "null" ] || return 0
     _proto=$(st_get '.argo.protocol')
@@ -1611,22 +1631,11 @@ _plg_argo_link() {
             "${_password}" "${_cfip}" "${_cfport}" "${_domain}" "${_domain}"
         return 0
     fi
-    [ "$(xpad_of argo)" = "true" ] && _xqs="${_XPAD_QS}" || _xqs=""
     case "${_proto}" in
         xhttp)
-            if st_get '.argo.xhttp | type' | grep -qx object; then
-                _argo_xhttp_link normal || return 1
-                if _argo_xhttp_split_active; then
-                    _argo_xhttp_link split || log_warn "Argo XHTTP 分离节点暂不可导出，请检查 Reality 公钥和下行地址"
-                fi
-                return 0
-            fi
-            if [ -n "${_xqs}" ]; then
-                printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=chrome&type=xhttp&host=%s&path=%%2Fargo&mode=auto&extra=%%7B%s%%7D#Argo-XHTTP\n' \
-                    "${_uuid}" "${_cfip}" "${_cfport}" "${_domain}" "${_domain}" "${_xqs}"
-            else
-                printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=chrome&type=xhttp&host=%s&path=%%2Fargo&mode=auto#Argo-XHTTP\n' \
-                    "${_uuid}" "${_cfip}" "${_cfport}" "${_domain}" "${_domain}"
+            _argo_xhttp_link normal || return 1
+            if _argo_xhttp_split_active; then
+                _argo_xhttp_link split || log_warn "Argo XHTTP 分离节点暂不可导出，请检查 Reality 公钥和下行地址"
             fi ;;
         *)
             printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=chrome&type=ws&host=%s&path=%%2Fargo%%3Fed%%3D2560#Argo-WS\n' \
@@ -1634,11 +1643,10 @@ _plg_argo_link() {
     esac
 }
 PLUGIN_EOF
-    chmod 644 "${PLUGIN_DIR}/argo.sh"
 }
 
 _plugin_write_ff() {
-cat > "${PLUGIN_DIR}/ff.sh" << 'PLUGIN_EOF'
+cat << 'PLUGIN_EOF'
 # xray-2go plugin: ff (FreeFlow)
 
 _plg_ff_enabled() {
@@ -1727,11 +1735,10 @@ _plg_ff_link() {
     esac
 }
 PLUGIN_EOF
-    chmod 644 "${PLUGIN_DIR}/ff.sh"
 }
 
 _plugin_write_reality() {
-cat > "${PLUGIN_DIR}/reality.sh" << 'PLUGIN_EOF'
+cat << 'PLUGIN_EOF'
 # xray-2go plugin: reality
 
 _plg_reality_enabled() {
@@ -1794,11 +1801,10 @@ _plg_reality_link() {
         "$(st_get '.uuid')" "${_ip}" "$(port_of reality)" "$(st_get '.reality.sni')" "${_rpbk}" "$(st_get '.reality.sid')"
 }
 PLUGIN_EOF
-    chmod 644 "${PLUGIN_DIR}/reality.sh"
 }
 
 _plugin_write_vltcp() {
-cat > "${PLUGIN_DIR}/vltcp.sh" << 'PLUGIN_EOF'
+cat << 'PLUGIN_EOF'
 # xray-2go plugin: vltcp
 
 _plg_vltcp_enabled() {
@@ -1834,12 +1840,11 @@ _plg_vltcp_link() {
         "${_uuid}" "${_vhost}" "${_port}"
 }
 PLUGIN_EOF
-    chmod 644 "${PLUGIN_DIR}/vltcp.sh"
 }
 
 
 _plugin_write_ss2022() {
-cat > "$PLUGIN_DIR/ss2022.sh" << 'PLUGIN_EOF'
+cat << 'PLUGIN_EOF'
 # xray-2go plugin: ss2022 (Xray-core built-in Shadowsocks 2022)
 
 _plg_ss2022_enabled() {
@@ -1905,11 +1910,10 @@ _plg_ss2022_link() {
     printf 'ss://%s@%s:%s#Shadowsocks-2022\n' "$_encoded" "$_host" "$_port"
 }
 PLUGIN_EOF
-    chmod 644 "$PLUGIN_DIR/ss2022.sh"
 }
 
 _plugin_write_socks() {
-cat > "${PLUGIN_DIR}/socks.sh" << 'PLUGIN_EOF'
+cat << 'PLUGIN_EOF'
 # xray-2go plugin: socks (SOCKS5 inbound)
 
 _plg_socks_enabled() {
@@ -1944,11 +1948,10 @@ _plg_socks_link() {
     printf 'socks://%s@%s:%s#SOCKS5\n' "${_auth}" "${_ip}" "${_port}"
 }
 PLUGIN_EOF
-    chmod 644 "${PLUGIN_DIR}/socks.sh"
 }
 
 _plugin_write_http() {
-cat > "${PLUGIN_DIR}/http.sh" << 'PLUGIN_EOF'
+cat << 'PLUGIN_EOF'
 # xray-2go plugin: http (HTTP proxy inbound)
 
 _plg_http_enabled() {
@@ -1984,11 +1987,10 @@ _plg_http_link() {
     printf 'http://%s:%s@%s:%s#HTTP-Proxy\n' "${_user}" "${_pass}" "${_ip}" "${_port}"
 }
 PLUGIN_EOF
-    chmod 644 "${PLUGIN_DIR}/http.sh"
 }
 
 _plugin_write_cforigin() {
-cat > "${PLUGIN_DIR}/cforigin.sh" << 'PLUGIN_EOF'
+cat << 'PLUGIN_EOF'
 # xray-2go plugin: cforigin (Cloudflare Origin Rule / Destination Port)
 
 _cf_origin_tls_json() {
@@ -2069,11 +2071,10 @@ _plg_cforigin_link() {
     esac
 }
 PLUGIN_EOF
-    chmod 644 "${PLUGIN_DIR}/cforigin.sh"
 }
 
 _plugin_write_vlquic() {
-cat > "${PLUGIN_DIR}/vlquic.sh" << 'PLUGIN_EOF'
+cat << 'PLUGIN_EOF'
 # xray-2go plugin: vlquic (VLESS + XHTTP stream-one H3)
 
 _plg_vlquic_enabled() {
@@ -2116,7 +2117,6 @@ _plg_vlquic_link() {
     _vlquic_xhttp_link
 }
 PLUGIN_EOF
-    chmod 644 "${PLUGIN_DIR}/vlquic.sh"
 }
 
 # ==============================================================================
@@ -2380,7 +2380,7 @@ lifecycle_apply_sysctl() {
 lifecycle_rollback_sysctl() {
     [ -f "${_SYSCTL_FILE}" ] || return 0
     grep -Fxq '# xray2go managed - do not edit manually' "${_SYSCTL_FILE}" || return 0
-    rm -f "${_SYSCTL_FILE}" 2>/dev/null || true
+    rm -f "${_SYSCTL_FILE}" || { log_error "sysctl drop-in 清理失败"; return 1; }
     log_info "sysctl drop-in 已清除"
 }
 lifecycle_apply_hosts_patch() {
@@ -2394,10 +2394,12 @@ lifecycle_apply_hosts_patch() {
 }
 lifecycle_rollback_hosts() {
     [ -f "${_HOSTS_BAK}" ] || return 0
-    cp -f "${_HOSTS_BAK}" /etc/hosts 2>/dev/null && {
-        rm -f "${_HOSTS_BAK}" 2>/dev/null || true
-        log_ok "/etc/hosts 已从备份恢复"
-    } || log_warn "/etc/hosts 恢复失败，请手动恢复: ${_HOSTS_BAK}"
+    cp -f "${_HOSTS_BAK}" /etc/hosts 2>/dev/null || {
+        log_warn "/etc/hosts 恢复失败，请手动恢复: ${_HOSTS_BAK}"
+        return 1
+    }
+    rm -f "${_HOSTS_BAK}" || return 1
+    log_ok "/etc/hosts 已从备份恢复"
 }
 
 # ==============================================================================
@@ -2932,7 +2934,7 @@ _transaction_rollback() {
     else
         _failed=1
     fi
-    if [ "${_install_hosts_pending:-0}" -eq 1 ]; then lifecycle_rollback_hosts; fi
+    if [ "${_install_hosts_pending:-0}" -eq 1 ]; then lifecycle_rollback_hosts || _failed=1; fi
     if _transaction_restore_files "${_restore_fw}"; then
         _reload="${_TXN_XRAY_RESTART_ATTEMPTED}"
         _G_SYSD_DIRTY=1
@@ -3022,11 +3024,6 @@ _module_enable_commit_inner() {
 }
 _module_enable_commit() { _transaction_run "模块启用提交" _module_enable_commit_inner "$@"; }
 
-_module_apply_if_enabled() {
-    local _enabled="${1}"
-    [ "${_enabled}" = "true" ] || return 0
-    config_apply || return 1
-}
 _module_save_fields() {
     _transaction_run "更新模块配置" _module_save_fields_inner "$@"
 }
@@ -3035,8 +3032,11 @@ _module_save_fields_inner() {
     local _id="$1"
     shift
     st_set "$@" || return 1
-    _module_apply_if_enabled "$(st_get '.[$id].enabled' --arg id "${_id}")" || return 1
-    st_persist || { log_error "state.json 写入失败"; return 1; }
+    if [ "$(st_get '.[$id].enabled' --arg id "${_id}")" = "true" ]; then
+        _commit_inner
+    else
+        st_persist || { log_error "state.json 写入失败"; return 1; }
+    fi
 }
 
 # State mutations must happen inside the transaction callback so the snapshot
@@ -3108,6 +3108,21 @@ module_update_port_action() {
     esac
 }
 
+_menu_read_listen() {
+    local _input
+    prompt "$1" _input || return 1
+    if [ -n "${_input:-}" ]; then
+        _input=$(val_listen_addr "${_input}") || return 1
+    fi
+    printf -v "$2" '%s' "${_input:-}"
+}
+
+_menu_warn_http_listen() {
+    case "$1:$2" in
+        http:0.0.0.0|http:::) log_warn "HTTP 代理为明文协议，请确认防火墙与网络边界" ;;
+    esac
+}
+
 module_update_listen_action() {
     local _proto="${1:-}" _l _label
     case "${_proto}" in
@@ -3121,10 +3136,10 @@ module_update_listen_action() {
             return 1
             ;;
     esac
-    prompt "新监听地址（0.0.0.0=所有，127.0.0.1=仅本地）: " _l || return 1
-    [ -n "${_l:-}" ] || return 0
-    _l=$(val_listen_addr "${_l}") || return 1
+    _menu_read_listen "新监听地址（0.0.0.0=所有，127.0.0.1=仅本地，回车保持）: " _l || return 1
+    [ -n "${_l}" ] || return 0
     _module_update_listen_transaction "${_proto}" "${_l}" || return 1
+    _menu_warn_http_listen "${_proto}" "${_l}"
     log_ok "${_label} 监听地址已更新: ${_l}"
     [ "$(st_get ".${_proto}.enabled")" = true ] && { config_print_nodes "${_proto}" || true; }
     return 0
@@ -3523,17 +3538,7 @@ module_vlquic_update_port() {
 
 module_cforigin_update_port() {
     local _np
-    prompt "新 Origin 回源端口（需与 Cloudflare Origin Rule 的 Destination Port 一致，回车随机）: " _np || return 1
-    if [ -z "${_np:-}" ]; then
-        _menu_select_port tcp _np || return 1
-    else
-        val_port "${_np}" >/dev/null || return 1
-        if port_mgr_in_use "${_np}"; then
-            log_warn "端口 ${_np} 已被占用"
-            local _a2; prompt "仍然继续？(y/N): " _a2 || return 1
-            case "${_a2:-n}" in y|Y) :;; *) return 1;; esac
-        fi
-    fi
+    _menu_select_port tcp _np "新 Origin 回源端口（需与 Cloudflare Origin Rule 的 Destination Port 一致，回车随机）: " || return 1
     _commit_port_change cforigin "${_np}" || return 1
     log_warn "如果 Cloudflare Origin Rule 已手动配置，请同步确认 Destination Port Override = ${_np}"
     cforigin_print_cloudflare_hint
@@ -3557,22 +3562,37 @@ module_vlquic_update_listen() {
     module_update_listen_action vlquic
 }
 
-module_cforigin_update_protocol() {
-    local _en _proto _pc
-    _en=$(st_get '.cforigin.enabled')
-    _proto=$(st_get '.cforigin.protocol')
-    echo ""; printf "  ${C_GRN}1.${C_RST} WS ${C_YLW}[默认]${C_RST}\n"; printf "  ${C_GRN}2.${C_RST} HTTPUpgrade\n"; printf "  ${C_GRN}3.${C_RST} XHTTP (stream-one)\n"
-    prompt "传输协议 (1-3，回车保持 ${_proto}): " _pc || return 1
-    case "${_pc:-}" in
-        1) _proto=ws ;;
-        2) _proto=httpupgrade ;;
-        3) _proto=xhttp ;;
-        '') return 0 ;;
+_cforigin_read_transport() {
+    local _hint="$1" _output="$2" _option _protocol
+    printf '\n  %s1.%s WS\n' "${C_GRN}" "${C_RST}"
+    printf '  %s2.%s HTTPUpgrade\n' "${C_GRN}" "${C_RST}"
+    printf '  %s3.%s XHTTP (stream-one)\n' "${C_GRN}" "${C_RST}"
+    prompt "CF Origin 传输协议 (1-3，${_hint}): " _option || return 1
+    case "${_option:-}" in
+        1) _protocol=ws ;;
+        2) _protocol=httpupgrade ;;
+        3) _protocol=xhttp ;;
+        '') _protocol='' ;;
         *) log_error "无效选项，请按提示输入"; return 1 ;;
     esac
-    _module_save_fields cforigin '
+    printf -v "${_output}" '%s' "${_protocol}"
+}
+
+_cforigin_save_transport() {
+    local _protocol="$1"
+    shift
+    "$@" '
         .cforigin.protocol = $protocol | if $protocol == "xhttp" then . else .cforigin.edge_h3 = false end
-    ' --arg protocol "${_proto}" || return 1
+    ' --arg protocol "${_protocol}"
+}
+
+module_cforigin_update_protocol() {
+    local _en _current _proto
+    _en=$(st_get '.cforigin.enabled')
+    _current=$(st_get '.cforigin.protocol')
+    _cforigin_read_transport "回车保持 ${_current}" _proto || return 1
+    [ -n "${_proto}" ] || return 0
+    _cforigin_save_transport "${_proto}" _module_save_fields cforigin || return 1
     log_ok "CF Origin 协议已更新: $(st_get '.cforigin.protocol')"
     if [ "${_en}" = "true" ]; then config_print_nodes cforigin || true; fi
 }
@@ -3609,12 +3629,10 @@ module_cforigin_update_path() {
 }
 
 module_cforigin_update_listen() {
-    local _en _l
-    _en=$(st_get '.cforigin.enabled')
-    prompt "新监听地址（:: / 0.0.0.0 / 127.0.0.1）: " _l || return 1
-    [ -n "${_l:-}" ] || return 0
-    _l=$(val_listen_addr "${_l}") || return 1
-    _module_save_fields cforigin '.cforigin.listen = $l' --arg l "${_l}" || return 1
+    local _l
+    _menu_read_listen "新监听地址（:: / 0.0.0.0 / 127.0.0.1，回车保持）: " _l || return 1
+    [ -n "${_l}" ] || return 0
+    _module_update_listen_transaction cforigin "${_l}" || return 1
     log_ok "监听地址已更新: ${_l}"
 }
 
@@ -3646,9 +3664,18 @@ module_argo_enable() {
     _transaction_run "Argo 启用" module_argo_enable_inner "$@"
 }
 
+_svc_stop_and_disable() {
+    local _service="$1"
+    svc_exec_mut stop "${_service}" 2>/dev/null || true
+    svc_exec_mut disable "${_service}" 2>/dev/null || true
+    if svc_exec status "${_service}" >/dev/null 2>&1 || svc_is_enabled "${_service}" >/dev/null 2>&1; then
+        log_error "${_service} 仍在运行或设为开机启动"
+        return 1
+    fi
+}
+
 module_argo_disable_inner() {
-    svc_exec_mut stop    "${_SVC_TUNNEL}" 2>/dev/null || true
-    svc_exec_mut disable "${_SVC_TUNNEL}" 2>/dev/null || true
+    _svc_stop_and_disable "${_SVC_TUNNEL}" || return 1
     st_set '.argo.enabled = false' || return 1
     _module_disable_commit Argo || return 1
     log_ok "Argo 已禁用"
@@ -3658,17 +3685,28 @@ module_argo_disable() {
     _transaction_run "Argo 禁用" module_argo_disable_inner "$@"
 }
 
-module_argo_uninstall_inner() {
-    svc_exec_mut stop    "${_SVC_TUNNEL}" 2>/dev/null || true
-    svc_exec_mut disable "${_SVC_TUNNEL}" 2>/dev/null || true
+_svc_remove_units() {
+    local _name _dir _suffix=
     if is_systemd; then
-        rm -f "${_SVC_SYSTEMD_DIR}/${_SVC_TUNNEL}.service" 2>/dev/null || true
-        systemctl daemon-reload >/dev/null 2>&1 || true
+        _dir="${_SVC_SYSTEMD_DIR}"
+        _suffix=.service
     else
-        rm -f "${_SVC_OPENRC_DIR}/${_SVC_TUNNEL}" 2>/dev/null || true
+        _dir="${_SVC_OPENRC_DIR}"
     fi
-    rm -f "${ARGO_BIN}" "${WORK_DIR}/tunnel.yml" \
-          "${WORK_DIR}/tunnel.json" "${_ARGO_ENV_FILE}" 2>/dev/null || true
+    for _name in "$@"; do
+        rm -f -- "${_dir}/${_name}${_suffix}" || return 1
+    done
+    if [ "${_suffix}" = .service ]; then
+        _G_SYSD_DIRTY=1
+        svc_reload_daemon || return 1
+    fi
+}
+
+module_argo_uninstall_inner() {
+    _svc_stop_and_disable "${_SVC_TUNNEL}" || return 1
+    _svc_remove_units "${_SVC_TUNNEL}" || return 1
+    rm -f -- "${ARGO_BIN}" "${WORK_DIR}/tunnel.yml" \
+          "${WORK_DIR}/tunnel.json" "${_ARGO_ENV_FILE}" || return 1
     st_set '.argo.enabled = false | .argo.domain = null | .argo.token = null | .argo.cred_b64 = null | .argo.mode = "fixed" | .argo.protocol = "ws" | .argo.auth_protocol = "vless" | .argo.trojan_password = "" | del(.argo.xhttp)' || return 1
     _module_disable_commit Argo || return 1
     log_ok "Argo 已完全卸载"
@@ -3715,32 +3753,23 @@ _module_argo_update_protocol_impl() {
 }
 
 _module_argo_update_auth_protocol_impl() {
-    local _en _auth _pw
-    _en=$(st_get '.argo.enabled')
-    [ "${_en}" = "true" ] || { log_warn "请先启用 Argo"; return 1; }
-    _auth=$(st_get '.argo.auth_protocol')
-    _pw=$(st_get '.argo.trojan_password')
-    install_plan_argo_update_auth_protocol || return 1
-    argo_apply_fixed_tunnel_from_state || {
-        st_set '.argo.auth_protocol = $v | .argo.trojan_password = $p' --arg v "${_auth}" --arg p "${_pw}" || true
-        log_error "固定隧道同步失败，已回滚入站认证为 ${_auth}"
-        return 1
-    }
+    _argo_update_credential install_plan_argo_update_auth_protocol
+}
+
+_argo_update_credential() {
+    local _before="${_G_STATE}"
+    [ "$(st_get '.argo.enabled')" = true ] || { log_warn "请先启用 Argo"; return 1; }
+    "$@" || return 1
+    if [ "${_G_STATE}" = "${_before}" ]; then
+        _argo_update_changed=0
+        return 0
+    fi
+    argo_apply_fixed_tunnel_from_state || return 1
     config_print_nodes argo || true
 }
 
 _module_argo_update_trojan_password_impl() {
-    local _en _pw
-    _en=$(st_get '.argo.enabled')
-    [ "${_en}" = "true" ] || { log_warn "请先启用 Argo"; return 1; }
-    _pw=$(st_get '.argo.trojan_password')
-    install_plan_argo_update_trojan_password || return 1
-    argo_apply_fixed_tunnel_from_state || {
-        st_set '.argo.trojan_password = $p' --arg p "${_pw}" || true
-        log_error "固定隧道同步失败，已回滚 Trojan 密码"
-        return 1
-    }
-    config_print_nodes argo || true
+    _argo_update_credential install_plan_argo_update_trojan_password
 }
 
 module_ff_update_mode() {
@@ -4550,10 +4579,7 @@ _module_argo_update_domain_impl() {
 }
 
 _module_argo_update_auth_impl() {
-    [ "$(st_get '.argo.enabled')" = "true" ] || { log_warn "请先启用 Argo"; return 1; }
-    install_plan_argo_update_auth || return 1
-    argo_apply_fixed_tunnel_from_state || return 1
-    config_print_nodes argo || true
+    _argo_update_credential install_plan_argo_update_auth
 }
 
 module_argo_update_action() {
@@ -4957,10 +4983,9 @@ module_xray_uninstall() {
 _uninstall_managed_files() {
     local _module _path _domain _state _domains
     if [ -d "${PLUGIN_DIR}" ] && [ ! -L "${PLUGIN_DIR}" ]; then
-        for _module in argo ff reality vltcp socks ss2022 http vlquic cforigin; do
+        for _module in "${_BUILTIN_PLUGINS[@]}"; do
             _path="${PLUGIN_DIR}/${_module}.sh"
-            if [ -f "${_path}" ] && [ ! -L "${_path}" ] &&
-               grep -Eq "^# xray-2go plugin: ${_module}( |$)" "${_path}"; then
+            if _plugin_is_managed_builtin "${_path}" "${_module}"; then
                 rm -f -- "${_path}" || return 1
             fi
         done
@@ -4982,10 +5007,8 @@ _module_xray_uninstall_locked() {
     : > "${_UNINSTALL_PENDING}" || return 1
     log_step "卸载中..."
     for _s in "${_SVC_XRAY}" "${_SVC_TUNNEL}"; do
-        svc_exec_mut stop "${_s}" 2>/dev/null || true
-        svc_exec_mut disable "${_s}" 2>/dev/null || true
-        if svc_exec status "${_s}" >/dev/null 2>&1 || svc_is_enabled "${_s}" >/dev/null 2>&1; then
-            log_error "卸载未完成：${_s} 仍在运行或设为开机启动，请处理后再次执行 u"
+        if ! _svc_stop_and_disable "${_s}"; then
+            log_error "卸载未完成，请处理服务后再次执行 u"
             _service_failed=1
         fi
     done
@@ -5001,15 +5024,9 @@ _module_xray_uninstall_locked() {
         "${STATE_FILE}" "${STATE_FILE}".*.bak "${_CONFIG_HASH_FILE}" \
         "${_ARGO_ENV_FILE}" "${_ACME_ENV_FILE}" "${WORK_DIR}/tunnel.yml" "${WORK_DIR}/tunnel.json" \
         "${XRAY_BIN}" "${ARGO_BIN}" "${_SVC_LOCK_FILE}" "${WORK_DIR}/.lock" || return 1
-    if is_systemd; then
-        rm -f -- "${_SVC_SYSTEMD_DIR}/${_SVC_XRAY}.service" \
-            "${_SVC_SYSTEMD_DIR}/${_SVC_TUNNEL}.service" || return 1
-        systemctl daemon-reload >/dev/null 2>&1 || true
-    else
-        rm -f -- "${_SVC_OPENRC_DIR}/${_SVC_XRAY}" "${_SVC_OPENRC_DIR}/${_SVC_TUNNEL}" || return 1
-    fi
-    lifecycle_rollback_sysctl
-    lifecycle_rollback_hosts
+    _svc_remove_units "${_SVC_XRAY}" "${_SVC_TUNNEL}" || return 1
+    lifecycle_rollback_sysctl || return 1
+    lifecycle_rollback_hosts || return 1
     if [ -d "${HOME}/.cloudflared" ]; then log_info "已保留 ${HOME}/.cloudflared 中的独立 Tunnel 文件"; fi
     if shortcut_is_managed; then
         rm -f -- "${SHORTCUT}" || { log_error "快捷命令清理失败"; return 1; }
@@ -5515,12 +5532,18 @@ module_dispatch() {
 }
 
 # 交互输入端口并写入 .ports.<proto>
-# 交互选择端口（回车随机、校验、占用确认），只输出端口，不修改 state。
+# 交互选择端口并校验，只输出端口。可传入提示、回车保留值和占用处理（confirm / warn）。
 _menu_select_port() {
     local _proto="${1:-tcp}" _outvar="${2:-}" _port_input _proto_label
     _proto_label="${_proto^^}"
-    prompt "新端口（回车随机）: " _port_input || return 1
-    [ -z "${_port_input:-}" ] && _port_input=$(port_mgr_random_proto "${_proto}")
+    prompt "${3:-新端口（回车随机）: }" _port_input || return 1
+    if [ -z "${_port_input:-}" ]; then
+        if [ -n "${4:-}" ]; then
+            _port_input="$4"
+        else
+            _port_input=$(port_mgr_random_proto "${_proto}") || return 1
+        fi
+    fi
     val_port "${_port_input}" >/dev/null || return 1
     local _busy
     case "${_proto}" in
@@ -5529,9 +5552,13 @@ _menu_select_port() {
         *)    port_mgr_in_use "${_port_input}" && _busy=1 || _busy=0 ;;
     esac
     if [ "${_busy}" -eq 1 ]; then
-        log_warn "${_proto_label}/${_port_input} 已被占用"
-        local _a; prompt "仍然继续？(y/N): " _a || return 1
-        case "${_a:-n}" in y|Y) :;; *) return 1;; esac
+        if [ "${5:-confirm}" = confirm ]; then
+            log_warn "${_proto_label}/${_port_input} 已被占用"
+            local _a; prompt "仍然继续？(y/N): " _a || return 1
+            case "${_a:-n}" in y|Y) :;; *) return 1;; esac
+        else
+            log_warn "${_proto_label}/${_port_input} 已被占用；当前不会自动更换，请手动确认端口"
+        fi
     fi
     if [ -n "${_outvar:-}" ]; then
         printf '%s' "${_outvar}" | grep -qE '^[A-Za-z_][A-Za-z0-9_]*$' \
@@ -6003,23 +6030,18 @@ install_plan_argo_update_protocol() {
     log_ok "Argo 协议已设置为: ${_new}"
 }
 
-install_plan_argo_update_port() {
-    local _p _dp
-    _dp=$(port_of argo)
-    prompt "Argo 回源端口（回车默认 ${_dp}）: " _p || return 1
-    if [ -z "${_p:-}" ]; then
-        _menu_input_port '.ports.argo' _p || return 1
-    else
-        val_port "${_p}" >/dev/null || return 1
-        if port_mgr_in_use "${_p}"; then
-            log_warn "端口 ${_p} 已被占用"
-            local _a2; prompt "仍然继续？(y/N): " _a2 || return 1
-            case "${_a2:-n}" in y|Y) :;; *) return 1;; esac
-        fi
-        st_set '.ports.argo = ($p|tonumber)' --arg p "${_p}" || return 1
-    fi
-    log_ok "Argo 回源端口已设置为: $(port_of argo)"
+_install_plan_update_port() {
+    local _module="$1" _transport="$2" _conflict="$3" _current _selected _label
+    _label=$(module_label "${_module}")
+    _current=$(port_of "${_module}") || return 1
+    _menu_select_port "${_transport}" _selected "${_label} 端口（回车保持 ${_current}）: " \
+        "${_current}" "${_conflict}" || return 1
+    [ "${_selected}" != "${_current}" ] || return 0
+    st_set '.ports[$id] = ($p|tonumber)' --arg id "${_module}" --arg p "${_selected}" || return 1
+    log_ok "${_label} 端口已设置为: ${_selected}"
 }
+
+install_plan_argo_update_port() { _install_plan_update_port argo tcp confirm; }
 
 install_plan_argo_update_domain() {
     local _domain _cur
@@ -6089,10 +6111,9 @@ install_plan_ff_update_mode() {
         2) st_set '.ff.enabled = true | .ff.protocol = "httpupgrade"' || return 1 ;;
         3) st_set '.ff.enabled = true | .ff.protocol = "xhttp"' || return 1 ;;
         4)
-            st_set '.ff.enabled = true | .ff.protocol = "tcphttp"' || return 1
             prompt "免流 Host（如 realname.1888.com.mo）: " _host || return 1
             [ -n "${_host:-}" ] || { log_error "Host 不能为空"; return 1; }
-            st_set '.ff.host = $h' --arg h "${_host}" || return 1
+            st_set '.ff.enabled = true | .ff.protocol = "tcphttp" | .ff.host = $h' --arg h "${_host}" || return 1
             log_info "已选: TCP + HTTP 伪装（host=${_host}）"
             return 0 ;;
         *) log_error "无效选项，请按提示输入"; return 1 ;;
@@ -6100,21 +6121,7 @@ install_plan_ff_update_mode() {
     log_ok "FreeFlow 协议已设置为: $(st_get '.ff.protocol')"
 }
 
-install_plan_ff_update_port() {
-    local _fp _dp _vp
-    _fp=$(st_get '.ff.protocol')
-    _dp=$(port_of ff)
-    prompt "FreeFlow 监听端口（回车默认 ${_dp}）: " _vp || return 1
-    if [ -n "${_vp:-}" ]; then
-        if val_port "${_vp}" >/dev/null 2>&1; then
-            st_set '.ports.ff = ($p|tonumber)' --arg p "${_vp}" || return 1
-        else
-            log_warn "端口无效，使用默认值 ${_dp}"
-        fi
-    fi
-    port_mgr_in_use "$(port_of ff)" && log_warn "端口 $(port_of ff) 已被占用"
-    log_ok "FreeFlow 端口已设置为: $(port_of ff)"
-}
+install_plan_ff_update_port() { _install_plan_update_port ff tcp warn; }
 
 install_plan_ff_update_host_or_path() {
     local _proto _host _path _h _p _vp2
@@ -6149,20 +6156,7 @@ install_plan_reality_toggle() {
     log_ok "Reality 已$( [ "$(st_get '.reality.enabled')" = "true" ] && printf '启用' || printf '禁用' )"
 }
 
-install_plan_reality_update_port() {
-    local _rp _dp
-    _dp=$(port_of reality)
-    prompt "Reality 监听端口（回车默认 ${_dp}）: " _rp || return 1
-    if [ -n "${_rp:-}" ]; then
-        if val_port "${_rp}" >/dev/null 2>&1; then
-            st_set '.ports.reality = ($p|tonumber)' --arg p "${_rp}" || return 1
-        else
-            log_warn "端口无效，使用默认值 ${_dp}"
-        fi
-    fi
-    port_mgr_in_use "$(port_of reality)" &&         log_warn "端口 $(port_of reality) 已被占用；当前不会自动更换，请手动修改端口，否则安装阶段可能失败"
-    log_ok "Reality 端口已设置为: $(port_of reality)"
-}
+install_plan_reality_update_port() { _install_plan_update_port reality tcp warn; }
 
 install_plan_reality_update_sni() {
     local _ds _sni
@@ -6199,60 +6193,29 @@ install_plan_vltcp_toggle() {
     log_ok "VLESS-TCP 已$( [ "$(st_get '.vltcp.enabled')" = "true" ] && printf '启用' || printf '禁用' )"
 }
 
-install_plan_vltcp_update_port() {
-    local _vp _dp
-    _dp=$(port_of vltcp)
-    prompt "VLESS-TCP 监听端口（回车默认 ${_dp}）: " _vp || return 1
-    if [ -n "${_vp:-}" ]; then
-        if val_port "${_vp}" >/dev/null 2>&1; then
-            st_set '.ports.vltcp = ($p|tonumber)' --arg p "${_vp}" || return 1
-        else
-            log_warn "端口无效，使用默认值 ${_dp}"
-        fi
-    fi
-    port_mgr_in_use "$(port_of vltcp)" && log_warn "端口 $(port_of vltcp) 已被占用"
-    log_ok "VLESS-TCP 端口已设置为: $(port_of vltcp)"
+install_plan_vltcp_update_port() { _install_plan_update_port vltcp tcp warn; }
+
+_install_plan_update_listen() {
+    local _module="$1" _current _listen _label
+    _label=$(module_label "${_module}")
+    _current=$(st_get '.[$id].listen' --arg id "${_module}") || return 1
+    _menu_read_listen "${_label} 监听地址（回车保持 ${_current}）: " _listen || return 1
+    [ -n "${_listen}" ] || return 0
+    st_set '.[$id].listen = $listen' --arg id "${_module}" --arg listen "${_listen}" || return 1
+    _menu_warn_http_listen "${_module}" "${_listen}"
+    log_ok "${_label} 监听地址已设置为: ${_listen}"
 }
 
-install_plan_vltcp_update_listen() {
-    local _dl _vl
-    _dl=$(st_get '.vltcp.listen')
-    prompt "VLESS-TCP 监听地址（回车默认 ${_dl}，0.0.0.0=所有接口）: " _vl || return 1
-    [ -n "${_vl:-}" ] || { log_info "保持监听地址: ${_dl}"; return 0; }
-    _vl=$(val_listen_addr "${_vl}") || { log_warn "监听地址不合法，使用默认值 ${_dl}"; return 0; }
-    st_set '.vltcp.listen = $l' --arg l "${_vl}" || return 1
-    log_ok "VLESS-TCP 监听地址已设置为: $(st_get '.vltcp.listen')"
-}
+install_plan_vltcp_update_listen() { _install_plan_update_listen vltcp; }
 
 install_plan_socks_toggle() {
     [ "$(st_get '.socks.enabled')" = "true" ]         && st_set '.socks.enabled = false'         || st_set '.socks.enabled = true' || return 1
     log_ok "SOCKS5 已$( [ "$(st_get '.socks.enabled')" = "true" ] && printf '启用' || printf '禁用' )"
 }
 
-install_plan_socks_update_port() {
-    local _sp _dp
-    _dp=$(port_of socks)
-    prompt "SOCKS5 监听端口（回车默认 ${_dp}）: " _sp || return 1
-    if [ -n "${_sp:-}" ]; then
-        if val_port "${_sp}" >/dev/null 2>&1; then
-            st_set '.ports.socks = ($p|tonumber)' --arg p "${_sp}" || return 1
-        else
-            log_warn "端口无效，使用默认值 ${_dp}"
-        fi
-    fi
-    port_mgr_in_use "$(port_of socks)" && log_warn "TCP/$(port_of socks) 已被占用"
-    log_ok "SOCKS5 端口已设置为: $(port_of socks)"
-}
+install_plan_socks_update_port() { _install_plan_update_port socks tcp warn; }
 
-install_plan_socks_update_listen() {
-    local _dl _sl
-    _dl=$(st_get '.socks.listen')
-    prompt "SOCKS5 监听地址（回车默认 ${_dl}，0.0.0.0=所有接口）: " _sl || return 1
-    [ -n "${_sl:-}" ] || { log_info "保持监听地址: ${_dl}"; return 0; }
-    _sl=$(val_listen_addr "${_sl}") || { log_warn "监听地址不合法，使用默认值 ${_dl}"; return 0; }
-    st_set '.socks.listen = $l' --arg l "${_sl}" || return 1
-    log_ok "SOCKS5 监听地址已设置为: $(st_get '.socks.listen')"
-}
+install_plan_socks_update_listen() { _install_plan_update_listen socks; }
 
 install_plan_socks_update_user() {
     local _du _user
@@ -6280,31 +6243,9 @@ install_plan_http_toggle() {
     log_ok "HTTP 代理已$( [ "$(st_get '.http.enabled')" = "true" ] && printf '启用' || printf '禁用' )"
 }
 
-install_plan_http_update_port() {
-    local _hp _dp
-    _dp=$(port_of http)
-    prompt "HTTP 代理监听端口（回车默认 ${_dp}）: " _hp || return 1
-    if [ -n "${_hp:-}" ]; then
-        if val_port "${_hp}" >/dev/null 2>&1; then
-            st_set '.ports.http = ($p|tonumber)' --arg p "${_hp}" || return 1
-        else
-            log_warn "端口无效，使用默认值 ${_dp}"
-        fi
-    fi
-    port_mgr_in_use "$(port_of http)" && log_warn "TCP/$(port_of http) 已被占用"
-    log_ok "HTTP 代理端口已设置为: $(port_of http)"
-}
+install_plan_http_update_port() { _install_plan_update_port http tcp warn; }
 
-install_plan_http_update_listen() {
-    local _dl _hl
-    _dl=$(st_get '.http.listen')
-    prompt "HTTP 代理监听地址（回车默认 ${_dl}，0.0.0.0=所有接口）: " _hl || return 1
-    [ -n "${_hl:-}" ] || { log_info "保持监听地址: ${_dl}"; return 0; }
-    _hl=$(val_listen_addr "${_hl}") || { log_warn "监听地址不合法，使用默认值 ${_dl}"; return 0; }
-    st_set '.http.listen = $l' --arg l "${_hl}" || return 1
-    log_warn "HTTP 代理为明文协议，请勿在不可信公网直接暴露"
-    log_ok "HTTP 代理监听地址已设置为: $(st_get '.http.listen')"
-}
+install_plan_http_update_listen() { _install_plan_update_listen http; }
 
 install_plan_http_update_user() {
     local _du _user
@@ -6329,20 +6270,9 @@ install_plan_cforigin_toggle() {
 }
 
 install_plan_cforigin_update_protocol() {
-    echo ""
-    printf "  ${C_GRN}1.${C_RST} WS ${C_YLW}[默认，兼容性最好]${C_RST}
-"
-    printf "  ${C_GRN}2.${C_RST} HTTPUpgrade
-"
-    printf "  ${C_GRN}3.${C_RST} XHTTP (stream-one)
-"
-    local _pc
-    prompt "CF Origin 传输协议 (1-3，回车默认1): " _pc || return 1
-    case "${_pc:-1}" in
-        2) st_set '.cforigin.protocol = "httpupgrade" | .cforigin.edge_h3 = false' || return 1 ;;
-        3) st_set '.cforigin.protocol = "xhttp"' || return 1 ;;
-        *) st_set '.cforigin.protocol = "ws" | .cforigin.edge_h3 = false' || return 1 ;;
-    esac
+    local _proto
+    _cforigin_read_transport "回车默认 WS" _proto || return 1
+    _cforigin_save_transport "${_proto:-ws}" st_set || return 1
     log_ok "CF Origin 协议已设置为: $(st_get '.cforigin.protocol')"
 }
 
@@ -6377,26 +6307,11 @@ install_plan_cforigin_update_edge_port() {
 }
 
 install_plan_cforigin_update_origin_port() {
-    local _origin _cur_origin
-    _cur_origin=$(port_of cforigin)
-    prompt "CF Origin 源站回源端口（回车默认 ${_cur_origin:-28888}）: " _origin || return 1
-    _origin="${_origin:-${_cur_origin:-28888}}"
-    val_port "${_origin}" >/dev/null || return 1
-    st_set '.ports.cforigin = ($p|tonumber)' --arg p "${_origin}" || return 1
-    port_mgr_in_use "$(port_of cforigin)" && log_warn "端口 $(port_of cforigin) 已被占用"
+    _install_plan_update_port cforigin tcp warn || return 1
     log_warn "如果 Cloudflare Origin Rule 已手动配置，请同步确认 Destination Port Override = $(port_of cforigin)"
-    log_ok "CF Origin 源站回源端口已设置为: $(port_of cforigin)"
 }
 
-install_plan_cforigin_update_listen() {
-    local _dl _vl
-    _dl=$(st_get '.cforigin.listen')
-    prompt "CF Origin 监听地址（回车默认 ${_dl}，::=IPv4+IPv6）: " _vl || return 1
-    [ -n "${_vl:-}" ] || { log_info "保持监听地址: ${_dl}"; return 0; }
-    _vl=$(val_listen_addr "${_vl}") || { log_warn "监听地址不合法，使用默认值 ${_dl}"; return 0; }
-    st_set '.cforigin.listen = $l' --arg l "${_vl}" || return 1
-    log_ok "CF Origin 监听地址已设置为: $(st_get '.cforigin.listen')"
-}
+install_plan_cforigin_update_listen() { _install_plan_update_listen cforigin; }
 
 install_plan_cforigin_toggle_edge_h3() {
     [ "$(st_get '.cforigin.protocol')" = "xhttp" ] || { log_warn "CF Origin 当前不是 XHTTP，实验性客户端到 Cloudflare Edge HTTP/3 不适用"; return 0; }
@@ -6414,30 +6329,9 @@ install_plan_vlquic_toggle() {
     log_ok "VLESS-XHTTP-H3 已$( [ "$(st_get '.vlquic.enabled')" = "true" ] && printf '启用' || printf '禁用' )"
 }
 
-install_plan_vlquic_update_port() {
-    local _dp _vp
-    _dp=$(port_of vlquic)
-    prompt "VLESS-XHTTP-H3 UDP 监听端口（回车默认 ${_dp}）: " _vp || return 1
-    if [ -n "${_vp:-}" ]; then
-        if val_port "${_vp}" >/dev/null 2>&1; then
-            st_set '.ports.vlquic = ($p|tonumber)' --arg p "${_vp}" || return 1
-        else
-            log_warn "端口无效，使用默认值 ${_dp}"
-        fi
-    fi
-    port_mgr_in_use_udp "$(port_of vlquic)" && log_warn "UDP/$(port_of vlquic) 已被占用"
-    log_ok "VLESS-XHTTP-H3 UDP 端口已设置为: $(port_of vlquic)"
-}
+install_plan_vlquic_update_port() { _install_plan_update_port vlquic udp warn; }
 
-install_plan_vlquic_update_listen() {
-    local _dl _vl
-    _dl=$(st_get '.vlquic.listen')
-    prompt "VLESS-XHTTP-H3 监听地址（回车默认 ${_dl}，0.0.0.0=所有接口）: " _vl || return 1
-    [ -n "${_vl:-}" ] || { log_info "保持监听地址: ${_dl}"; return 0; }
-    _vl=$(val_listen_addr "${_vl}") || { log_warn "监听地址不合法，使用默认值 ${_dl}"; return 0; }
-    st_set '.vlquic.listen = $l' --arg l "${_vl}" || return 1
-    log_ok "VLESS-XHTTP-H3 监听地址已设置为: $(st_get '.vlquic.listen')"
-}
+install_plan_vlquic_update_listen() { _install_plan_update_listen vlquic; }
 
 install_plan_vlquic_update_cert() {
     vlquic_config_cert || return 1
@@ -6454,28 +6348,9 @@ install_plan_ss2022_toggle() {
     fi
 }
 
-install_plan_ss2022_update_port() {
-    local _old _new
-    _old=$(port_of ss2022)
-    prompt "Shadowsocks 2022 TCP/UDP 端口（回车保持 ${_old}）: " _new || return 1
-    [ -n "${_new}" ] || return 0
-    val_port "${_new}" >/dev/null || return 1
-    if port_mgr_in_use_both "${_new}"; then
-        log_warn "TCP/UDP/${_new} 已被占用；当前不会自动更换，请确认端口冲突不会影响安装"
-    fi
-    st_set '.ports.ss2022 = ($p|tonumber)' --arg p "${_new}" || return 1
-    log_ok "Shadowsocks 2022 端口已设置为: $(port_of ss2022)"
-}
+install_plan_ss2022_update_port() { _install_plan_update_port ss2022 both warn; }
 
-install_plan_ss2022_update_listen() {
-    local _old _new
-    _old=$(st_get '.ss2022.listen')
-    prompt "Shadowsocks 2022 监听地址（回车保持 $_old）: " _new || return 1
-    [ -n "$_new" ] || return 0
-    _new=$(val_listen_addr "$_new") || return 1
-    st_set '.ss2022.listen = $l' --arg l "$_new" || return 1
-    log_ok "Shadowsocks 2022 监听地址已设置为: $(st_get '.ss2022.listen')"
-}
+install_plan_ss2022_update_listen() { _install_plan_update_listen ss2022; }
 
 install_plan_ss2022_update_method() {
     _ss2022_select_method install
@@ -6765,9 +6640,9 @@ _xhttp_validate_profile() {
                 checked((.extra // {}) | extra("split.download.xhttpSettings.extra")));
         (if length == 1 then .[0] else error("XHTTP 请输入一个 JSON 对象") end) |
         require("配置对象（允许 mode、server、client、split）"; only(["mode","server","client","split"])) |
-        require("mode（auto、packet-up、stream-up 或 stream-one）"; (.mode // "auto") | IN("auto","packet-up","stream-up","stream-one")) |
-        checked((.server // {}) | extra("server")) |
-        checked((.client // {}) | extra("client")) |
+        require("mode（auto、packet-up、stream-up 或 stream-one）"; .mode | IN(null,"auto","packet-up","stream-up","stream-one")) |
+        checked(.server | if . == null then . else extra("server") end) |
+        checked(.client | if . == null then . else extra("client") end) |
         checked(.split | if . == null then . else
             require("split（允许 port、mode、download）"; only(["port","mode","download"])) |
             require("split.port（1–65535 的整数）"; .port | port) |
@@ -6784,9 +6659,17 @@ _xhttp_validate_profile() {
     printf '%s\n' "${_checked}"
 }
 
+_xhttp_store_profile() {
+    local _module="$1" _profile="$2"
+    if [ "${_module}" = argo ]; then
+        _argo_xhttp_check_profile_split "${_profile}" || return 1
+    fi
+    st_set '.[$inbound_id].xhttp = $profile' --arg inbound_id "${_module}" --argjson profile "${_profile}"
+}
+
 _xhttp_apply_profile() {
     local _module="$1" _profile="$2"
-    st_set '.[$inbound_id].xhttp = $profile' --arg inbound_id "${_module}" --argjson profile "${_profile}" || return 1
+    _xhttp_store_profile "${_module}" "${_profile}" || return 1
     if { [ "${_module}" = reality ] && [ "$(st_get '.reality.network')" != xhttp ]; } ||
        { [ "${_module}" = ff ] && [ "$(st_get '.ff.protocol')" != xhttp ]; }; then
         st_persist
@@ -6818,27 +6701,33 @@ _argo_xhttp_check_profile_split() {
     _argo_xhttp_check_split_port "${_port}" "${_old_port}"
 }
 
-_argo_xhttp_save_profile() {
-    _argo_xhttp_check_profile_split "$1" && _xhttp_apply_profile argo "$1"
-}
-
-_argo_xhttp_set_profile() {
-    local _runtime="$1" _raw="$2" _profile
-    if [ "${_raw}" = null ]; then
-        _profile=null
-    else
+_xhttp_set_profile() {
+    local _module="$1" _runtime="$2" _raw="$3" _profile=null _invalid _mode _label
+    _label=$(module_label "${_module}")
+    if [ "${_raw}" != null ]; then
         _profile=$(_xhttp_validate_profile "${_raw}") || return 1
+        _invalid=$(jq -r --arg id "${_module}" '
+            if $id != "argo" and has("split") then "split（仅 Argo 支持）"
+            else ["server","client"][] as $side | (.[$side] // {}) | keys[] as $key |
+                select($key | IN("path", "mode", "host", "extra", "xhttpModeH3")) | "\($side).\($key)"
+            end
+        ' <<< "${_profile}") || return 1
+        [ -z "${_invalid}" ] || { log_error "${_label} XHTTP 保留字段: ${_invalid}"; return 1; }
+        if [ "${_module}" != argo ]; then
+            _mode=$(st_get '.[$id].xhttp.mode // "stream-one"' --arg id "${_module}") || return 1
+            _profile=$(jq -ce --arg mode "${_mode}" '.mode //= $mode' <<< "${_profile}") || return 1
+        fi
     fi
-
     if [ "${_runtime}" = 1 ]; then
-        _transaction_run "更新 Argo XHTTP" _argo_xhttp_save_profile "${_profile}" || return 1
-        log_ok "Argo XHTTP 配置已保存"
+        _transaction_run "更新 ${_label} XHTTP" _xhttp_apply_profile "${_module}" "${_profile}" || return 1
+        log_ok "${_label} XHTTP 配置已保存"
     else
-        _argo_xhttp_check_profile_split "${_profile}" || return 1
-        st_set '.argo.xhttp = $profile' --argjson profile "${_profile}" || return 1
-        log_ok "Argo XHTTP 已写入安装计划"
+        _xhttp_store_profile "${_module}" "${_profile}" || return 1
+        log_ok "${_label} XHTTP 已写入安装计划"
     fi
 }
+
+_argo_xhttp_set_profile() { _xhttp_set_profile argo "$@"; }
 
 _xhttp_export_vless_outbound() {
     jq -n --arg address "$1" --argjson port "$2" \
@@ -6848,9 +6737,11 @@ _xhttp_export_vless_outbound() {
 }
 
 _argo_xhttp_export_json() {
-    local _stream
+    local _stream _address
     _stream=$(_argo_xhttp_client_stream "$1") || return 1
-    _xhttp_export_vless_outbound "$(st_get '.cfip')" "$(st_get '.cfport')" "${_stream}"
+    _address=$(st_get '.cfip') || return 1
+    _address="${_address#[}"
+    _xhttp_export_vless_outbound "${_address%]}" "$(st_get '.cfport')" "${_stream}"
 }
 
 _argo_xhttp_export_mihomo() {
@@ -6920,9 +6811,10 @@ _argo_xhttp_render_status() {
 }
 
 _xhttp_edit_advanced() {
-    local _module="$1" _runtime="$2" _draft
-    _draft=$(st_get '.[$inbound_id].xhttp // {}' --arg inbound_id "${_module}" | jq -c .) || return 1
-    while prompt '编辑单行 JSON（回车保存，清空后回车返回）: ' _draft "${_draft}" && [ -n "${_draft}" ]; do
+    local _module="$1" _runtime="$2" _current _draft
+    _current=$(st_get '.[$inbound_id].xhttp // {}' --arg inbound_id "${_module}" | jq -c .) || return 1
+    printf '当前 XHTTP JSON: %s\n' "${_current}"
+    while prompt '编辑单行 JSON（可直接粘贴，空行返回）: ' _draft '' && [ -n "${_draft}" ]; do
         if "_${_module}_xhttp_set_profile" "${_runtime}" "${_draft}"; then
             _pause
             return 0
@@ -6930,12 +6822,19 @@ _xhttp_edit_advanced() {
     done
 }
 
+# 旧配置以 false 表示未设置 Extra，编辑已有配置时按缺省处理。
+_xhttp_saved_profile() {
+    st_get '.[$id].xhttp | (if type == "object" then
+        with_entries(select(((.key | IN("server", "client", "mode")) and (.value == false)) | not))
+        else null end) | tojson' --arg id "$1"
+}
+
 _xhttp_edit_field() {
-    local _module="$1" _runtime="$2" _field="$3" _label="$4" _raw='' _profile _server
+    local _module="$1" _runtime="$2" _field="$3" _label="$4" _raw _profile _server
     _server=$(_xhttp_server_extra "${_module}") || return 1
-    while prompt "${_label}（空行返回）: " _raw "${_raw}" && [ -n "${_raw}" ]; do
-        _profile=$(st_get '
-            ($path | split(".")) as $field | (.[$inbound_id].xhttp // {}) |
+    while prompt "${_label}（空行返回）: " _raw '' && [ -n "${_raw}" ]; do
+        _profile=$(_xhttp_saved_profile "${_module}" | jq -c '
+            ($path | split(".")) as $field | (. // {}) |
             if $field[0] == "server" then .server //= $server
             elif $field[0] == "client" then .client //= {} | .client.xmux //= {}
             else . end |
@@ -7067,7 +6966,7 @@ _argo_xhttp_menu() {
             4) _argo_xhttp_export_menu; continue ;;
             5) _argo_xhttp_set_profile "${_runtime}" null ;;
             6)
-                _profile=$(st_get '.argo.xhttp | if type == "object" then del(.split) else null end')
+                _profile=$(_xhttp_saved_profile argo | jq -c 'del(.split)')
                 _argo_xhttp_set_profile "${_runtime}" "${_profile:-null}"
                 ;;
             7) _xhttp_edit_common argo "${_runtime}"; continue ;;
@@ -7391,35 +7290,9 @@ unified_menu_vlquic() {
     done
 }
 
-_direct_xhttp_set_profile() {
-    local _module="$1" _runtime="$2" _raw="$3" _profile=null _invalid _label
-    _label=$(module_label "${_module}")
-    if [ "${_raw}" != null ]; then
-        _profile=$(_xhttp_validate_profile "${_raw}") || return 1
-        _invalid=$(jq -r '
-            if has("split") then "split（此字段用于 Argo）"
-            elif (.mode | type | IN("null","string") | not) then "mode"
-            elif (.server | type | IN("null","object") | not) then "server"
-            elif (.client | type | IN("null","object") | not) then "client"
-            else ["server","client"][] as $side | (.[$side] // {}) | keys[] as $key |
-                select($key | IN("path", "mode", "host", "extra", "xhttpModeH3")) | "\($side).\($key)"
-            end
-        ' <<< "${_profile}") || return 1
-        [ -z "${_invalid}" ] || { log_error "${_label} XHTTP 字段无效: ${_invalid}"; return 1; }
-        _profile=$(jq -ce --arg mode "$(st_get '.[$id].xhttp.mode // "stream-one"' --arg id "${_module}")" '.mode //= $mode' <<< "${_profile}") || return 1
-    fi
-    if [ "${_runtime}" = 1 ]; then
-        _transaction_run "更新 Reality XHTTP" _xhttp_apply_profile "${_module}" "${_profile}" || return 1
-        log_ok "${_label} XHTTP 配置已保存"
-    else
-        st_set '.[$id].xhttp = $profile' --arg id "${_module}" --argjson profile "${_profile}" || return 1
-        log_ok "${_label} XHTTP 已写入安装计划"
-    fi
-}
-
-_reality_xhttp_set_profile() { _direct_xhttp_set_profile reality "$@"; }
-_ff_xhttp_set_profile() { _direct_xhttp_set_profile ff "$@"; }
-_vlquic_xhttp_set_profile() { _direct_xhttp_set_profile vlquic "$@"; }
+_reality_xhttp_set_profile() { _xhttp_set_profile reality "$@"; }
+_ff_xhttp_set_profile() { _xhttp_set_profile ff "$@"; }
+_vlquic_xhttp_set_profile() { _xhttp_set_profile vlquic "$@"; }
 
 _ff_xhttp_render_status() { _xhttp_render_status_with_legacy_padding ff; }
 
@@ -7469,32 +7342,7 @@ _reality_xhttp_export_json() {
     _xhttp_export_vless_outbound "${_address}" "$(port_of reality)" "${_stream}"
 }
 
-_cforigin_xhttp_set_profile() {
-    local _runtime="$1" _raw="$2" _profile _invalid
-    if [ "${_raw}" = null ]; then
-        _profile=null
-    else
-        _profile=$(_xhttp_validate_profile "${_raw}") || return 1
-        _invalid=$(jq -r '
-            if has("split") then "split（仅 Argo 支持）"
-            elif (.mode | type | IN("null","string") | not) then "mode"
-            elif (.server | type | IN("null","object") | not) then "server"
-            elif (.client | type | IN("null","object") | not) then "client"
-            elif (.server // {} | has("xhttpModeH3")) then "server.xhttpModeH3（请在上一级用 8 设置）"
-            elif (.client // {} | has("xhttpModeH3")) then "client.xhttpModeH3（请在上一级用 8 设置）"
-            else empty end
-        ' <<< "${_profile}") || return 1
-        [ -z "${_invalid}" ] || { log_error "CF Origin XHTTP 字段无效: ${_invalid}"; return 1; }
-        _profile=$(jq -ce --arg mode "$(st_get '.cforigin.xhttp.mode // "stream-one"')" '.mode //= $mode' <<< "${_profile}") || return 1
-    fi
-    if [ "${_runtime}" = 1 ]; then
-        _transaction_run "更新 CF Origin XHTTP" _xhttp_apply_profile cforigin "${_profile}" || return 1
-        log_ok "CF Origin XHTTP 配置已保存"
-    else
-        st_set '.cforigin.xhttp = $profile' --argjson profile "${_profile}" || return 1
-        log_ok "CF Origin XHTTP 已写入安装计划"
-    fi
-}
+_cforigin_xhttp_set_profile() { _xhttp_set_profile cforigin "$@"; }
 
 _cforigin_xhttp_export_json() {
     local _domain _stream
@@ -7557,7 +7405,7 @@ _direct_xhttp_menu() {
                     '') continue ;;
                     *) log_error "请输入 1–4 选择传输模式"; _pause; continue ;;
                 esac
-                _profile=$(st_get '.[$id].xhttp // {} | .mode = $mode' --arg id "${_module}" --arg mode "${_mode}")
+                _profile=$(_xhttp_saved_profile "${_module}" | jq -c --arg mode "${_mode}" '.mode = $mode')
                 "_${_module}_xhttp_set_profile" "${_runtime}" "${_profile}" || true ;;
             2)
                 log_info 'JSON 字段: mode, server（入站 Extra）, client（客户端 Extra）'
