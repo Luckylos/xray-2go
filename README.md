@@ -16,7 +16,7 @@ Xray-2go 是一个面向 Linux VPS 的交互式 Xray 安装与管理脚本，支
   - VLESS-TCP：明文落地，可配置监听地址
   - SOCKS5：账号密码认证，可配置监听端口与地址
   - HTTP 代理：账号密码认证，可配置监听端口与地址；协议本身为明文 TCP，公开监听前请确认防火墙与网络边界
-  - Shadowsocks 2022：复用 Xray-core 内置实现，支持 AES-128/AES-256 GCM、TCP/UDP 与单用户分享链接
+  - Shadowsocks 2022：复用 Xray-core 内置实现，支持 AES-128-GCM、AES-256-GCM、ChaCha20-Poly1305、TCP/UDP 与节点分享链接
 - 自动生成并打印分享链接
 - 支持修改 UUID、端口、路径、域名、Reality 目标站点等常用参数
 - xPadding 支持按协议独立开关，可实现 Argo 开启、Reality 关闭等组合
@@ -39,9 +39,9 @@ Argo 工作台的“修改入站认证”可在 VLESS 与 Trojan 之间切换：
 Shadowsocks 2022 通过 Xray-core 的 shadowsocks inbound 提供服务，不额外安装独立 Shadowsocks 二进制：
 
 - 默认监听 8388，同时开放 TCP 与 UDP；可在安装计划或运行时工作台修改端口和监听地址
-- 默认方法为 2022-blake3-aes-256-gcm，另支持 2022-blake3-aes-128-gcm；首版不启用 ChaCha20 多用户模式，以匹配当前 Xray-core 的多用户能力
-- 启用时自动生成服务端 PSK 与用户 PSK；切换方法或手动轮换密钥会同时重新生成两者
-- 节点链接使用 SS2022 的双密钥 ss:// 分享格式，链接中的敏感密钥请按密码处理，不要公开发布
+- 新部署默认使用单密钥 `2022-blake3-aes-256-gcm`。工作台 `4` 也可选择单密钥 `2022-blake3-aes-128-gcm` 或 `2022-blake3-chacha20-poly1305`，以及两种 AES-GCM 的双密钥模式
+- 已有双密钥节点升级后保留原密钥和分享链接。选择加密配置或手动轮换密钥会生成新密钥，之后需重新导入节点
+- 单密钥节点使用 SIP002 规定的百分号编码生成 `ss://` 分享链接。请像管理密码一样保管链接
 
 ## 安全与实现原则
 
@@ -105,7 +105,7 @@ sudo ./xray_2go.sh
 
 ### 主控制台快捷键
 
-首页显示 Xray 状态及已启用的内置入站。`1` 查看节点，`2`–`10` 管理入站，`11` 更新 UUID。`d` 打开部署向导，`s` 更新脚本，`u` 进入卸载确认，`0` 退出。
+首页显示 Xray 状态及已启用的内置入站。`1` 查看节点，`2`–`10` 管理入站，`11` 更新 UUID。`d` 打开部署向导，`s` 更新脚本，`x` 升级 Xray 内核，`u` 进入卸载确认，`0` 退出。
 
 `d` 和 `reality` 用于首次部署。重装先用 `u` 完成卸载，再重新部署。安装失败后可以重试，已下载且通过检查的 Xray 可执行文件可在重试时复用。
 
@@ -114,6 +114,12 @@ sudo ./xray_2go.sh
 在主菜单选择 `s`（更新快捷方式/脚本）。脚本会下载官方 `main` 的最新内容，安装为 `/usr/local/bin/xray2go`，并创建 `/usr/local/bin/s`。成功后同一终端会进入新版菜单，重新读取现有状态并加载插件。以后可用 `sudo s` 打开管理菜单。
 
 旧版本的 `s` 若提示自更新已禁用，先按上面的下载方式运行当前 `main`，再在菜单里选择 `s`。如果快捷命令路径已被其他文件占用，菜单会提示冲突。成功替换已有脚本时，上一版保存在 `/usr/local/bin/xray2go.bak`。替换失败或更新过程中收到 `SIGINT`、`SIGTERM` 时会恢复原脚本和原备份。
+
+### 升级 Xray 内核
+
+在主菜单按 `x`。脚本会显示已安装版本和 Xray-core 官方最新稳定版。已有版本相同或更高时直接返回。输入 `y` 后，脚本会校验发布包的 SHA256、下载版本及现有配置，再替换内核。
+
+运行中的 Xray 会短暂重启。若新版启动或健康检查失败，脚本会恢复旧内核并尝试恢复服务。原本停止的服务升级后仍保持停止。
 
 ### Argo XHTTP 配置
 
@@ -139,6 +145,12 @@ sudo ./xray_2go.sh
 自动下行读取本机公网地址和 Reality 的 SNI、公钥及 Short ID。更换密钥后请重新导出。`split.download` 可覆盖对外地址、端口、路径、Host 和安全层。覆盖路径时，转发后的请求仍需进入同一个 `/argo` 入站。`stream-up` 需要沿途支持流式上传，分离默认使用 `packet-up`。
 
 Argo 工作台的 `h` 探测域名根路径，HTTP 请求上限为 15 秒。菜单会显示返回状态码，例如 `404`，并单独提示 `5xx` 和未收到 HTTP 响应。请通过客户端验证节点连通。
+
+### Reality 分享链接与 Mihomo
+
+重新导出的直连 Reality TCP Vision 和 XHTTP 链接包含 `&support-x25519mlkem768=true`。Mihomo v1.19.34 和支持该参数的 MiSub 内置转换器会将它写为 `reality-opts.support-x25519mlkem768: true`。请重新导出并替换订阅源里的旧链接，再刷新客户端订阅。
+
+Argo XHTTP 分离节点可在 Argo 工作台按 `7` → `4` → `2` → `3` 导出 Mihomo 代理提供者配置。将输出保存为 JSON 文件，作为本地 `proxy-provider` 使用，也可把其中的节点加入现有 Mihomo 配置的 `proxies` 列表。下载侧使用 Reality 时，配置会在 `xhttp-opts.download-settings.reality-opts` 下启用该开关。
 
 ### Reality XHTTP 配置
 

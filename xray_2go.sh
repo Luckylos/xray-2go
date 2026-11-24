@@ -105,7 +105,7 @@ trap '_trap_exit' EXIT
 trap '_trap_int'  INT TERM
 
 _trap_exit() {
-    [ -n "${_TXN_DIR:-}" ] && rm -rf "${_TXN_DIR}" 2>/dev/null || true
+    if [ -n "${_TXN_DIR:-}" ]; then log_warn "事务快照保留于：${_TXN_DIR}"; fi
     [ -n "${_G_TMP_DIR:-}" ] && rm -rf "${_G_TMP_DIR}" 2>/dev/null || true
     [ -t 1 ] && tput cnorm 2>/dev/null || true
 }
@@ -116,8 +116,9 @@ _trap_int() {
         wait "${_UPDATE_PID}" 2>/dev/null || true
     fi
     if [ "${_TXN_ACTIVE:-0}" -eq 1 ]; then
-        _transaction_rollback 130 || true
-        _transaction_end || true
+        local _keep_snapshot=0
+        _transaction_rollback || _keep_snapshot=1
+        _transaction_end "${_keep_snapshot}"
     fi
     printf '\n' >&2
     printf '\033[1;91m[ERR ] 已中断\033[0m\n' >&2
@@ -448,6 +449,7 @@ readonly _STATE_DEFAULT='{
     "enabled": false,
     "listen":  "0.0.0.0",
     "method":  "2022-blake3-aes-256-gcm",
+    "key_mode": "single",
     "server_key": "",
     "user_key":   ""
   },
@@ -698,10 +700,7 @@ val_trojan_password() {
 }
 
 ss2022_method_is_valid() {
-    case "$1" in
-        2022-blake3-aes-128-gcm|2022-blake3-aes-256-gcm) return 0 ;;
-        *) return 1 ;;
-    esac
+    ss2022_key_bytes "$1" >/dev/null
 }
 
 val_ss2022_method() {
@@ -713,7 +712,7 @@ val_ss2022_method() {
 ss2022_key_bytes() {
     case "$1" in
         2022-blake3-aes-128-gcm) printf '16' ;;
-        2022-blake3-aes-256-gcm) printf '32' ;;
+        2022-blake3-aes-256-gcm|2022-blake3-chacha20-poly1305) printf '32' ;;
         *) return 1 ;;
     esac
 }
@@ -779,8 +778,28 @@ _st_persist_inner() {
     chmod 600 "${STATE_FILE}" 2>/dev/null || true
 }
 
+# Legacy ownership is proven by an ACME method and the exact managed pair.
+_managed_certificate_domains() {
+    jq -c --arg dir "${_CERT_DIR}" '
+        (._managed_cert_domains | arrays // []) +
+        [(.vlquic, .cforigin) | objects |
+            select(.acme_method == "dns_cf_token" or .acme_method == "dns_cf_key" or .acme_method == "http01") |
+            select((.domain | type) == "string" and .domain != "") |
+            ($dir + "/" + .domain) as $path |
+            select(.cert == ($path + "/fullchain.pem") and .key == ($path + "/privkey.pem")) | .domain] |
+        map(strings) | unique
+    '
+}
+
+_st_track_managed_certificates() {
+    local _domains
+    _domains=$(_managed_certificate_domains <<< "${_G_STATE}") || return 1
+    [ "${_domains}" = '[]' ] || st_set '._managed_cert_domains = $domains' --argjson domains "${_domains}"
+}
+
 st_persist() {
     local _saved
+    _st_track_managed_certificates || return 1
     _saved=$(jq -c . <<< "${_G_STATE}") || return 1
     with_lock _st_persist_inner || return 1
     _G_STATE_DISK="${_saved}"
@@ -917,9 +936,12 @@ _st_normalize_schema() {
     _c=$(st_get '.ss2022.listen')
     { [ -z "$_c" ] || [ "$_c" = "null" ]; } && st_set '.ss2022.listen = "0.0.0.0"'
     _c=$(st_get '.ss2022.method')
-    case "$_c" in
-        2022-blake3-aes-128-gcm|2022-blake3-aes-256-gcm) : ;;
-        *) st_set '.ss2022.method = "2022-blake3-aes-256-gcm"' ;;
+    ss2022_method_is_valid "$_c" || st_set '.ss2022.method = "2022-blake3-aes-256-gcm"'
+    case "$(st_get '.ss2022.key_mode')" in
+        single|dual) : ;;
+        *)
+            # 旧状态只支持双密钥。保留已有节点以及暂时禁用但仍有密钥的节点。
+            st_set '.ss2022 |= (.key_mode = (if .enabled == true or (.user_key // "") != "" then "dual" else "single" end))' ;;
     esac
     _c=$(st_get '.ss2022.server_key')
     { [ "$_c" = "null" ] || [ -z "$_c" ]; } && st_set '.ss2022.server_key = ""'
@@ -962,7 +984,7 @@ _st_normalize_schema() {
     _c=$(st_get '.cforigin.acme_method')
     { [ -z "${_c:-}" ] || [ "${_c}" = "null" ]; } && st_set '.cforigin.acme_method = "manual"'
 
-    return 0
+    _st_track_managed_certificates
 }
 
 _st_read_object() {
@@ -1167,59 +1189,72 @@ _plugin_snapshot_stamp() {
     printf '%s|%s' "${_PLUGIN_REGISTRY[*]}" "${_G_STATE}"
 }
 
+_plugin_port_rules() {
+    local _name="$1" _ports _rule _port _proto
+    _ports=$(plugin_call "${_name}" ports) || { log_error "插件 ports 失败: ${_name}"; return 1; }
+    while IFS= read -r _rule; do
+        [ -n "${_rule}" ] || continue
+        _port="${_rule%/*}"
+        _proto="${_rule#*/}"
+        [[ "${_rule}" == */* ]] || _proto=tcp
+        if [[ ! "${_port}" =~ ^[0-9]+$ ]] || [[ "${_proto}" != tcp && "${_proto}" != udp ]]; then
+            log_error "插件端口格式无效: ${_name}"
+            return 1
+        fi
+        printf '%s/%s\n' "${_port}" "${_proto}"
+    done <<< "${_ports}"
+}
+
 _plugin_snapshot_rebuild() {
-    local _uuid_check _name _p _l _links _ibs _ib _used_exact_keys _used_wild_ports _key
+    local _uuid_check _name _p _l _links _ibs='[]' _ib _rows _port _listen _proto _transports _key _socket
+    local -A _used_ports=() _used_wild_ports=() _used_exact_keys=()
+    _PLUGIN_SNAPSHOT_STAMP=""
     _uuid_check=$(st_get '.uuid')
     if ! val_uuid "${_uuid_check}" >/dev/null 2>&1; then
         log_error "UUID 格式异常，拒绝生成插件快照: ${_uuid_check}"
         return 1
     fi
-
     _PLUGIN_SNAPSHOT_PORTS=""
     _PLUGIN_SNAPSHOT_LINKS=""
-    _ibs='[]'
-    _used_exact_keys=''
-    _used_wild_ports=''
 
     for _name in "${_PLUGIN_REGISTRY[@]}"; do
-        _p=$(plugin_call "${_name}" ports 2>/dev/null) || true
-        [ -n "${_p:-}" ] && _PLUGIN_SNAPSHOT_PORTS+="${_p}"$'\n'
+        _p=$(_plugin_port_rules "${_name}") || return 1
+        [ -z "${_p}" ] || _PLUGIN_SNAPSHOT_PORTS+="${_p}"$'\n'
 
         _l=$(plugin_call "${_name}" link 2>/dev/null) || _l=""
         _links=$(plugin_filter_links "${_name}" <<< "${_l}")
-        [ -n "${_links}" ] && _PLUGIN_SNAPSHOT_LINKS+="${_links}"$'\n'
+        [ -z "${_links}" ] || _PLUGIN_SNAPSHOT_LINKS+="${_links}"$'\n'
         _ib=$(plugin_call "${_name}" inbound 2>/dev/null) || {
             log_error "插件 inbound 失败: ${_name}"; return 1; }
-        [ -n "${_ib:-}" ] || continue
+        [ -n "${_ib}" ] || continue
 
-        local _rows _port _listen
         _rows=$(jq -c 'if type == "array" then .[] else . end' <<< "${_ib}") || {
             log_error "inbounds 组装失败: ${_name}"; return 1; }
         [ -n "${_rows}" ] || continue
         while IFS= read -r _ib; do
-            _port=$(printf '%s' "${_ib}" | jq -r '.port // empty')
-            _listen=$(printf '%s' "${_ib}" | jq -r '.listen // "0.0.0.0"')
-            _key="${_listen}:${_port}"
-
-            if _is_wild_listen "${_listen}"; then
-                if { [ -n "${_used_wild_ports:-}" ] && printf '%s\n' "${_used_wild_ports}" | grep -qxF "${_port}"; } || \
-                   { [ -n "${_used_exact_keys:-}" ] && printf '%s\n' "${_used_exact_keys}" | grep -qE ":${_port}$"; }; then
-                    log_error "端口冲突: ${_key}，插件 [${_name}] 与已启用入站冲突"
-                    return 1
-                fi
-                _used_wild_ports="${_used_wild_ports:+${_used_wild_ports}
-}${_port}"
-            else
-                if { [ -n "${_used_wild_ports:-}" ] && printf '%s\n' "${_used_wild_ports}" | grep -qxF "${_port}"; } || \
-                   { [ -n "${_used_exact_keys:-}" ] && printf '%s\n' "${_used_exact_keys}" | grep -qxF "${_key}"; }; then
-                    log_error "端口冲突: ${_key}，插件 [${_name}] 与已启用入站冲突"
-                    return 1
-                fi
-                _used_exact_keys="${_used_exact_keys:+${_used_exact_keys}
-}${_key}"
+            _port=$(jq -r '.port // empty' <<< "${_ib}") || return 1
+            _listen=$(jq -r '.listen // "0.0.0.0"' <<< "${_ib}") || return 1
+            if [ -n "${_port}" ]; then
+                # 未在插件中声明的监听（例如本地回源）按 TCP 处理。
+                _transports=$(awk -F/ -v port="${_port}" '$1 == port {print $2}' <<< "${_p}" | sort -u)
+                for _proto in ${_transports:-tcp}; do
+                    _socket="${_port}/${_proto}"
+                    _key="${_listen}:${_socket}"
+                    if [ -n "${_used_wild_ports[$_socket]:-}" ] || [ -n "${_used_exact_keys[$_key]:-}" ] ||
+                       { _is_wild_listen "${_listen}" && [ -n "${_used_ports[$_socket]:-}" ]; }; then
+                        log_error "端口冲突: ${_key}，插件 [${_name}] 与已启用入站冲突"
+                        return 1
+                    fi
+                    _used_ports["${_socket}"]=1
+                    if _is_wild_listen "${_listen}"; then
+                        _used_wild_ports["${_socket}"]=1
+                    else
+                        _used_exact_keys["${_key}"]=1
+                    fi
+                done
             fi
 
-            _ibs=$(printf '%s' "${_ibs}" | jq --argjson ib "${_ib}" '. + [$ib]') \
+            _ibs=$(jq --argjson ib "${_ib}" '. + [$ib]' <<< "${_ibs}") \
                 || { log_error "inbounds 组装失败: ${_name}"; return 1; }
         done <<< "${_rows}"
     done
@@ -1240,7 +1275,7 @@ plugin_collect_ports_raw() {
     local _name _ports
     if [ "${1:-}" = preview ]; then
         for _name in "${_PLUGIN_REGISTRY[@]}"; do
-            _ports=$(plugin_call "${_name}" ports) || return 1
+            _ports=$(_plugin_port_rules "${_name}") || return 1
             [ -z "${_ports}" ] || printf '%s\n' "${_ports}"
         done
         return 0
@@ -1305,10 +1340,12 @@ _argo_xhttp_split_active() {
         (.argo.xhttp.split | type == "object")' | grep -qx true
 }
 
-_argo_xhttp_server_extra() {
-    local _legacy='{}'
-    [ "$(xpad_of argo)" != true ] || _legacy="${_XPAD_JSON}"
-    st_get '.argo.xhttp.server // $legacy' --argjson legacy "${_legacy}"
+_xhttp_server_extra() {
+    local _module="$1" _legacy='{}'
+    case "${_module}" in
+        argo|reality|ff) [ "$(xpad_of "${_module}")" != true ] || _legacy="${_XPAD_JSON}" ;;
+    esac
+    st_get '.[$id].xhttp.server // $legacy' --arg id "${_module}" --argjson legacy "${_legacy}"
 }
 
 _xhttp_client_visible_server_extra() {
@@ -1319,60 +1356,65 @@ _xhttp_client_visible_server_extra() {
     )))'
 }
 
+_argo_xhttp_download_settings() {
+    local _profile="$1" _server _address
+    _argo_xhttp_split_active || return 1
+    _server=$(_xhttp_server_extra argo) || return 1
+    _server=$(_xhttp_client_visible_server_extra <<< "${_server}") || return 1
+    _address=$(jq -r '.split.download.address // empty' <<< "${_profile}") || return 1
+    [ -n "${_address}" ] || _address=$(platform_get_realip)
+    _address="${_address#[}"; _address="${_address%]}"
+    [ -n "${_address}" ] || return 1
+    jq -ce --arg address "${_address}" --arg sni "$(st_get '.reality.sni')" \
+        --arg public "$(st_get '.reality.pbk')" --arg sid "$(st_get '.reality.sid')" --argjson server "${_server}" '
+        .split as $split | ($split.download // {} | with_entries(select(.value != null))) as $override |
+        ({network:"xhttp",security:"reality",xhttpSettings:{extra:$server}} * $override) |
+        .address = $address | .port //= $split.port | .xhttpSettings.path //= "/argo" |
+        .xhttpSettings.extra //= $server |
+        if .security == "reality" then
+            .realitySettings = ({serverName:$sni,fingerprint:"chrome",shortId:$sid}
+                + (if ($override.realitySettings // {} | has("publicKey")) then {} else {password:$public} end)
+                + ($override.realitySettings // {})) |
+            select((.realitySettings.password // .realitySettings.publicKey // "") | length > 0)
+        else del(.realitySettings) end
+    ' <<< "${_profile}"
+}
+
 _argo_xhttp_client_stream() {
-    local _kind="$1" _profile _server _address='' _down='{}'
-    _profile=$(st_get '.argo.xhttp // {}') || return 1
-    _server=$(_argo_xhttp_server_extra | _xhttp_client_visible_server_extra) || return 1
+    local _kind="$1" _profile _settings _host _down _mode
+    _host=$(st_get '.argo.domain') || return 1
+    _settings=$(_xhttp_client_settings argo /argo "${_host}") || return 1
     if [ "${_kind}" = split ]; then
-        _argo_xhttp_split_active || return 1
-        _address=$(jq -r '.split.download.address // empty' <<< "${_profile}")
-        [ -n "${_address}" ] || _address=$(platform_get_realip)
-        _address="${_address#[}"; _address="${_address%]}"
-        [ -n "${_address}" ] || return 1
-        _down=$(jq -ce --arg address "${_address}" --arg sni "$(st_get '.reality.sni')" \
-            --arg public "$(st_get '.reality.pbk')" --arg sid "$(st_get '.reality.sid')" \
-            --argjson server "${_server}" '
-            .split as $split | ($split.download // {}) as $override |
-            {address:$address, port:$split.port, network:"xhttp", security:"reality",
-             xhttpSettings:{path:"/argo", extra:$server}} * $override |
-            if .security == "reality" then
-                .realitySettings = ({serverName:$sni, fingerprint:"chrome", shortId:$sid}
-                    + (if ($override.realitySettings // {} | has("publicKey")) then {} else {password:$public} end)
-                    + ($override.realitySettings // {})) |
-                select((.realitySettings.password // .realitySettings.publicKey // "") | length > 0)
-            else del(.realitySettings) end
-        ' <<< "${_profile}") || return 1
+        _profile=$(st_get '.argo.xhttp // {}') || return 1
+        _down=$(_argo_xhttp_download_settings "${_profile}") || return 1
+        _mode=$(jq -r '.split.mode // "packet-up"' <<< "${_profile}") || return 1
+        _settings=$(jq -c --arg mode "${_mode}" --argjson down "${_down}" '
+            .mode = $mode | .extra.downloadSettings = $down
+        ' <<< "${_settings}") || return 1
     fi
-    jq -c --arg split "${_kind}" --arg host "$(st_get '.argo.domain')" \
-        --argjson server "${_server}" --argjson down "${_down}" '
-        ($server * (.client // {})) as $extra |
-        {network:"xhttp", security:"tls", tlsSettings:{serverName:$host,fingerprint:"chrome"},
-         xhttpSettings:{host:$host,path:"/argo",mode:(.mode // "auto")}} |
-        if $split == "split" then
-            .xhttpSettings.mode = ($profile.split.mode // "packet-up") |
-            .xhttpSettings.extra = ($extra + {downloadSettings:$down})
-        elif ($extra | length) > 0 then .xhttpSettings.extra = $extra
-        else . end
-    ' --argjson profile "${_profile}" <<< "${_profile}"
+    jq -c --arg host "${_host}" '
+        {network:"xhttp",security:"tls",tlsSettings:{serverName:$host,fingerprint:"chrome"},xhttpSettings:.}
+    ' <<< "${_settings}"
 }
 
-_xhttp_server_extra_with_legacy_padding() {
-    local _module="$1" _legacy='{}'
-    [ "$(xpad_of "${_module}")" != true ] || _legacy="${_XPAD_JSON}"
-    st_get '.[$id].xhttp.server // $legacy' --arg id "${_module}" --argjson legacy "${_legacy}"
+_xhttp_client_settings() {
+    local _module="$1" _path="$2" _host="${3:-}" _mode=stream-one _profile _server
+    [ "${_module}" != argo ] || _mode=auto
+    _profile=$(st_get '.[$id].xhttp // {}' --arg id "${_module}") || return 1
+    _server=$(_xhttp_server_extra "${_module}") || return 1
+    _server=$(_xhttp_client_visible_server_extra <<< "${_server}") || return 1
+    jq -c --arg path "${_path}" --arg host "${_host}" --arg mode "${_mode}" --argjson server "${_server}" '
+        {path:$path, mode:(.mode // $mode), extra:($server * (.client // {}))} |
+        if $host == "" then . else .host = $host end |
+        if .extra == {} then del(.extra) else . end
+    ' <<< "${_profile}"
 }
 
-_reality_xhttp_server_extra() { _xhttp_server_extra_with_legacy_padding reality; }
-_ff_xhttp_server_extra() { _xhttp_server_extra_with_legacy_padding ff; }
 
 _ff_xhttp_client_stream() {
-    local _server
-    _server=$(_ff_xhttp_server_extra | _xhttp_client_visible_server_extra) || return 1
-    jq -c --arg path "$(st_get '.ff.path')" --arg host "$1" --argjson server "${_server}" '
-        {network:"xhttp",security:"none",
-         xhttpSettings:{host:$host,path:$path,mode:(.mode // "stream-one"),extra:($server * (.client // {}))}} |
-        if (.xhttpSettings.extra | length) == 0 then del(.xhttpSettings.extra) else . end
-    ' <<< "$(st_get '.ff.xhttp // {}')"
+    local _settings
+    _settings=$(_xhttp_client_settings ff "$(st_get '.ff.path')" "$1") || return 1
+    jq -c '{network:"xhttp",security:"none",xhttpSettings:.}' <<< "${_settings}"
 }
 
 _ff_xhttp_link() {
@@ -1388,13 +1430,11 @@ _ff_xhttp_link() {
 }
 
 _vlquic_xhttp_client_stream() {
-    local _server
-    _server=$(st_get '.vlquic.xhttp.server // {}' | _xhttp_client_visible_server_extra) || return 1
-    jq -c --arg domain "$1" --argjson server "${_server}" '
-        {network:"xhttp",security:"tls",tlsSettings:{serverName:$domain,fingerprint:"chrome",alpn:["h3"]},
-         xhttpSettings:{host:$domain,path:"/",mode:(.mode // "stream-one"),extra:($server * (.client // {}))}} |
-        if (.xhttpSettings.extra | length) == 0 then del(.xhttpSettings.extra) else . end
-    ' <<< "$(st_get '.vlquic.xhttp // {}')"
+    local _settings
+    _settings=$(_xhttp_client_settings vlquic / "$1") || return 1
+    jq -c --arg domain "$1" '
+        {network:"xhttp",security:"tls",tlsSettings:{serverName:$domain,fingerprint:"chrome",alpn:["h3"]},xhttpSettings:.}
+    ' <<< "${_settings}"
 }
 
 _vlquic_xhttp_link() {
@@ -1409,21 +1449,17 @@ _vlquic_xhttp_link() {
 }
 
 _reality_xhttp_client_stream() {
-    local _profile _server _public
+    local _settings _public
     _public=$(st_get '.reality.pbk')
     if [ -z "${_public}" ] || [ "${_public}" = null ]; then
         log_warn "请先生成 Reality 密钥，再导出节点"
         return 1
     fi
-    _profile=$(st_get '.reality.xhttp // {}') || return 1
-    _server=$(_reality_xhttp_server_extra | _xhttp_client_visible_server_extra) || return 1
-    jq -c --arg sni "$(st_get '.reality.sni')" --arg public "${_public}" \
-        --arg sid "$(st_get '.reality.sid')" --argjson server "${_server}" '
+    _settings=$(_xhttp_client_settings reality /) || return 1
+    jq -c --arg sni "$(st_get '.reality.sni')" --arg public "${_public}" --arg sid "$(st_get '.reality.sid')" '
         {network:"xhttp", security:"reality",
-         realitySettings:{serverName:$sni, fingerprint:"chrome", password:$public, shortId:$sid},
-         xhttpSettings:{path:"/", mode:(.mode // "stream-one"), extra:($server * (.client // {}))}} |
-        if (.xhttpSettings.extra | length) == 0 then del(.xhttpSettings.extra) else . end
-    ' <<< "${_profile}"
+         realitySettings:{serverName:$sni,fingerprint:"chrome",password:$public,shortId:$sid},xhttpSettings:.}
+    ' <<< "${_settings}"
 }
 
 _reality_xhttp_link() {
@@ -1434,24 +1470,19 @@ _reality_xhttp_link() {
     if [[ "${_ip}" == *:* && "${_ip}" != \[*\] ]]; then _ip="[${_ip}]"; fi
     _mode=$(jq -r '.xhttpSettings.mode' <<< "${_stream}") || return 1
     _extra=$(jq -r '.xhttpSettings.extra // empty | tojson | @uri' <<< "${_stream}") || return 1
-    printf 'vless://%s@%s:%s?encryption=none&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=xhttp&path=%%2F&mode=%s%s#Reality-XHTTP\n' \
+    printf 'vless://%s@%s:%s?encryption=none&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=xhttp&path=%%2F&mode=%s%s&support-x25519mlkem768=true#Reality-XHTTP\n' \
         "$(st_get '.uuid')" "${_ip}" "$(port_of reality)" "$(st_get '.reality.sni')" "$(st_get '.reality.pbk')" \
         "$(st_get '.reality.sid')" "${_mode}" "${_extra:+&extra=${_extra}}"
 }
 
 _cforigin_xhttp_client_stream() {
-    local _profile _server
-    _profile=$(st_get '.cforigin.xhttp // {}') || return 1
-    _server=$(jq -c '.server // {}' <<< "${_profile}" | _xhttp_client_visible_server_extra) || return 1
-    jq -c --arg host "$(st_get '.cforigin.domain')" --arg path "$(st_get '.cforigin.path')" \
-        --arg edge_h3 "$(st_get '.cforigin.edge_h3')" --argjson server "${_server}" '
-        {network:"xhttp", security:"tls", tlsSettings:{serverName:$host,fingerprint:"chrome"},
-         xhttpSettings:{host:$host,path:$path,mode:(.mode // "stream-one"),extra:($server * (.client // {}))}} |
-        if $edge_h3 == "true" then
-            .tlsSettings.alpn = ["h3"] | .xhttpSettings.extra.xhttpModeH3 = true
-        elif (.xhttpSettings.extra | length) == 0 then del(.xhttpSettings.extra)
-        else . end
-    ' <<< "${_profile}"
+    local _settings _host
+    _host=$(st_get '.cforigin.domain') || return 1
+    _settings=$(_xhttp_client_settings cforigin "$(st_get '.cforigin.path')" "${_host}") || return 1
+    jq -c --arg host "${_host}" --arg edge_h3 "$(st_get '.cforigin.edge_h3')" '
+        {network:"xhttp",security:"tls",tlsSettings:{serverName:$host,fingerprint:"chrome"},xhttpSettings:.} |
+        if $edge_h3 == "true" then .tlsSettings.alpn = ["h3"] else . end
+    ' <<< "${_settings}"
 }
 
 _cforigin_xhttp_link() {
@@ -1463,7 +1494,10 @@ _cforigin_xhttp_link() {
     _penc=$(urlencode_path "$(st_get '.cforigin.path')")
     _stream=$(_cforigin_xhttp_client_stream) || return 1
     _mode=$(jq -r '.xhttpSettings.mode' <<< "${_stream}") || return 1
-    _extra=$(jq -r '.xhttpSettings.extra // empty | tojson | @uri' <<< "${_stream}") || return 1
+    _extra=$(jq -r '
+        if .tlsSettings.alpn == ["h3"] then .xhttpSettings.extra.xhttpModeH3 = true else . end |
+        .xhttpSettings.extra // empty | tojson | @uri
+    ' <<< "${_stream}") || return 1
     _tag="CF-Origin-XHTTP"
     if [ "$(st_get '.cforigin.edge_h3')" = true ]; then
         _alpn='&alpn=h3'
@@ -1536,7 +1570,7 @@ _plg_argo_inbound() {
         trojan:*)
             log_error "Trojan Argo 当前仅支持 WS 传输"; return 1 ;;
         vless:xhttp)
-            _xpad=$(_argo_xhttp_server_extra) || return 1
+            _xpad=$(_xhttp_server_extra argo) || return 1
             _origin=$(jq -n --argjson port "${_port}" --arg uuid "${_uuid}" --argjson x "${_xpad}" '{
                 port:$port, listen:"127.0.0.1", protocol:"vless",
                 settings:{clients:[{id:$uuid}], decryption:"none"},
@@ -1639,7 +1673,7 @@ _plg_ff_inbound() {
                     httpupgradeSettings:{path:$path}}}' ;;
         xhttp)
             _mode=$(st_get '.ff.xhttp.mode // "stream-one"') || return 1
-            _extra=$(_ff_xhttp_server_extra) || return 1
+            _extra=$(_xhttp_server_extra ff) || return 1
             jq -n --argjson port "${_port}" --arg uuid "${_uuid}" --arg path "${_path}" \
                    --arg mode "${_mode}" --argjson x "${_extra}" '{
                 port:$port, listen:"::", protocol:"vless",
@@ -1724,7 +1758,7 @@ _plg_reality_inbound() {
     case "${_net}" in
         xhttp)
             _mode=$(st_get '.reality.xhttp.mode // "stream-one"') || return 1
-            _extra=$(_reality_xhttp_server_extra) || return 1
+            _extra=$(_xhttp_server_extra reality) || return 1
             jq -n --argjson port "${_port}" --arg uuid "${_uuid}" \
                    --arg sni "${_sni}" --arg pvk "${_pvk}" --arg sid "${_sid}" \
                    --arg mode "${_mode}" --argjson x "${_extra}" '{
@@ -1756,7 +1790,7 @@ _plg_reality_link() {
     fi
     _ip=$(platform_get_realip)
     [ -n "${_ip}" ] || { log_warn "无法获取服务器 IP，Reality 节点已跳过"; return 0; }
-    printf 'vless://%s@%s:%s?encryption=none&flow=xtls-rprx-vision&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=tcp&headerType=none#Reality-Vision\n' \
+    printf 'vless://%s@%s:%s?encryption=none&flow=xtls-rprx-vision&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=tcp&headerType=none&support-x25519mlkem768=true#Reality-Vision\n' \
         "$(st_get '.uuid')" "${_ip}" "$(port_of reality)" "$(st_get '.reality.sni')" "${_rpbk}" "$(st_get '.reality.sid')"
 }
 PLUGIN_EOF
@@ -1821,30 +1855,31 @@ _plg_ss2022_ports() {
 
 _plg_ss2022_inbound() {
     _plg_ss2022_enabled || return 0
-    local _port _listen _method _server _user
+    local _port _listen _method _key_mode _server _user
     _port=$(port_of ss2022)
     _listen=$(st_get '.ss2022.listen')
     _method=$(st_get '.ss2022.method')
+    _key_mode=$(st_get '.ss2022.key_mode')
     _server=$(st_get '.ss2022.server_key')
     _user=$(st_get '.ss2022.user_key')
-    val_ss2022_method "$_method" >/dev/null || return 1
-    val_ss2022_key "$_method" "$_server" >/dev/null || return 1
-    val_ss2022_key "$_method" "$_user" >/dev/null || return 1
+    _ss2022_validate_credentials "$_method" "$_key_mode" "$_server" "$_user" || return 1
     jq -n --argjson port "$_port" --arg listen "$_listen" --arg method "$_method" \
-        --arg server "$_server" --arg user "$_user" '{
+        --arg server "$_server" --arg user "$_user" --arg key_mode "$_key_mode" '{
         port:$port, listen:$listen, protocol:"shadowsocks",
-        settings:{method:$method, password:$server, network:"tcp,udp",
-            clients:[{password:$user, email:"xray2go-ss2022", level:0}]}
+        settings: ({method:$method, password:$server, network:"tcp,udp"} +
+            if $key_mode == "dual" then {clients:[{password:$user, email:"xray2go-ss2022", level:0}]} else {} end)
     }'
 }
 
 _plg_ss2022_link() {
     _plg_ss2022_enabled || return 0
-    local _listen _host _port _method _server _user _raw _encoded
+    local _listen _host _port _method _key_mode _server _user _raw _encoded
     _listen=$(st_get '.ss2022.listen')
     _method=$(st_get '.ss2022.method')
     _server=$(st_get '.ss2022.server_key')
     _user=$(st_get '.ss2022.user_key')
+    _key_mode=$(st_get '.ss2022.key_mode')
+    _ss2022_validate_credentials "$_method" "$_key_mode" "$_server" "$_user" || return 1
     _port=$(port_of ss2022)
     if [ "$_listen" = "0.0.0.0" ] || [ "$_listen" = "::" ]; then
         _host=$(platform_get_realip)
@@ -1860,8 +1895,13 @@ _plg_ss2022_link() {
             esac
             ;;
     esac
-    _raw=$(printf '%s:%s:%s' "$_method" "$_server" "$_user")
-    _encoded=$(printf '%s' "$_raw" | base64 | tr '+/' '-_' | tr -d '=\n')
+    if [ "$_key_mode" = dual ]; then
+        # 保留存量双密钥节点的分享格式。
+        _raw=$(printf '%s:%s:%s' "$_method" "$_server" "$_user")
+        _encoded=$(printf '%s' "$_raw" | base64 | tr '+/' '-_' | tr -d '=\n')
+    else
+        _encoded="$_method:$(urlencode_path "$_server")"
+    fi
     printf 'ss://%s@%s:%s#Shadowsocks-2022\n' "$_encoded" "$_host" "$_port"
 }
 PLUGIN_EOF
@@ -2057,7 +2097,7 @@ _plg_vlquic_inbound() {
     [ -n "${_domain:-}" ] && [ -n "${_cert:-}" ] && [ -n "${_key:-}" ] || {
         log_error "VLESS-XHTTP-H3 缺少域名或证书路径"; return 1; }
     _mode=$(st_get '.vlquic.xhttp.mode // "stream-one"') || return 1
-    _extra=$(st_get '.vlquic.xhttp.server // {}') || return 1
+    _extra=$(_xhttp_server_extra vlquic) || return 1
     jq -n --argjson port "${_port}" --arg listen "${_listen}" --arg uuid "${_uuid}" \
           --arg domain "${_domain}" --arg cert "${_cert}" --arg key "${_key}" \
           --arg mode "${_mode}" --argjson server "${_extra}" '{
@@ -2085,20 +2125,16 @@ PLUGIN_EOF
 
 # 汇总所有插件的期望防火墙规则（格式：port/proto）
 fw_desired_rules() {
-    local _p _port _proto
-    plugin_collect_ports_raw "$@" | while IFS= read -r _p; do
-        [ -n "${_p:-}" ] || continue
-        case "${_p}" in
-            */udp) _port=${_p%/*}; _proto=udp ;;
-            */tcp) _port=${_p%/*}; _proto=tcp ;;
-            *)     _port=${_p};    _proto=tcp ;;
-        esac
-        printf '%s' "${_port}" | grep -qE '^[0-9]+$' || continue
-        printf '%s/%s\n' "${_port}" "${_proto}"
-    done | sort -u
+    local _rules
+    _rules=$(plugin_collect_ports_raw "$@") || return 1
+    [ -z "${_rules}" ] || sort -u <<< "${_rules}"
 }
 
-fw_desired_ports() { fw_desired_rules | cut -d/ -f1 | sort -un; }
+fw_desired_ports() {
+    local _rules
+    _rules=$(fw_desired_rules "$@") || return 1
+    [ -z "${_rules}" ] || cut -d/ -f1 <<< "${_rules}" | sort -un
+}
 
 _fw_read_managed() {
     grep -E '^[0-9]+$' "${_FW_PORTS_FILE}" 2>/dev/null | sort -un || true
@@ -2402,7 +2438,7 @@ svc_is_enabled() {
 
 svc_reload_daemon() {
     is_systemd && [ "${_G_SYSD_DIRTY}" -eq 1 ] || return 0
-    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl daemon-reload >/dev/null 2>&1 || { log_error "刷新 systemd 服务单元失败"; return 1; }
     _G_SYSD_DIRTY=0
 }
 
@@ -2458,7 +2494,7 @@ svc_reload_xray() {
     # 进程仍在运行，但 unit 文件不存在时，systemctl restart 会直接失败。
     # 因此每次重载配置前都先确保托管服务单元存在并刷新 daemon。
     svc_apply_xray || { log_error "xray2go 服务单元写入失败"; return 1; }
-    svc_reload_daemon
+    svc_reload_daemon || return 1
     if [ "${_TXN_ACTIVE}" -eq 1 ]; then
         _TXN_XRAY_RESTART_ATTEMPTED=1
     fi
@@ -2545,7 +2581,10 @@ svc_apply_tunnel() {
 svc_restart_xray() {
     [ -f "${CONFIG_FILE}" ] || { log_error "配置文件不存在"; return 1; }
     svc_apply_xray || { log_error "xray2go 服务单元写入失败"; return 1; }
-    svc_reload_daemon
+    svc_reload_daemon || return 1
+    if [ "${_TXN_ACTIVE}" -eq 1 ]; then
+        _TXN_XRAY_RESTART_ATTEMPTED=1
+    fi
     svc_exec_mut restart "${_SVC_XRAY}" \
         && { log_ok "${_SVC_XRAY} 已重启"; svc_verify_health "${_SVC_XRAY}" 6; } \
         || { log_error "${_SVC_XRAY} 重启失败"; return 1; }
@@ -2877,6 +2916,7 @@ _transaction_restore_service() {
     fi
     if [ "${_was_active}" = 1 ] && [ "${_is_active}" = 0 ]; then
         svc_exec_mut start "${_name}" >/dev/null 2>&1 || return 1
+        svc_exec status "${_name}" >/dev/null 2>&1 || return 1
     elif [ "${_was_active}" = 1 ] && [ "${_reload}" = 1 ]; then
         svc_exec_mut restart "${_name}" >/dev/null 2>&1 || return 1
         svc_exec status "${_name}" >/dev/null 2>&1 || return 1
@@ -2896,7 +2936,7 @@ _transaction_rollback() {
     if _transaction_restore_files "${_restore_fw}"; then
         _reload="${_TXN_XRAY_RESTART_ATTEMPTED}"
         _G_SYSD_DIRTY=1
-        svc_reload_daemon
+        svc_reload_daemon || _failed=1
     else
         _failed=1
     fi
@@ -2922,9 +2962,14 @@ _transaction_rollback() {
 }
 
 _transaction_end() {
+    local _keep_snapshot="$1"
     _TXN_ACTIVE=0
+    if [ "${_keep_snapshot}" -eq 1 ]; then
+        log_error "事务回滚未完全成功，快照保留于：${_TXN_DIR}"
+    elif ! rm -rf -- "${_TXN_DIR}"; then
+        log_warn "事务快照清理失败：${_TXN_DIR}"
+    fi
     _transaction_lock_release
-    [ -n "${_TXN_DIR:-}" ] && rm -rf "${_TXN_DIR}" 2>/dev/null || true
     _TXN_DIR=""
     _TXN_PRE_STATE=""
     _TXN_PRE_FW_FILE=""
@@ -2932,7 +2977,7 @@ _transaction_end() {
 }
 
 _transaction_run() {
-    local _label="$1" _rc=0
+    local _label="$1" _rc=0 _keep_snapshot=0
     shift
     if [ "${_TXN_ACTIVE:-0}" -eq 1 ]; then
         "$@"
@@ -2942,38 +2987,36 @@ _transaction_run() {
     "$@" || _rc=$?
     if [ "${_rc}" -ne 0 ]; then
         _transaction_rollback || {
-            log_error "${_label} 失败，事务回滚未完全成功"
+            log_error "${_label} 失败"
+            _keep_snapshot=1
             _rc=1
         }
     fi
-    _transaction_end
+    _transaction_end "${_keep_snapshot}"
     return "${_rc}"
 }
 
-# 组合提交：config_apply + st_persist + fw_reconcile
+_commit_state_and_firewall() {
+    st_persist || { log_error "state.json 写入失败，拒绝同步防火墙以避免状态漂移"; return 1; }
+    fw_reconcile || return 1
+}
+
 _commit_inner() {
     config_apply || return 1
-    st_persist   || { log_error "state.json 写入失败，拒绝同步防火墙以避免状态漂移"; return 1; }
-    fw_reconcile || return 1
+    _commit_state_and_firewall
 }
 _commit() { _transaction_run "配置提交" _commit_inner "$@"; }
 
 _module_disable_commit_inner() {
     local _name="$1"
-    config_apply || return 1
-    st_persist   || { log_error "state.json 写入失败，拒绝同步防火墙以避免状态漂移"; return 1; }
-    # 模块禁用/卸载后必须删除对应托管防火墙端口，而不是只让服务不再监听。
-    # fw_reconcile 根据当前启用插件重新计算期望端口，并删除托管规则中不再期望的规则。
-    fw_reconcile || return 1
+    _commit_inner || return 1
     log_info "${_name} 防火墙端口已从托管规则中删除"
 }
 _module_disable_commit() { _transaction_run "模块禁用提交" _module_disable_commit_inner "$@"; }
 
 _module_enable_commit_inner() {
     local _id="$1"
-    config_apply || return 1
-    st_persist   || { log_error "state.json 写入失败，拒绝同步防火墙以避免状态漂移"; return 1; }
-    fw_reconcile || return 1
+    _commit_inner || return 1
     log_ok "$(module_label "${_id}") 已启用"
     config_print_nodes "${_id}" || true
 }
@@ -3173,33 +3216,60 @@ module_socks_disable() {
     module_socks_action disable
 }
 
-_module_ss2022_enable_prepare() {
-    local _method _server _user
-    _method=$(st_get '.ss2022.method')
+_ss2022_validate_key_mode() {
+    case "$2:$1" in
+        single:*|dual:2022-blake3-aes-128-gcm|dual:2022-blake3-aes-256-gcm) return 0 ;;
+        *) log_error "SS2022 加密方法不支持所选密钥模式"; return 1 ;;
+    esac
+}
+
+_ss2022_validate_credentials() {
+    local _method="$1" _key_mode="$2" _server="$3" _user="$4"
+    _ss2022_validate_key_mode "$_method" "$_key_mode" || return 1
+    val_ss2022_key "$_method" "$_server" >/dev/null || return 1
+    if [ "$_key_mode" = dual ]; then
+        val_ss2022_key "$_method" "$_user" >/dev/null || return 1
+    fi
+}
+
+_ss2022_prepare_credentials() {
+    local _method="$1" _key_mode="$2" _server="${3:-}" _user="${4:-}"
     val_ss2022_method "$_method" >/dev/null || return 1
-    _server=$(st_get '.ss2022.server_key')
-    _user=$(st_get '.ss2022.user_key')
-    if [ -z "$_server" ] || ! val_ss2022_key "$_method" "$_server" >/dev/null 2>&1; then
+    _ss2022_validate_key_mode "$_method" "$_key_mode" || return 1
+    if ! val_ss2022_key "$_method" "$_server" >/dev/null 2>&1; then
         _server=$(crypto_gen_ss2022_key "$_method") || return 1
     fi
-    if [ -z "$_user" ] || ! val_ss2022_key "$_method" "$_user" >/dev/null 2>&1; then
+    if [ "$_key_mode" = single ]; then
+        _user=""
+    elif ! val_ss2022_key "$_method" "$_user" >/dev/null 2>&1; then
         _user=$(crypto_gen_ss2022_key "$_method") || return 1
     fi
-    st_set '.ss2022.enabled = true | .ss2022.server_key = $s | .ss2022.user_key = $u' \
-        --arg s "$_server" --arg u "$_user"
+    jq -nc --arg m "$_method" --arg k "$_key_mode" --arg s "$_server" --arg u "$_user" \
+        '{method:$m, key_mode:$k, server_key:$s, user_key:$u}'
+}
+
+_module_ss2022_enable_prepare() {
+    local _credentials
+    _credentials=$(_ss2022_prepare_credentials "$(st_get '.ss2022.method')" "$(st_get '.ss2022.key_mode')" \
+        "$(st_get '.ss2022.server_key')" "$(st_get '.ss2022.user_key')") || return 1
+    st_set '.ss2022 += ($credentials + {enabled:true})' --argjson credentials "$_credentials"
 }
 
 module_ss2022_enable() {
     _module_enable_transaction ss2022 _module_ss2022_enable_prepare
 }
 
+_ss2022_disable_state() {
+    st_set '.ss2022.enabled = false'
+}
+
 module_ss2022_disable() {
-    _module_disable_transaction "Shadowsocks 2022" st_set '.ss2022.enabled = false' || return 1
+    _module_disable_transaction "Shadowsocks 2022" _ss2022_disable_state || return 1
     log_ok "Shadowsocks 2022 已禁用"
 }
 
 module_ss2022_uninstall() {
-    _module_disable_transaction "Shadowsocks 2022" st_set '.ss2022.enabled = false | .ss2022.listen = "0.0.0.0" | .ss2022.method = "2022-blake3-aes-256-gcm" | .ss2022.server_key = "" | .ss2022.user_key = "" | .ports.ss2022 = 8388' || return 1
+    _module_disable_transaction "Shadowsocks 2022" st_set '.ss2022.enabled = false | .ss2022.listen = "0.0.0.0" | .ss2022.method = "2022-blake3-aes-256-gcm" | .ss2022.key_mode = "single" | .ss2022.server_key = "" | .ss2022.user_key = "" | .ports.ss2022 = 8388' || return 1
     log_ok "Shadowsocks 2022 已卸载"
 }
 
@@ -3211,49 +3281,57 @@ module_ss2022_update_listen() {
     module_update_listen_action ss2022
 }
 
-_module_ss2022_update_method_inner() {
-    local _method="$1" _server="$2" _user="$3"
-    st_set '.ss2022.method = $m | .ss2022.server_key = $s | .ss2022.user_key = $u' \
-        --arg m "${_method}" --arg s "${_server}" --arg u "${_user}" || return 1
-    _module_apply_if_enabled "$(st_get '.ss2022.enabled')" || return 1
-    st_persist || { log_error "state.json 写入失败"; return 1; }
+_ss2022_select_method() {
+    local _context="$1" _choice _method _key_mode=single
+    echo ""
+    printf "  1. 2022-blake3-aes-256-gcm [单密钥，默认]\n"
+    printf "  2. 2022-blake3-aes-128-gcm [单密钥]\n"
+    printf "  3. 2022-blake3-chacha20-poly1305 [单密钥]\n"
+    printf "  4. 2022-blake3-aes-256-gcm [双密钥]\n"
+    printf "  5. 2022-blake3-aes-128-gcm [双密钥]\n"
+    prompt "加密方法与密钥模式（回车保持当前设置）: " _choice || return 1
+    case "$_choice" in
+        "") return 0 ;;
+        1) _method="2022-blake3-aes-256-gcm" ;;
+        2) _method="2022-blake3-aes-128-gcm" ;;
+        3) _method="2022-blake3-chacha20-poly1305" ;;
+        4) _method="2022-blake3-aes-256-gcm"; _key_mode=dual ;;
+        5) _method="2022-blake3-aes-128-gcm"; _key_mode=dual ;;
+        *) log_error "无效的 SS2022 加密选项"; return 1 ;;
+    esac
+    if [ "$_context" = runtime ]; then
+        _module_ss2022_apply_credentials "$_method" "$_key_mode"
+    else
+        install_plan_ss2022_regenerate_keys "$_method" "$_key_mode"
+    fi
+}
+
+_ss2022_update_credentials() {
+    local _context="$1" _credentials
+    shift
+    if [ "$#" -eq 0 ]; then
+        set -- "$(st_get '.ss2022.method')" "$(st_get '.ss2022.key_mode')"
+    fi
+    _credentials=$(_ss2022_prepare_credentials "$@") || return 1
+    if [ "$_context" = runtime ]; then
+        _module_save_fields_inner ss2022 '.ss2022 += $credentials' --argjson credentials "$_credentials"
+    else
+        st_set '.ss2022 += $credentials' --argjson credentials "$_credentials"
+    fi
+}
+
+_module_ss2022_apply_credentials() {
+    _module_update_state_transaction "SS2022 密钥更新" _ss2022_update_credentials runtime "$@" || return 1
+    log_ok "SS2022 密钥已重新生成"
+    if [ "$(st_get '.ss2022.enabled')" = true ]; then config_print_nodes ss2022 || true; fi
 }
 
 module_ss2022_update_method() {
-    local _cur _choice _method _server _user
-    _cur=$(st_get '.ss2022.method')
-    echo ""
-    printf "  1. 2022-blake3-aes-256-gcm [默认，32 字节密钥]\\n"
-    printf "  2. 2022-blake3-aes-128-gcm [16 字节密钥]\\n"
-    prompt "加密方法（回车保持 $_cur）: " _choice || return 1
-    [ -n "$_choice" ] || return 0
-    case "$_choice" in
-        1) _method="2022-blake3-aes-256-gcm" ;;
-        2) _method="2022-blake3-aes-128-gcm" ;;
-        *) log_error "无效的 SS2022 加密方法"; return 1 ;;
-    esac
-    _server=$(crypto_gen_ss2022_key "$_method") || return 1
-    _user=$(crypto_gen_ss2022_key "$_method") || return 1
-    _module_update_state_transaction "SS2022 加密方法更新" _module_ss2022_update_method_inner \
-        "${_method}" "${_server}" "${_user}" || return 1
-    log_ok "SS2022 加密方法已更新为 $_method（已重新生成密钥）"
-    if [ "$(st_get '.ss2022.enabled')" = true ]; then config_print_nodes ss2022 || true; fi
-}
-
-_module_ss2022_regenerate_keys_inner() {
-    local _method _server _user
-    _method=$(st_get '.ss2022.method')
-    val_ss2022_method "${_method}" >/dev/null || return 1
-    _server=$(crypto_gen_ss2022_key "${_method}") || return 1
-    _user=$(crypto_gen_ss2022_key "${_method}") || return 1
-    _module_save_fields_inner ss2022 '.ss2022.server_key = $s | .ss2022.user_key = $u' \
-        --arg s "${_server}" --arg u "${_user}"
+    _ss2022_select_method runtime
 }
 
 module_ss2022_regenerate_keys() {
-    _module_update_state_transaction "SS2022 密钥轮换" _module_ss2022_regenerate_keys_inner || return 1
-    log_ok "SS2022 服务端/用户密钥已重新生成"
-    if [ "$(st_get '.ss2022.enabled')" = true ]; then config_print_nodes ss2022 || true; fi
+    _module_ss2022_apply_credentials
 }
 
 module_http_action() {
@@ -3547,7 +3625,7 @@ module_argo_enable_inner() {
     st_set '.argo.enabled = true' || return 1
     config_apply || return 1
     svc_apply_tunnel || return 1
-    svc_reload_daemon
+    svc_reload_daemon || return 1
     svc_exec_mut enable "${_SVC_TUNNEL}" || {
         log_error "Argo 服务启用失败"
         return 1
@@ -3560,7 +3638,7 @@ module_argo_enable_inner() {
         log_error "Argo 健康检查失败，请检查域名和 Tunnel 认证"
         return 1
     }
-    st_persist || { log_error "state.json 写入失败"; return 1; }
+    _commit_state_and_firewall || return 1
     log_ok "Argo 已启用并启动"
 }
 
@@ -3600,29 +3678,39 @@ module_argo_uninstall() {
     _transaction_run "Argo 卸载" module_argo_uninstall_inner "$@"
 }
 
-_module_argo_update_protocol_impl() {
-    local _en _proto _pp
-    _en=$(st_get '.argo.enabled')
-    _proto=$(st_get '.argo.protocol')
-    [ "${_en}" = "true" ] || { log_warn "请先选项 1 启用 Argo"; return 1; }
+_argo_read_transport() {
+    local _current="$1" _output="$2" _option _transport
     echo ""
-    printf "  ${C_GRN}1.${C_RST} WS ${C_YLW}[默认]${C_RST}\n"
-    printf "  ${C_GRN}2.${C_RST} XHTTP\n"
-    prompt "协议 (回车维持 ${_proto}): " _pp || return 1
-    case "${_pp:-}" in
+    printf "  ${C_GRN}1.${C_RST} WS
+"
+    printf "  ${C_GRN}2.${C_RST} XHTTP
+"
+    prompt "协议 (回车维持 ${_current}): " _option || return 1
+    case "${_option:-}" in
+        '') _transport="${_current}" ;;
+        1) _transport=ws ;;
         2)
-            [ "$(st_get '.argo.auth_protocol')" = "trojan" ] && {
-                log_error "当前入站认证为 Trojan，仅支持 WS；请先将入站认证改回 VLESS"; return 1; }
-            st_set '.argo.protocol = "xhttp"' ;;
-        1) st_set '.argo.protocol = "ws"' ;;
-        '') : ;;
+            if [ "$(st_get '.argo.auth_protocol')" = trojan ]; then
+                log_error "当前入站认证为 Trojan，仅支持 WS；请先将入站认证改回 VLESS"
+                return 1
+            fi
+            _transport=xhttp ;;
         *) log_error "无效选项，请按提示输入"; return 1 ;;
     esac
-    argo_apply_fixed_tunnel_from_state || {
-        st_set '.argo.protocol = $v' --arg v "${_proto}" || true
-        log_error "固定隧道同步失败，已回滚传输协议为 ${_proto}"
-        return 1
-    }
+    printf -v "${_output}" '%s' "${_transport}"
+}
+
+_module_argo_update_protocol_impl() {
+    local _old _new
+    [ "$(st_get '.argo.enabled')" = true ] || { log_warn "请先选项 1 启用 Argo"; return 1; }
+    _old=$(st_get '.argo.protocol')
+    _argo_read_transport "${_old}" _new || return 1
+    if [ "${_new}" = "${_old}" ]; then
+        _argo_update_changed=0
+        return 0
+    fi
+    st_set '.argo.protocol = $v' --arg v "${_new}" || return 1
+    argo_apply_fixed_tunnel_from_state || return 1
     config_print_nodes argo || true
 }
 
@@ -4055,42 +4143,24 @@ export CF_Key CF_Email
 }
 
 acme_install_cert() {
-    local _domain="$1" _method="${2:-manual}"
-    # 证书安装阶段只落盘证书，不重启 xray2go。
-    # 调用方随后会写入 vlquic state、合成 config，再由 config_apply 统一重启。
-    # 若此处提前 restart，服务会加载旧配置，可能中断当前 SSH/代理连接且模块未完成启用。
-    "${HOME}/.acme.sh/acme.sh" --install-cert -d "${_domain}" --ecc \
-        --fullchain-file "${_CERT_DIR}/${_domain}/fullchain.pem" \
-        --key-file "${_CERT_DIR}/${_domain}/privkey.pem" \
-        || { log_error "证书安装失败"; return 1; }
-    chmod 700 "${_CERT_DIR}/${_domain}" 2>/dev/null || true
-    chmod 600 "${_CERT_DIR}/${_domain}/privkey.pem" 2>/dev/null || true
-    chmod 644 "${_CERT_DIR}/${_domain}/fullchain.pem" 2>/dev/null || true
-    st_set '.vlquic.domain = $d | .vlquic.cert = $c | .vlquic.key = $k | .vlquic.acme_method = $m' \
-        --arg d "${_domain}" \
-        --arg c "${_CERT_DIR}/${_domain}/fullchain.pem" \
-        --arg k "${_CERT_DIR}/${_domain}/privkey.pem" \
-        --arg m "${_method}"
+    acme_install_cert_to_state vlquic "$@"
 }
 
 acme_install_cert_to_state() {
-    local _prefix="$1" _domain="$2" _method="${3:-manual}"
+    local _module="$1" _domain="$2" _method="${3:-manual}" _dir
+    case "${_module}" in vlquic|cforigin) : ;; *) return 1 ;; esac
+    val_domain "${_domain}" >/dev/null || return 1
+    _dir="${_CERT_DIR}/${_domain}"
+    # Config is applied only after the certificate and state have both been prepared.
     "${HOME}/.acme.sh/acme.sh" --install-cert -d "${_domain}" --ecc \
-        --fullchain-file "${_CERT_DIR}/${_domain}/fullchain.pem" \
-        --key-file "${_CERT_DIR}/${_domain}/privkey.pem" \
+        --fullchain-file "${_dir}/fullchain.pem" --key-file "${_dir}/privkey.pem" \
         || { log_error "证书安装失败"; return 1; }
-    chmod 700 "${_CERT_DIR}/${_domain}" 2>/dev/null || true
-    chmod 600 "${_CERT_DIR}/${_domain}/privkey.pem" 2>/dev/null || true
-    chmod 644 "${_CERT_DIR}/${_domain}/fullchain.pem" 2>/dev/null || true
-    case "${_prefix}" in
-        cforigin)
-            st_set '.cforigin.domain = $d | .cforigin.cert = $c | .cforigin.key = $k | .cforigin.acme_method = $m' \
-                --arg d "${_domain}" \
-                --arg c "${_CERT_DIR}/${_domain}/fullchain.pem" \
-                --arg k "${_CERT_DIR}/${_domain}/privkey.pem" \
-                --arg m "${_method}" ;;
-        *) log_error "未知证书状态前缀: ${_prefix}"; return 1 ;;
-    esac
+    chmod 700 "${_dir}" 2>/dev/null || true
+    chmod 600 "${_dir}/privkey.pem" 2>/dev/null || true
+    chmod 644 "${_dir}/fullchain.pem" 2>/dev/null || true
+    st_set '.[$inbound_id] += {domain:$domain,cert:($dir+"/fullchain.pem"),key:($dir+"/privkey.pem"),acme_method:$method} |
+            ._managed_cert_domains = (((._managed_cert_domains | arrays // []) + [$domain]) | unique)' \
+        --arg inbound_id "${_module}" --arg domain "${_domain}" --arg dir "${_dir}" --arg method "${_method}"
 }
 
 acme_issue_http01() {
@@ -4396,7 +4466,7 @@ argo_apply_fixed_tunnel() {
 
     _svc_write_argo_env || return 1
     svc_apply_tunnel || return 1
-    svc_reload_daemon
+    svc_reload_daemon || return 1
     svc_exec_mut enable "${_SVC_TUNNEL}" 2>/dev/null || true
     config_apply  || return 1
     st_persist    || { log_error "state.json 写入失败"; return 1; }
@@ -4450,12 +4520,12 @@ _argo_prepare_fixed_tunnel_from_state() {
 argo_apply_fixed_tunnel_from_state() {
     _argo_prepare_fixed_tunnel_from_state || return 1
     svc_apply_tunnel || return 1
-    svc_reload_daemon
+    svc_reload_daemon || return 1
     svc_exec_mut enable "${_SVC_TUNNEL}" 2>/dev/null || true
     config_apply || return 1
     _TXN_TUNNEL_RESTART_ATTEMPTED=1
     svc_exec_mut restart "${_SVC_TUNNEL}" || { log_error "tunnel 重启失败"; return 1; }
-    st_persist || { log_error "state.json 写入失败"; return 1; }
+    _commit_state_and_firewall || return 1
     log_ok "固定隧道本地配置已同步 (domain=$(st_get '.argo.domain'))"
 }
 
@@ -4487,10 +4557,11 @@ _module_argo_update_auth_impl() {
 }
 
 module_argo_update_action() {
+    local _argo_update_changed=1
     case "${1:-}" in
         protocol|auth_protocol|trojan_password|domain|auth)
             _transaction_run "更新 Argo" "_module_argo_update_$1"_impl || return 1
-            argo_check_health || true ;;
+            [ "${_argo_update_changed}" -eq 0 ] || argo_check_health || true ;;
         *)
             log_error "未知 Argo 字段动作: ${1:-}"
             return 1
@@ -4542,7 +4613,7 @@ module_argo_update_port() {
 
 _module_argo_update_port_inner() {
     st_set '.ports.argo = ($port|tonumber)' --arg port "$1" || return 1
-    argo_apply_fixed_tunnel_from_state && fw_reconcile
+    argo_apply_fixed_tunnel_from_state
 }
 
 # ==============================================================================
@@ -4565,8 +4636,8 @@ _xray_latest_tag() {
     for _i in 1 2; do
         _tag=$(curl -sfL --max-time 10 \
             "https://api.github.com/repos/XTLS/Xray-core/releases/latest" \
-            2>/dev/null | jq -r '.tag_name // empty' 2>/dev/null) || true
-        [ -n "${_tag:-}" ] && { printf '%s' "${_tag}"; return 0; }
+            2>/dev/null | jq -r 'select(.draft != true and .prerelease != true) | .tag_name // empty' 2>/dev/null) || true
+        [[ "${_tag:-}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] && { printf '%s' "${_tag}"; return 0; }
         [ "${_i}" -lt 2 ] && sleep 2
     done
     return 1
@@ -4585,39 +4656,121 @@ _xray_download_from_mirrors() {
     log_error "所有镜像均下载失败: ${_filename}"; return 1
 }
 
-download_xray() {
-    platform_detect_arch
-    if _xray_health_check "${XRAY_BIN}" 2>/dev/null; then
-        local _cur
-        _cur=$("${XRAY_BIN}" version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
-        log_info "xray 已存在且健康 (v${_cur:-unknown})，跳过下载"; return 0
-    fi
-    log_info "xray 健康检查未通过，重新下载..."
-    rm -f "${XRAY_BIN}" 2>/dev/null || true
-    local _tag; _tag=$(_xray_latest_tag) || true
-    [ -z "${_tag:-}" ] && { log_error "无法获取 Xray 最新版本号，拒绝使用未校验 latest 下载"; return 1; }
-    local _zip_name="Xray-linux-${_G_ARCH_XRAY}.zip"
-    local _z; _z=$(tmp_file "xray_XXXXXX.zip") || return 1
+_xray_binary_tag() {
+    "$1" version 2>/dev/null | awk 'NR == 1 && $1 == "Xray" && $2 ~ /^[0-9]+\.[0-9]+\.[0-9]+$/ {print "v" $2}'
+}
+
+_xray_stage_release() {
+    local _tag="$1" _stage="$2" _zip_name _z _dgst _expected _actual
+    platform_detect_arch || return 1
+    _zip_name="Xray-linux-${_G_ARCH_XRAY}.zip"
+    _z="${_stage}/${_zip_name}"
+    command -v sha256sum >/dev/null 2>&1 || { log_error "缺少 sha256sum，拒绝安装未校验 Xray 二进制"; return 1; }
+    command -v unzip >/dev/null 2>&1 || { log_error "缺少 unzip，无法解压 Xray 发布包"; return 1; }
     _xray_download_from_mirrors "${_zip_name}" "${_z}" "${_tag}" || return 1
-    command -v sha256sum >/dev/null 2>&1 || { log_error "缺少 sha256sum，拒绝安装未校验 Xray 二进制"; rm -f "${_z}"; return 1; }
     log_step "校验 SHA256..."
-    local _dgst _expected _actual
     _dgst=$(curl -sfL --max-time 15 \
-        "https://github.com/XTLS/Xray-core/releases/download/${_tag}/${_zip_name}.dgst" \
-        2>/dev/null) || true
-    _expected=$(printf '%s' "${_dgst:-}" | grep -i 'SHA2-256' | awk '{print $NF}' | head -1 | tr -d '[:space:]')
-    [ -n "${_expected:-}" ] || { log_error "未获取到 Xray SHA256 摘要，拒绝继续"; rm -f "${_z}"; return 1; }
-    _actual=$(sha256sum "${_z}" | awk '{print $1}')
-    if [ "${_actual}" != "${_expected}" ]; then
-        log_error "SHA256 校验失败"; rm -f "${_z}"; return 1
+        "https://github.com/XTLS/Xray-core/releases/download/${_tag}/${_zip_name}.dgst" 2>/dev/null) || {
+        log_error "无法下载官方 Xray SHA256 摘要"; return 1;
+    }
+    _expected=$(awk 'toupper($0) ~ /SHA2-256/ {print tolower($NF); exit}' <<< "${_dgst}")
+    [[ "${_expected}" =~ ^[0-9a-f]{64}$ ]] || { log_error "未获取到有效的 Xray SHA256 摘要"; return 1; }
+    _actual=$(sha256sum "${_z}") || return 1
+    if [ "${_actual%% *}" != "${_expected}" ]; then
+        log_error "SHA256 校验失败"; return 1
     fi
     log_ok "SHA256 校验通过"
-    unzip -t "${_z}" >/dev/null 2>&1 || { log_error "zip 文件损坏"; rm -f "${_z}"; return 1; }
-    unzip -o "${_z}" xray -d "${WORK_DIR}/" >/dev/null 2>&1 || { log_error "解压失败"; return 1; }
-    [ -f "${XRAY_BIN}" ] || { log_error "解压后未找到 xray 二进制"; return 1; }
-    chmod +x "${XRAY_BIN}"
-    _xray_health_check "${XRAY_BIN}" || { log_error "xray 健康检查失败"; rm -f "${XRAY_BIN}"; return 1; }
-    log_ok "Xray 安装完成 ($("${XRAY_BIN}" version 2>/dev/null | head -1 | awk '{print $2}'))"
+    unzip -p "${_z}" xray > "${_stage}/xray" || { log_error "解压 Xray 二进制失败"; return 1; }
+    chmod 755 "${_stage}/xray" || return 1
+    if [ "$(_xray_binary_tag "${_stage}/xray")" != "${_tag}" ] || ! _xray_health_check "${_stage}/xray"; then
+        log_error "Xray 二进制版本或健康检查未通过"; return 1
+    fi
+}
+
+download_xray() (
+    local _cur _tag _stage
+    if _xray_health_check "${XRAY_BIN}" 2>/dev/null; then
+        _cur=$(_xray_binary_tag "${XRAY_BIN}")
+        log_info "xray 已存在且健康 (${_cur:-unknown})，跳过下载"; return 0
+    fi
+    _tag=$(_xray_latest_tag) || { log_error "无法获取 Xray 最新稳定版本号"; return 1; }
+    mkdir -p "${WORK_DIR}" || return 1
+    _stage=$(mktemp -d "${WORK_DIR}/.xray-install.XXXXXX") || return 1
+    trap 'rm -rf -- "${_stage}"' EXIT
+    _xray_stage_release "${_tag}" "${_stage}" || return 1
+    mv -fT -- "${_stage}/xray" "${XRAY_BIN}" || return 1
+    log_ok "Xray 安装完成 (${_tag})"
+)
+
+_xray_upgrade_cleanup() {
+    local _stage="$1" _restore="$2" _running="$3"
+    if [ "${_restore}" -eq 1 ] && [ ! -e "${_stage}/xray" ]; then
+        if ! mv -fT -- "${_stage}/previous" "${XRAY_BIN}"; then
+            log_error "恢复旧内核失败，旧内核保留在 ${_stage}/previous"
+            return 1
+        fi
+        if [ "${_running}" -eq 1 ] &&
+            ! { svc_exec_mut restart "${_SVC_XRAY}" && svc_verify_health "${_SVC_XRAY}" 6; }; then
+            log_error "已恢复旧内核，但 Xray 服务未能恢复运行"
+        else
+            log_warn "已恢复升级前的 Xray 内核"
+        fi
+    fi
+    rm -rf -- "${_stage}"
+}
+
+_xray_upgrade_locked() (
+    local _current="$1" _latest="$2" _stage _restore=0 _running=0
+    if [ -e "${_UNINSTALL_PENDING}" ] || [ ! -f "${CONFIG_FILE}" ] ||
+        [ -L "${XRAY_BIN}" ] || [ "$(_xray_binary_tag "${XRAY_BIN}")" != "${_current}" ]; then
+        log_error "部署状态或 Xray 版本已变化，请重新检查后再试"
+        return 1
+    fi
+    _stage=$(mktemp -d "${WORK_DIR}/.xray-upgrade.XXXXXX") || return 1
+    trap '_xray_upgrade_cleanup "${_stage}" "${_restore}" "${_running}"' EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    _xray_stage_release "${_latest}" "${_stage}" || return 1
+    if ! XRAY_LOCATION_ASSET="${XRAY_LOCATION_ASSET:-${WORK_DIR}}" "${_stage}/xray" -test -c "${CONFIG_FILE}" >/dev/null 2>&1; then
+        log_error "新版 Xray 未通过现有配置检查，升级已取消"
+        return 1
+    fi
+    if svc_exec status "${_SVC_XRAY}" >/dev/null 2>&1; then _running=1; fi
+    cp -p -- "${XRAY_BIN}" "${_stage}/previous" || return 1
+    # 同目录树内原子替换，暂存文件消失后才需要回滚。
+    _restore=1
+    mv -fT -- "${_stage}/xray" "${XRAY_BIN}" || return 1
+    if [ "${_running}" -eq 1 ] &&
+        ! { svc_exec_mut restart "${_SVC_XRAY}" && svc_verify_health "${_SVC_XRAY}" 6; }; then
+        log_error "新版 Xray 服务未能正常启动"
+        return 1
+    fi
+    _restore=0
+    log_ok "Xray 内核已升级：${_current} → ${_latest}"
+)
+
+module_xray_upgrade() {
+    local _current _latest _answer
+    if [ -e "${_UNINSTALL_PENDING}" ] || [ ! -f "${CONFIG_FILE}" ] || [ ! -x "${XRAY_BIN}" ] || [ -L "${XRAY_BIN}" ]; then
+        log_error "请先完成 Xray-2go 部署或清理，再升级内核"
+        return 1
+    fi
+    command -v flock >/dev/null 2>&1 || { log_error "升级内核需要 flock，以保护并发操作"; return 1; }
+    _current=$(_xray_binary_tag "${XRAY_BIN}")
+    [ -n "${_current}" ] || { log_error "无法读取当前 Xray 版本"; return 1; }
+    _latest=$(_xray_latest_tag) || { log_error "无法获取 Xray 最新稳定版本号"; return 1; }
+    log_info "当前 Xray 内核：${_current}，官方最新稳定版：${_latest}"
+    if jq -en --arg current "${_current#v}" --arg latest "${_latest#v}" '
+        def version: split(".") | map(tonumber);
+        ($current | version) >= ($latest | version)
+    ' >/dev/null; then
+        log_info "当前内核已达到最新稳定版，无需升级"
+        return 0
+    fi
+    prompt "确认升级内核？运行中的 Xray 将短暂重启 (y/N): " _answer || return 1
+    [[ "${_answer:-}" == [yY] ]] || return 0
+    with_lock _xray_upgrade_locked "${_current}" "${_latest}"
 }
 
 download_cloudflared() {
@@ -4755,7 +4908,7 @@ module_xray_install_core() {
     if [ "$(st_get '.argo.enabled')" = "true" ]; then
         _argo_prepare_fixed_tunnel_from_state && svc_apply_tunnel || return 1
     fi
-    svc_reload_daemon
+    svc_reload_daemon || return 1
 
     platform_fix_time_sync
     fw_reconcile || return 1
@@ -4802,7 +4955,7 @@ module_xray_uninstall() {
 }
 
 _uninstall_managed_files() {
-    local _module _path _domain _state
+    local _module _path _domain _state _domains
     if [ -d "${PLUGIN_DIR}" ] && [ ! -L "${PLUGIN_DIR}" ]; then
         for _module in argo ff reality vltcp socks ss2022 http vlquic cforigin; do
             _path="${PLUGIN_DIR}/${_module}.sh"
@@ -4814,16 +4967,14 @@ _uninstall_managed_files() {
     fi
     [ -d "${_CERT_DIR}" ] && [ ! -L "${_CERT_DIR}" ] || return 0
     _state=$(_st_read_object "${STATE_FILE}") || return 0
-    for _module in cforigin vlquic; do
-        _domain=$(jq -r --arg name "${_module}" '.[$name] | select(.acme_method == "dns_cf_token" or .acme_method == "dns_cf_key" or .acme_method == "http01") | .domain // empty' <<< "${_state}") || return 1
-        [ -n "${_domain}" ] && val_domain "${_domain}" >/dev/null 2>&1 || continue
+    _domains=$(_managed_certificate_domains <<< "${_state}" | jq -r '.[]') || return 1
+    while IFS= read -r _domain; do
+        val_domain "${_domain}" >/dev/null 2>&1 || continue
         _path="${_CERT_DIR}/${_domain}"
         [ -d "${_path}" ] && [ ! -L "${_path}" ] || continue
-        if jq -e --arg name "${_module}" --arg dir "${_path}" '.[$name] | .cert == ($dir + "/fullchain.pem") and .key == ($dir + "/privkey.pem")' <<< "${_state}" >/dev/null; then
-            rm -f -- "${_path}/fullchain.pem" "${_path}/privkey.pem" || return 1
-            rmdir -- "${_path}" 2>/dev/null || true
-        fi
-    done
+        rm -f -- "${_path}/fullchain.pem" "${_path}/privkey.pem" || return 1
+        rmdir -- "${_path}" 2>/dev/null || true
+    done <<< "${_domains}"
 }
 
 _module_xray_uninstall_locked() {
@@ -5221,7 +5372,7 @@ module_restart_action() {
     local _target="${1:-}"
     case "${_target}" in
         xray)
-            svc_restart_xray
+            _transaction_run "Xray 重启" svc_restart_xray
             ;;
         argo)
             _transaction_run "Argo 重启" _module_argo_restart_inner
@@ -5270,7 +5421,8 @@ module_registry_dispatch_common() {
         menu)
             _fn="${_MODULE_MENU_FN[${_mod}]-}"
             [ -n "${_fn}" ] || { log_error "模块 ${_mod} 未注册菜单处理器"; return 1; }
-            "${_fn}" runtime
+            "${_fn}" runtime || return $?
+            _menu_return_to_parent
             ;;
         restart)
             _target="${_MODULE_RESTART_TARGET[${_mod}]-}"
@@ -5320,6 +5472,7 @@ module_dispatch() {
     case "${_mod}:${_action}" in
         # core/global actions
         xray:install) module_xray_install ;;
+        xray:upgrade) module_xray_upgrade ;;
         xray:uninstall) module_xray_uninstall ;;
         nodes:show) module_nodes_show ;;
         config:update_uuid) module_config_update_uuid ;;
@@ -5530,6 +5683,7 @@ _menu_actions() {
 维护|11|更新 UUID|config|update_uuid
 维护|d|开始部署（快速向导）|xray|install
 维护|s|更新快捷方式/脚本|config|update_shortcut
+维护|x|升级 Xray 内核|xray|upgrade
 维护|u|卸载整套 Xray-2go|xray|uninstall
 维护|0|退出程序||
 MENU
@@ -5566,8 +5720,12 @@ _menu_render() {
     printf '\n'
 }
 
+_menu_return_to_parent() {
+    if [ -n "${_menu_redraw+x}" ]; then _menu_redraw=1; fi
+}
+
 _menu_select_action() {
-    local _selected="$1" _key _module _action _matched=0
+    local _selected="$1" _key _module _action _matched=0 _menu_redraw=0
     while IFS='|' read -r _ _key _ _module _action; do
         [ "${_key}" = "${_selected}" ] || continue
         _matched=1
@@ -5579,7 +5737,9 @@ _menu_select_action() {
         log_info "已退出"
         exit 0
     else
-        module_dispatch "${_module}" ${_action:+"${_action}"} && [ -z "${_action}" ] && return 0
+        if module_dispatch "${_module}" ${_action:+"${_action}"} && [ "${_menu_redraw}" -eq 1 ]; then
+            return 0
+        fi
     fi
     _pause
 }
@@ -5631,6 +5791,7 @@ install_plan_reset_defaults() {
         .ss2022.enabled = false |
         .ss2022.listen = "0.0.0.0" |
         .ss2022.method = "2022-blake3-aes-256-gcm" |
+        .ss2022.key_mode = "single" |
         .ss2022.server_key = "" |
         .ss2022.user_key = "" |
         .vlquic.enabled = false |
@@ -5834,20 +5995,12 @@ install_plan_argo_update_trojan_password() {
 }
 
 install_plan_argo_update_protocol() {
-    echo ""
-    log_title "Argo 传输协议"
-    printf "  ${C_GRN}1.${C_RST} WS ${C_YLW}[默认]${C_RST}\n"
-    printf "  ${C_GRN}2.${C_RST} XHTTP (auto)\n"
-    local _c
-    prompt "请选择 (1-2，回车默认1): " _c || return 1
-    case "${_c:-1}" in
-        2)
-            [ "$(st_get '.argo.auth_protocol')" = "trojan" ] && {
-                log_error "当前入站认证为 Trojan，仅支持 WS；请先将入站认证改回 VLESS"; return 1; }
-            st_set '.argo.protocol = "xhttp"' || return 1 ;;
-        *) st_set '.argo.protocol = "ws"' || return 1 ;;
-    esac
-    log_ok "Argo 协议已设置为: $(st_get '.argo.protocol')"
+    local _old _new
+    _old=$(st_get '.argo.protocol')
+    _argo_read_transport "${_old}" _new || return 1
+    [ "${_new}" != "${_old}" ] || return 0
+    st_set '.argo.protocol = $v' --arg v "${_new}" || return 1
+    log_ok "Argo 协议已设置为: ${_new}"
 }
 
 install_plan_argo_update_port() {
@@ -6293,7 +6446,7 @@ install_plan_vlquic_update_cert() {
 
 install_plan_ss2022_toggle() {
     if [ "$(st_get '.ss2022.enabled')" = "true" ]; then
-        st_set '.ss2022.enabled = false | .ss2022.server_key = "" | .ss2022.user_key = ""' || return 1
+        _ss2022_disable_state || return 1
         log_ok "Shadowsocks 2022 已禁用"
     else
         _module_ss2022_enable_prepare || return 1
@@ -6325,33 +6478,11 @@ install_plan_ss2022_update_listen() {
 }
 
 install_plan_ss2022_update_method() {
-    local _choice _method _server _user _cur
-    _cur=$(st_get '.ss2022.method')
-    echo ""
-    printf "  1. 2022-blake3-aes-256-gcm [默认，32 字节密钥]\\n"
-    printf "  2. 2022-blake3-aes-128-gcm [16 字节密钥]\\n"
-    prompt "加密方法（回车保持 $_cur）: " _choice || return 1
-    [ -n "$_choice" ] || return 0
-    case "$_choice" in
-        1) _method="2022-blake3-aes-256-gcm" ;;
-        2) _method="2022-blake3-aes-128-gcm" ;;
-        *) log_error "无效的 SS2022 加密方法"; return 1 ;;
-    esac
-    _server=$(crypto_gen_ss2022_key "$_method") || return 1
-    _user=$(crypto_gen_ss2022_key "$_method") || return 1
-    st_set '.ss2022.method = $m | .ss2022.server_key = $s | .ss2022.user_key = $u' \
-        --arg m "$_method" --arg s "$_server" --arg u "$_user" || return 1
-    log_ok "安装计划 SS2022 方法已更新为 $_method（已重新生成密钥）"
+    _ss2022_select_method install
 }
 
 install_plan_ss2022_regenerate_keys() {
-    local _method _server _user
-    _method=$(st_get '.ss2022.method')
-    val_ss2022_method "$_method" >/dev/null || return 1
-    _server=$(crypto_gen_ss2022_key "$_method") || return 1
-    _user=$(crypto_gen_ss2022_key "$_method") || return 1
-    st_set '.ss2022.server_key = $s | .ss2022.user_key = $u' \
-        --arg s "$_server" --arg u "$_user" || return 1
+    _ss2022_update_credentials install "$@" || return 1
     log_ok "安装计划 SS2022 密钥已重新生成"
 }
 
@@ -6422,11 +6553,10 @@ install_plan_validate() {
     fi
 
     if [ "$(st_get '.ss2022.enabled')" = "true" ]; then
-        val_ss2022_method "$(st_get '.ss2022.method')" >/dev/null || return 1
         val_port "$(port_of ss2022)" >/dev/null || return 1
         val_listen_addr "$(st_get '.ss2022.listen')" >/dev/null || return 1
-        val_ss2022_key "$(st_get '.ss2022.method')" "$(st_get '.ss2022.server_key')" >/dev/null || return 1
-        val_ss2022_key "$(st_get '.ss2022.method')" "$(st_get '.ss2022.user_key')" >/dev/null || return 1
+        _ss2022_validate_credentials "$(st_get '.ss2022.method')" "$(st_get '.ss2022.key_mode')" \
+            "$(st_get '.ss2022.server_key')" "$(st_get '.ss2022.user_key')" || return 1
     fi
 
     if [ "$(st_get '.http.enabled')" = "true" ]; then
@@ -6723,8 +6853,60 @@ _argo_xhttp_export_json() {
     _xhttp_export_vless_outbound "$(st_get '.cfip')" "$(st_get '.cfport')" "${_stream}"
 }
 
+_argo_xhttp_export_mihomo() {
+    local _stream
+    _stream=$(_argo_xhttp_client_stream split) || return 1
+    jq -n --arg address "$(st_get '.cfip')" --argjson port "$(st_get '.cfport')" \
+        --arg uuid "$(st_get '.uuid')" --argjson stream "$_stream" '
+        def omit_null: with_entries(select(.value != null));
+        def string_or_null: if . == null then null else tostring end;
+        def reuse_settings:
+            if . == null then null else
+                {"max-concurrency": (.maxConcurrency | string_or_null),
+                 "max-connections": (.maxConnections | string_or_null),
+                 "c-max-reuse-times": (.cMaxReuseTimes | string_or_null),
+                 "h-max-request-times": (.hMaxRequestTimes | string_or_null),
+                 "h-max-reusable-secs": (.hMaxReusableSecs | string_or_null),
+                 "h-keep-alive-period": .hKeepAlivePeriod} | omit_null
+            end;
+        def xhttp_opts:
+            {path, host, mode, headers: (.headers // .extra.headers),
+             "x-padding-bytes": .extra.xPaddingBytes, "x-padding-obfs-mode": .extra.xPaddingObfsMode,
+             "x-padding-key": .extra.xPaddingKey, "x-padding-header": .extra.xPaddingHeader,
+             "x-padding-placement": .extra.xPaddingPlacement, "x-padding-method": .extra.xPaddingMethod,
+             "uplink-http-method": .extra.uplinkHTTPMethod, "no-grpc-header": .extra.noGRPCHeader,
+             "session-placement": (.extra.sessionIDPlacement // .extra.sessionPlacement),
+             "session-key": (.extra.sessionIDKey // .extra.sessionKey),
+             "session-table": .extra.sessionIDTable, "session-length": (.extra.sessionIDLength | string_or_null),
+             "seq-placement": .extra.seqPlacement, "seq-key": .extra.seqKey,
+             "uplink-data-placement": .extra.uplinkDataPlacement, "uplink-data-key": .extra.uplinkDataKey,
+             "uplink-chunk-size": (.extra.uplinkChunkSize | string_or_null),
+             "sc-max-each-post-bytes": (.extra.scMaxEachPostBytes | string_or_null),
+             "sc-min-posts-interval-ms": (.extra.scMinPostsIntervalMs | string_or_null),
+             "reuse-settings": (.extra.xmux | reuse_settings)} | omit_null;
+        $stream.xhttpSettings.extra.downloadSettings as $down |
+        ($down.security == "reality") as $reality |
+        ($down.xhttpSettings | {path,host,headers:(.headers // .extra.headers),
+                               "reuse-settings":(.extra.xmux | reuse_settings)}) +
+        {server: ($down.address | ltrimstr("[") | rtrimstr("]")), port:$down.port,
+         tls: ($down.security != "none"),
+         servername: ($down.realitySettings.serverName // $down.tlsSettings.serverName),
+         "client-fingerprint": ($down.realitySettings.fingerprint // $down.tlsSettings.fingerprint),
+         alpn: $down.tlsSettings.alpn, "skip-cert-verify": $down.tlsSettings.allowInsecure,
+         "reality-opts": (if $reality then
+             {"public-key": ($down.realitySettings.password // $down.realitySettings.publicKey),
+              "short-id": $down.realitySettings.shortId, "support-x25519mlkem768": true}
+             else null end)} | omit_null | . as $download |
+        {proxies: [{name:"Argo-XHTTP-Split", type:"vless", server:($address | ltrimstr("[") | rtrimstr("]")),
+                    port:$port, uuid:$uuid, udp:true, tls:true, network:"xhttp",
+                    servername:$stream.tlsSettings.serverName,
+                    "client-fingerprint":$stream.tlsSettings.fingerprint,
+                    "xhttp-opts": ($stream.xhttpSettings | xhttp_opts | . + {"download-settings":$download})}]}
+    '
+}
+
 _argo_xhttp_render_status() {
-    jq -r --argjson server "$(_argo_xhttp_server_extra)" --arg legacy "$(xpad_of argo)" '
+    jq -r --argjson server "$(_xhttp_server_extra argo)" --arg legacy "$(xpad_of argo)" '
         ((.client // {}) | .xmux // {}) as $xmux |
         "模式 \(.mode // "auto") · Padding \(
             if .server == null and $legacy == "true" then "旧版设置"
@@ -6749,10 +6931,8 @@ _xhttp_edit_advanced() {
 }
 
 _xhttp_edit_field() {
-    local _module="$1" _runtime="$2" _field="$3" _label="$4" _raw='' _profile _server='{}'
-    case "${_module}" in
-        argo|reality|ff) _server=$("_${_module}_xhttp_server_extra") || return 1 ;;
-    esac
+    local _module="$1" _runtime="$2" _field="$3" _label="$4" _raw='' _profile _server
+    _server=$(_xhttp_server_extra "${_module}") || return 1
     while prompt "${_label}（空行返回）: " _raw "${_raw}" && [ -n "${_raw}" ]; do
         _profile=$(st_get '
             ($path | split(".")) as $field | (.[$inbound_id].xhttp // {}) |
@@ -6808,7 +6988,7 @@ _xhttp_edit_common() {
 }
 
 _argo_xhttp_export_menu() {
-    local _choice _kind _label
+    local _choice _kind _label _formats
     while true; do
         log_title "══ 导出 Argo XHTTP 节点 ══"
         _menu_print_action 1 "普通 XHTTP"
@@ -6835,12 +7015,23 @@ _argo_xhttp_export_menu() {
             log_title "══ ${_label} ══"
             _menu_print_action 1 "分享链接"
             _menu_print_action 2 "客户端出站 JSON"
+            _formats='0-2'
+            if [ "$_kind" = split ]; then
+                _menu_print_action 3 "Mihomo 代理提供者配置（JSON）"
+                _formats='0-3'
+            fi
             _menu_print_back
-            prompt '选择格式 (0-2): ' _choice || return 0
+            prompt "选择格式 ($_formats): " _choice || return 0
             case "${_choice}" in
                 0) break ;;
                 1) _argo_xhttp_link "${_kind}" || log_warn "无法生成 ${_label} 分享链接"; _pause; break ;;
                 2) _argo_xhttp_export_json "${_kind}" || log_warn "无法生成 ${_label} 出站 JSON"; _pause; break ;;
+                3)
+                    if [ "$_kind" != split ]; then log_error "无效选项，请按提示输入"; continue; fi
+                    _argo_xhttp_export_mihomo || log_warn "无法生成 ${_label} Mihomo 配置"
+                    _pause
+                    break
+                    ;;
                 *) log_error "无效选项，请按提示输入" ;;
             esac
         done
@@ -7260,7 +7451,7 @@ _reality_xhttp_render_status() { _xhttp_render_status_with_legacy_padding realit
 
 _xhttp_render_status_with_legacy_padding() {
     local _module="$1" _server
-    _server=$(_xhttp_server_extra_with_legacy_padding "${_module}") || return 1
+    _server=$(_xhttp_server_extra "${_module}") || return 1
     jq -r --argjson server "${_server}" --arg legacy "$(xpad_of "${_module}")" '
         "  当前模式 \(.mode // "stream-one") · Padding \(
             if .server == null and $legacy == "true" then "旧版设置"
@@ -7517,23 +7708,25 @@ unified_menu_ss2022() {
     [ -n "$_mode" ] || _mode=install
     _unified_mode_is_runtime "$_mode" && { _runtime=1; _manage_module_entry_check || return; }
     while true; do
-        local _en _port _listen _method _svc _summary
+        local _en _port _listen _method _key_mode _svc _summary
         _en=$(st_get '.ss2022.enabled')
         _port=$(port_of ss2022)
         _listen=$(st_get '.ss2022.listen')
         _method=$(st_get '.ss2022.method')
+        _key_mode=单密钥
+        if [ "$(st_get '.ss2022.key_mode')" = dual ]; then _key_mode=双密钥; fi
         _svc=$(_unified_runtime_status_for ss2022)
         _summary=$(_unified_summary_for "$_runtime" ss2022)
         clear; echo ""; log_title "══ Shadowsocks 2022 闭环工作台 ══"
-        _unified_render_mode_header "$_mode" "使用 Xray-core 内置 SS2022；仅支持 AES-128/AES-256 GCM 多用户模式"
+        _unified_render_mode_header "$_mode" "使用 Xray-core 内置 SS2022"
         _unified_render_status "$_runtime" "$_en" "$_svc"
-        printf "  端口: $C_YLW%s$C_RST  监听: $C_CYN%s$C_RST  方法: $C_GRN%s$C_RST\\n" "$_port" "$_listen" "$_method"
+        printf "  端口: $C_YLW%s$C_RST  监听: $C_CYN%s$C_RST  方法: $C_GRN%s（%s）$C_RST\\n" "$_port" "$_listen" "$_method" "$_key_mode"
         _hr
         _menu_print_action 1 "切换启用状态"
         _menu_print_action 2 "修改 TCP/UDP 监听端口"
         _menu_print_action 3 "修改监听地址"
-        _menu_print_action 4 "修改加密方法（会重新生成密钥）"
-        _menu_print_action 5 "重新生成服务端/用户密钥"
+        _menu_print_action 4 "修改加密方法与密钥模式（会重新生成密钥）"
+        _menu_print_action 5 "重新生成密钥"
         _menu_print_action 6 "查看当前节点摘要"
         if [ "$_runtime" -eq 1 ]; then
             _hr
@@ -7712,12 +7905,12 @@ install_wizard_menu() {
     while true; do
         install_wizard_render
         local _c
-        prompt "请选择部署方案 (0-3，回车选 1): " _c || return 1
+        prompt "请选择部署方案 (0-3，回车选 1): " _c || { _menu_return_to_parent; return 0; }
         case "${_c:-1}" in
             1) install_wizard_reality && return 0 ;;
             2) install_wizard_argo && return 0 ;;
             3) install_plan_menu && return 0 ;;
-            0) log_info "已返回主菜单"; return 0 ;;
+            0) _menu_return_to_parent; return 0 ;;
             *) log_error "无效选项，请输入 0-3" ;;
         esac
         _pause
@@ -7728,7 +7921,7 @@ install_plan_menu() {
     while true; do
         install_plan_render_summary
         local _c
-        prompt "请选择操作 (0-13): " _c || return 0
+        prompt "请选择操作 (0-13): " _c || { _menu_return_to_parent; return 0; }
         echo ""
         case "${_c:-}" in
             1) unified_menu_argo install && continue ;;
@@ -7746,9 +7939,7 @@ install_plan_menu() {
                 ;;
             12) unified_menu_http install && continue ;;
             13) unified_menu_ss2022 install && continue ;;
-            0)
-                log_info "已取消安装并返回主菜单"
-                return 0 ;;
+            0) _menu_return_to_parent; return 0 ;;
             *) log_error "无效选项，请输入 0-13" ;;
         esac
         _pause

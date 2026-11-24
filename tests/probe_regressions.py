@@ -148,6 +148,153 @@ def test_argo_domain_probe_reports_http_and_obeys_total_budget():
     ''', timeout=20)
 
 
+def test_xray_core_upgrade_verifies_release_and_restores_running_core():
+    result = run_bash_result(r'''
+        source ./xray_2go.sh
+        set -e
+        mkdir -p "$WORK_DIR"
+        fixture=$(mktemp -d "$WORK_DIR/fixture.XXXXXX")
+        export fixture CONFIG_FILE
+        printf 'existing config\n' > "$CONFIG_FILE"
+        cp "$CONFIG_FILE" "$fixture/config"
+        cat > "$fixture/current" <<'CORE'
+#!/bin/bash
+if [ "$1" = version ]; then
+    printf 'Xray 26.3.27 (Xray, Penetrates Everything.)\n'
+elif [ "$1" = -test ] && [ "$2" = -c ]; then
+    if [ "$3" = "$CONFIG_FILE" ]; then
+        [ ! -e "$fixture/reject-config" ] && cmp -s "$fixture/config" "$3"
+    else
+        exit 0
+    fi
+else
+    exit 1
+fi
+CORE
+        chmod 755 "$fixture/current"
+        cp -p "$fixture/current" "$XRAY_BIN"
+        sed 's/26\.3\.27/26.11.9/' "$fixture/current" > "$fixture/new"
+        python3 - "$fixture" <<'PYZIP'
+from pathlib import Path
+import sys
+from zipfile import ZipFile
+work = Path(sys.argv[1])
+with ZipFile(work / 'release.zip', 'w') as release:
+    release.write(work / 'new', 'xray')
+PYZIP
+        tag=v26.11.9
+        curl() {
+            case "$*" in
+                *'/releases/latest') printf '{"tag_name":"%s"}\n' "$tag" ;;
+                *'.zip.dgst')
+                    if [ "$scenario" = bad-digest ]; then
+                        printf 'SHA2-256= %064d\n' 0
+                    else
+                        printf 'SHA2-256= %s\n' "$(sha256sum "$fixture/release.zip" | cut -d' ' -f1)"
+                    fi ;;
+                *'.zip')
+                    printf 'download\n' >> "$fixture/events"
+                    while [ "$1" != -o ]; do shift; done
+                    cp "$fixture/release.zip" "$2" ;;
+                *) return 1 ;;
+            esac
+        }
+        prompt() {
+            printf 'confirm\n' >> "$fixture/events"
+            if [ "$scenario" = concurrent ]; then
+                cp "$fixture/new" "$XRAY_BIN"
+                chmod 755 "$XRAY_BIN"
+            fi
+            printf -v "$2" '%s' "$answer"
+        }
+        svc_exec() { [ "$1" = status ] && [ -e "$fixture/running" ]; }
+        svc_exec_mut() {
+            [ "$1" = restart ] || return 1
+            "$XRAY_BIN" version | awk '{print $2}' >> "$fixture/events"
+            touch "$fixture/running"
+        }
+        svc_verify_health() {
+            if "$XRAY_BIN" version | grep -qF 26.11.9; then
+                case "$scenario" in
+                    rollback) return 1 ;;
+                    interrupted) kill -TERM "$BASHPID" ;;
+                esac
+            fi
+            [ -e "$fixture/running" ]
+        }
+
+        scenario=cancel answer=n
+        module_dispatch xray upgrade
+        cmp "$XRAY_BIN" "$fixture/current"
+        ! grep -qx download "$fixture/events" || exit 1
+
+        : > "$fixture/events"
+        answer=y tag=v26.3.27
+        module_dispatch xray upgrade
+        test ! -s "$fixture/events"
+        tag=v25.12.9
+        module_dispatch xray upgrade
+        test ! -s "$fixture/events"
+
+        tag=v26.11.9 scenario=bad-digest
+        if module_dispatch xray upgrade; then exit 1; fi
+        cmp "$XRAY_BIN" "$fixture/current"
+        tag=v26.12.0 scenario=wrong-release
+        if module_dispatch xray upgrade; then exit 1; fi
+        cmp "$XRAY_BIN" "$fixture/current"
+        tag=v26.11.9
+        : > "$fixture/events"
+        scenario=concurrent
+        if module_dispatch xray upgrade; then exit 1; fi
+        cmp "$XRAY_BIN" "$fixture/new"
+        ! grep -qx download "$fixture/events" || exit 1
+        cp -p "$fixture/current" "$XRAY_BIN"
+        touch "$fixture/running" "$fixture/reject-config"
+        scenario=invalid-config
+        if module_dispatch xray upgrade; then exit 1; fi
+        cmp "$XRAY_BIN" "$fixture/current"
+        ! grep -Eq '^26\.' "$fixture/events" || exit 1
+        rm "$fixture/reject-config"
+
+        : > "$fixture/events"
+        scenario=rollback
+        if module_dispatch xray upgrade; then exit 1; fi
+        cmp "$XRAY_BIN" "$fixture/current"
+        test "$(tail -n 2 "$fixture/events")" = $'26.11.9\n26.3.27'
+
+        : > "$fixture/events"
+        scenario=interrupted
+        if module_dispatch xray upgrade; then exit 1; fi
+        cmp "$XRAY_BIN" "$fixture/current"
+        test "$(tail -n 2 "$fixture/events")" = $'26.11.9\n26.3.27'
+
+        : > "$fixture/events"
+        scenario=upgrade
+        module_dispatch xray upgrade
+        cmp "$XRAY_BIN" "$fixture/new"
+        test "$(tail -n 1 "$fixture/events")" = 26.11.9
+        cp -p "$fixture/current" "$XRAY_BIN"
+        rm "$fixture/running"
+        : > "$fixture/events"
+        module_dispatch xray upgrade
+        cmp "$XRAY_BIN" "$fixture/new"
+        test ! -e "$fixture/running"
+        cmp "$CONFIG_FILE" "$fixture/config"
+        ! grep -Eq '^26\.' "$fixture/events" || exit 1
+
+        rm "$XRAY_BIN" "$CONFIG_FILE"
+        download_xray
+        cmp "$XRAY_BIN" "$fixture/new"
+        : > "$fixture/events"
+        download_xray
+        test ! -s "$fixture/events"
+        test -z "$(find "$WORK_DIR" -maxdepth 1 -name '.xray-*.*' -print)"
+        printf 'CORE_UPGRADE_CHECKS_PASSED\n'
+    ''')
+    assert result.returncode == 0, result.stdout
+    assert 'CORE_UPGRADE_CHECKS_PASSED' in result.stdout
+
+
 def test_runtime_script_update_leaves_existing_files_on_failure():
     out = run_bash(r'''
         source ./xray_2go.sh
@@ -643,11 +790,53 @@ def test_firewall_sync_fails_closed_and_prefers_active_managers():
     assert_true('[[ "${_handle}" =~ ^[0-9]+$ ]] || return 1' in close_body, "nft cleanup must preserve ambiguous duplicate rules and their ledger entry")
 
 
-def test_config_detects_wildcard_listen_conflicts_and_filters_links():
-    assert_true('_is_wild_listen()' in TEXT, "wildcard listen helper missing")
-    assert_true('_used_wild_ports' in TEXT and '_used_exact_keys' in TEXT, "config build must track wildcard ports and exact listen keys separately")
-    assert_true('printf \'%s\\n\' "${_used_wild_ports}" | grep -qxF "${_port}"' in TEXT, "specific listen must conflict with existing wildcard same-port listener")
-    assert_true('printf \'%s\\n\' "${_used_exact_keys}" | grep -qE ":${_port}$"' in TEXT, "wildcard listen must conflict with existing specific same-port listener")
+def test_config_detects_wildcard_listen_conflicts_by_transport():
+    result = run_bash_result(r'''
+        source ./xray_2go.sh
+        set -e
+        st_init
+        transport=udp listen=0.0.0.0
+        _plg_one_ports() { printf '443\n'; }
+        _plg_one_inbound() { printf '{"port":443,"listen":"192.0.2.10"}\n'; }
+        _plg_two_ports() { printf '443/%s\n' "$transport"; }
+        _plg_two_inbound() { printf '{"port":443,"listen":"%s"}\n' "$listen"; }
+        _PLUGIN_REGISTRY=(one two)
+        test "$(fw_desired_rules preview)" = $'443/tcp\n443/udp'
+        _plugin_snapshot_rebuild
+        test "$(fw_desired_rules)" = $'443/tcp\n443/udp'
+        transport=tcp
+        if _plugin_snapshot_rebuild; then exit 1; fi
+        listen=192.0.2.11
+        _plugin_snapshot_rebuild
+        _PLUGIN_REGISTRY=(two one)
+        listen=0.0.0.0
+        if _plugin_snapshot_rebuild; then exit 1; fi
+        echo LISTENER_CONFLICT_TESTS_PASSED
+    ''')
+    assert result.returncode == 0, result.stdout
+    assert 'LISTENER_CONFLICT_TESTS_PASSED' in result.stdout
+
+
+def test_firewall_reconcile_preserves_rules_on_plugin_port_failure():
+    result = run_bash_result(r'''
+        source ./xray_2go.sh
+        set -e
+        st_init
+        _PLUGIN_REGISTRY=(failed)
+        _plg_failed_ports() { printf '8443/tcp\n'; return 1; }
+        _plg_failed_inbound() { :; }
+        mkdir -p "$WORK_DIR"
+        printf 'ufw:443/tcp\n' > "$_FW_RULES_FILE"
+        _fw_close_port() { echo UNEXPECTED_RULE_CHANGE; }
+        _fw_open_port() { echo UNEXPECTED_RULE_CHANGE; }
+        if fw_desired_rules preview; then exit 1; fi
+        if fw_reconcile; then exit 1; fi
+        test "$(<"$_FW_RULES_FILE")" = 'ufw:443/tcp'
+        echo FIREWALL_PORT_FAILURE_TEST_PASSED
+    ''')
+    assert result.returncode == 0, result.stdout
+    assert 'FIREWALL_PORT_FAILURE_TEST_PASSED' in result.stdout
+    assert 'UNEXPECTED_RULE_CHANGE' not in result.stdout
 
 
 def test_plugin_loader_validates_before_source_and_loads_in_subshell():
@@ -676,7 +865,7 @@ def test_plugin_collectors_drive_firewall_config_and_node_output():
     assert_true('plugin_collect_ports_raw' in fw_body, 'firewall desired rules should use shared plugin port collector')
     assert_true('plugin_collect_inbounds' in cfg_body, 'config_build_inbounds should delegate to shared inbound collector')
     assert_true('plugin_collect_links' in nodes_body, 'node output should delegate to shared link collector')
-    for token in ['_PLUGIN_SNAPSHOT_PORTS', '_PLUGIN_SNAPSHOT_LINKS', '_PLUGIN_SNAPSHOT_INBOUNDS', 'plugin_call "${_name}" ports', 'plugin_call "${_name}" link', 'plugin_call "${_name}" inbound']:
+    for token in ['_PLUGIN_SNAPSHOT_PORTS', '_PLUGIN_SNAPSHOT_LINKS', '_PLUGIN_SNAPSHOT_INBOUNDS', '_plugin_port_rules "${_name}"', 'plugin_call "${_name}" link', 'plugin_call "${_name}" inbound']:
         assert_true(token in snapshot_body, f'plugin snapshot rebuild should collect all plugin dimensions once: {token}')
 
 
@@ -923,13 +1112,18 @@ def test_state_schema_and_plugin_permission_hardening():
 
 
 def test_commit_helpers_fail_closed_on_firewall_reconcile():
-    for fn in ['_commit', '_module_enable_commit', '_module_disable_commit']:
-        candidates = [f'{fn}_inner()', f'{fn}()']
-        start = next((TEXT.index(candidate) for candidate in candidates if candidate in TEXT), None)
-        assert_true(start is not None, f'{fn} function missing')
-        end = TEXT.index('\n}\n', start)
-        body = TEXT[start:end]
-        assert_true('fw_reconcile || return 1' in body, f'{fn} implementation must fail closed if firewall reconciliation fails')
+    result = run_bash_result(r'''
+        source ./xray_2go.sh
+        config_apply() { :; }
+        st_persist() { :; }
+        fw_reconcile() { return 1; }
+        for commit in _commit_inner _module_enable_commit_inner _module_disable_commit_inner; do
+            if "$commit" socks; then exit 1; fi
+        done
+        echo COMMIT_FAILURES_PROPAGATED
+    ''')
+    assert result.returncode == 0, result.stdout
+    assert 'COMMIT_FAILURES_PROPAGATED' in result.stdout
 
 
 
@@ -1450,6 +1644,44 @@ def test_cforigin_rejects_hostname_drift_and_mismatched_private_key():
     ''')
 
 
+def test_managed_certificates_survive_module_removal_and_are_cleaned_on_uninstall():
+    run_bash(r'''
+        source ./xray_2go.sh
+        set -e
+        st_init
+        legacy="$_CERT_DIR/legacy.fixture.invalid"
+        issued="$_CERT_DIR/issued.fixture.invalid"
+        imported="$_CERT_DIR/imported.fixture.invalid"
+        mkdir -p "$legacy" "$issued" "$imported" "$HOME/.acme.sh"
+        for dir in "$legacy" "$issued" "$imported"; do
+            printf cert > "$dir/fullchain.pem"
+            printf key > "$dir/privkey.pem"
+        done
+        printf independent > "$legacy/notes"
+        printf '#!/bin/sh\nexit 0\n' > "$HOME/.acme.sh/acme.sh"
+        chmod +x "$HOME/.acme.sh/acme.sh"
+        st_set '.vlquic += {enabled:true, domain:"legacy.fixture.invalid", acme_method:"http01", cert:($d+"/fullchain.pem"), key:($d+"/privkey.pem")}' --arg d "$legacy"
+        atomic_write_secret "$STATE_FILE" "$_G_STATE"
+        st_init
+        config_apply() { :; }
+        fw_reconcile() { :; }
+        module_vlquic_uninstall
+        [[ -f "$legacy/fullchain.pem" && -f "$legacy/privkey.pem" ]]
+        acme_install_cert_to_state cforigin issued.fixture.invalid dns_cf_token
+        acme_install_cert issued.fixture.invalid http01
+        st_persist
+        module_vlquic_uninstall
+        module_cforigin_uninstall
+        [[ -f "$issued/fullchain.pem" && -f "$issued/privkey.pem" ]]
+        st_set '.cforigin += {domain:"imported.fixture.invalid", acme_method:"manual", cert:($d+"/fullchain.pem"), key:($d+"/privkey.pem")}' --arg d "$imported"
+        st_persist
+        _uninstall_managed_files
+        _uninstall_managed_files
+        [[ ! -e "$legacy/fullchain.pem" && ! -e "$legacy/privkey.pem" && -f "$legacy/notes" ]]
+        [[ ! -e "$issued" && -f "$imported/fullchain.pem" && -f "$imported/privkey.pem" ]]
+    ''')
+
+
 def test_uninstall_retries_failed_firewall_and_preserves_external_files():
     cp = run_bash_result(r"""
         source ./xray_2go.sh
@@ -1705,6 +1937,13 @@ assert json.loads(separated["extra"][0])["downloadSettings"]["port"] == 28443
         st_set '.reality.sid="abcdef"'
         _argo_xhttp_client_stream split | jq -e '.xhttpSettings.extra.downloadSettings.realitySettings.shortId == "abcdef"' >/dev/null
         _argo_xhttp_set_profile 0 '{"split":{"port":28443}}'
+        _argo_xhttp_set_profile 0 '{"split":{"port":28443,"download":{"address":"","port":null,"network":null,"security":null,"xhttpSettings":{"path":null}}}}'
+        _argo_xhttp_export_json split | jq -e '.streamSettings.xhttpSettings.extra.downloadSettings |
+            .address == "203.0.113.5" and .port == 28443 and .network == "xhttp" and .security == "reality" and
+            .xhttpSettings.path == "/argo" and .realitySettings.password == "fixture_public_key"' >/dev/null
+        _argo_xhttp_set_profile 0 '{"split":{"port":28443,"download":{"address":"[2001:db8::5]","port":28444,"xhttpSettings":{"path":"/custom"}}}}'
+        _argo_xhttp_export_json split | jq -e '.streamSettings.xhttpSettings.extra.downloadSettings |
+            .address == "2001:db8::5" and .port == 28444 and .xhttpSettings.path == "/custom"' >/dev/null
         _argo_xhttp_set_profile 0 '{"split":{"port":28443,"mode":"stream-one"}}' && exit 1
         _argo_xhttp_set_profile 0 '{"client":{"xmux":{"maxConcurrency":"1-2","maxConnections":3}}}' && exit 1
         st_set '.reality.enabled=false'
@@ -1713,6 +1952,55 @@ assert json.loads(separated["extra"][0])["downloadSettings"]["port"] == 28443
         printf '%s\n' 'Argo XHTTP profiles verified'
     ''', timeout=42)
     assert_true('Argo XHTTP profiles verified' in out, out)
+
+
+def test_argo_transport_changes_reconcile_split_listener():
+    output = run_bash(r'''
+        source ./xray_2go.sh
+        set -e
+        st_init
+        st_set '.argo.enabled=true | .argo.protocol="xhttp" | .argo.domain="tunnel.fixture.invalid" |
+            .argo.token="fixture" | .argo.xhttp={split:{port:28443}} |
+            .reality.enabled=true | .reality.pvk="fixture-private" | .reality.pbk="fixture-public" |
+            .reality.sid="01234567"'
+        st_persist
+        plugin_refresh_runtime
+        platform_get_realip() { printf 192.0.2.10; }
+        _argo_prepare_fixed_tunnel_from_state() { :; }
+        svc_apply_tunnel() { :; }
+        svc_exec() { return 1; }
+        svc_exec_mut() { :; }
+        svc_verify_health() { :; }
+        argo_check_health() { :; }
+        config_apply() { config_synthesize > "$CONFIG_FILE"; }
+        download_cloudflared() { :; }
+        fw_reconcile() { fw_desired_rules > "$_FW_PORTS_FILE"; }
+        prompt() { printf -v "$2" '%s' "$choice"; }
+        check_split() {
+            local present="$1"
+            if [ "$present" = yes ]; then
+                jq -e 'any(.inbounds[]; .port == 28443)' "$CONFIG_FILE" >/dev/null || exit 1
+                grep -qx '28443/tcp' "$_FW_PORTS_FILE" || exit 1
+            else
+                jq -e 'all(.inbounds[]; .port != 28443)' "$CONFIG_FILE" >/dev/null || exit 1
+                if grep -qx '28443/tcp' "$_FW_PORTS_FILE"; then exit 1; fi
+            fi
+        }
+        _commit
+        check_split yes
+        choice=1
+        module_argo_update_protocol
+        check_split no
+        choice=2
+        module_argo_update_protocol
+        check_split yes
+        module_argo_disable
+        check_split no
+        module_argo_enable
+        check_split yes
+        echo ARGO_LISTENER_TRANSITIONS_PASSED
+    ''', timeout=60)
+    assert 'ARGO_LISTENER_TRANSITIONS_PASSED' in output
 
 
 def test_argo_xhttp_menu_and_runtime_rollback():
@@ -1771,6 +2059,10 @@ def test_argo_xhttp_editor_and_selected_exports():
         _argo_xhttp_menu 0 <<< $'2\n'"$candidate"$'\n'"$fixed"$'\n7\n3\n3\n-\n4\n4\n7\nstream-up\n0\n4\n1\n0\n1\n1\n2\n1\n2\n2\n0\n0'
         jq -e '.argo.xhttp | .mode == "auto" and .client.xmux.maxConcurrency == 4 and
             .split.download.xhttpSettings.extra.xmux.maxConnections == 5' <<< "${_G_STATE}" >/dev/null
+        _argo_xhttp_export_menu <<< $'2\n3\n0\n'
+        st_set '.argo.xhttp.split.download.security = "tls" |
+            .argo.xhttp.split.download.tlsSettings = {serverName:"down.example.com",alpn:["h2"]}'
+        printf 'TLS_DOWN=%s\n' "$(_argo_xhttp_export_mihomo | jq -c .)"
         printf 'Argo editor state verified\n'
     ''', timeout=40)
     for marker in ('server.xPaddingBytes', 'client.xmux.maxConnections', 'Advanced draft retained',
@@ -1789,6 +2081,26 @@ def test_argo_xhttp_editor_and_selected_exports():
     assert parse_qs(links[1].query)['mode'] == ['stream-up']
     assert outbound['streamSettings']['xhttpSettings']['mode'] == 'stream-up'
     assert out.count('{\n  "protocol": "vless"') == 1
+    assert all('support-x25519mlkem768' not in parse_qs(link.query) for link in links)
+    assert 'support-x25519mlkem768' not in json.dumps(outbound)
+    provider, _ = decoder.raw_decode(out[out.index('{\n  "proxies": ['):])
+    proxy, = provider['proxies']
+    assert proxy['type'] == 'vless' and proxy['network'] == 'xhttp' and proxy['tls'] is True
+    assert proxy['servername'] == 'tunnel.example.com' and proxy['client-fingerprint'] == 'chrome'
+    assert 'reality-opts' not in proxy
+    xhttp = proxy['xhttp-opts']
+    assert xhttp['mode'] == 'stream-up' and xhttp['x-padding-bytes'] == '128-768'
+    assert xhttp['reuse-settings']['max-concurrency'] == '4'
+    down = xhttp['download-settings']
+    assert down == {'server': '192.0.2.10', 'port': 28443, 'tls': True, 'path': '/argo',
+                    'servername': 'example.com', 'client-fingerprint': 'chrome',
+                    'reuse-settings': {'max-connections': '5'},
+                    'reality-opts': {'public-key': expected_public_key, 'short-id': 'abcd',
+                                     'support-x25519mlkem768': True}}
+    tls_output = next(line[9:] for line in out.splitlines() if line.startswith('TLS_DOWN='))
+    tls_down = json.loads(tls_output)['proxies'][0]['xhttp-opts']['download-settings']
+    assert tls_down['tls'] is True and tls_down['servername'] == 'down.example.com' and tls_down['alpn'] == ['h2']
+    assert 'reality-opts' not in tls_down
     assert 'fixture-private' not in out
 
 
@@ -1930,6 +2242,52 @@ printf 'rc=%s memory=%s state=%s config=%s service=%s env=%s tunnel=%s fw=%s por
         and "config=old-config service=old-service env=old-env tunnel=old-tunnel fw=nft:1080/tcp ports=1080 active=0 enabled=0" in cp.stdout,
         f"failed Argo start must restore state, artifacts and service status: {cp.stdout}",
     )
+
+
+def test_transaction_retains_snapshot_when_restore_fails():
+    with XraySandbox() as sandbox:
+        for interrupt in ('false', 'true'):
+            cp = subprocess.run(
+                ['bash', '-lc', r'''
+                    source ./xray_2go.sh
+                    mkdir -p "${WORK_DIR}"
+                    printf 'original\n' > "${CONFIG_FILE}"
+                    _transaction_restore_files() { return 1; }
+                    apply_failure() {
+                        printf 'invalid\n' > "${CONFIG_FILE}"
+                        if [ "$interrupt" = true ]; then kill -TERM $$; fi
+                        return 1
+                    }
+                    _transaction_run '写入测试' apply_failure
+                '''],
+                cwd=ROOT,
+                env={**sandbox.environment(), 'interrupt': interrupt},
+                text=True, capture_output=True, timeout=20, check=False,
+            )
+            snapshots = sorted((sandbox.root / 'etc/xray2go').glob('.txn_*'))
+            assert cp.returncode == (130 if interrupt == 'true' else 1), cp.stderr
+            assert len(snapshots) == (2 if interrupt == 'true' else 1), cp.stderr
+            for snapshot in snapshots:
+                assert snapshot.stat().st_mode & 0o077 == 0
+                assert (snapshot / 'files/0').read_text() == 'original\n'
+            assert any(str(path).removeprefix(str(sandbox.root)) in cp.stderr for path in snapshots), cp.stderr
+
+
+def test_xray_manual_restart_holds_deployment_lock():
+    run_bash(r'''
+        source ./xray_2go.sh
+        set -e
+        mkdir -p "${WORK_DIR}"
+        printf 'config\n' > "${CONFIG_FILE}"
+        lock_held() {
+            ! flock -n "${_LOCK_FILE}" true
+        }
+        svc_apply_xray() { lock_held; }
+        svc_exec_mut() { [[ "$1" == restart ]] && lock_held; }
+        svc_verify_health() { lock_held; }
+        module_restart_action xray
+        flock -n "${_LOCK_FILE}" true
+    ''')
 
 
 def test_transaction_interrupt_restores_files_and_state():
@@ -2303,10 +2661,15 @@ def test_reality_xhttp_workbench_profiles_and_legacy_transport():
     assert stream['xhttpSettings'] == {'path': '/', 'mode': 'packet-up', 'extra': extra}
     assert extra == {'xPaddingBytes': '128-768', 'xmux': {'maxConnections': 6}}
     assert link['pbk'] == ['fixture-public-key']
+    assert link['support-x25519mlkem768'] == ['true']
+    assert link['fp'] == ['chrome']
     assert stream['realitySettings']['password'] == link['pbk'][0]
+    assert 'support-x25519mlkem768' not in stream['realitySettings']
     assert outbound['settings']['vnext'][0]['address'] == '2001:db8::1'
     assert 'fixture-server-key' not in records['OUTBOUND'] + records['LINK']
-    assert 'flow=xtls-rprx-vision' in records['TCP'] and 'type=tcp' in records['TCP']
+    tcp = parse_qs(urlsplit(records['TCP']).query)
+    assert tcp['flow'] == ['xtls-rprx-vision'] and tcp['type'] == ['tcp']
+    assert tcp['support-x25519mlkem768'] == ['true'] and tcp['fp'] == ['chrome']
     assert records['RESET'] == records['LEGACY']
     assert records['LINK'] in out and 'Reality / XHTTP' in out
 
@@ -2386,7 +2749,7 @@ def test_cforigin_xhttp_menu_profiles_and_links():
     assert_true((server['address'], server['port']) == ('origin.example.com', 8443), server)
     assert_true(stream['tlsSettings']['alpn'] == ['h3'] and stream['tlsSettings']['serverName'] == 'origin.example.com', stream)
     assert_true(stream['xhttpSettings'] == {
-        'host': 'origin.example.com', 'path': '/origin-test', 'mode': 'packet-up', 'extra': h3_extra,
+        'host': 'origin.example.com', 'path': '/origin-test', 'mode': 'packet-up', 'extra': expected_extra,
     }, stream)
     assert_true(ws['type'] == ['ws'] and 'mode' not in ws and 'extra' not in ws, ws)
     assert_true(default['mode'] == ['stream-one'] and json.loads(default['extra'][0]) == {'xhttpModeH3': True}, default)
@@ -2473,15 +2836,51 @@ def test_illegal_trojan_transport_state_does_not_lock_config_synthesis():
     assert_true(cp.returncode == 0, "healed state must not leave config synthesis fail-closed")
 
 
+def test_argo_draft_and_runtime_transport_edits_share_field_rules():
+    run_bash(r'''
+        source ./xray_2go.sh
+        set -e
+        st_init
+        st_set '.argo.enabled = true | .argo.protocol = "xhttp" | .argo.auth_protocol = "vless"'
+        st_persist
+        changes=0
+        argo_apply_fixed_tunnel_from_state() { changes=$((changes+1)); }
+        argo_check_health() { :; }
+        config_print_nodes() { :; }
+        prompt() { [[ "$input" != eof ]] && printf -v "$2" '%s' "$input"; }
+        for action in install_plan_argo_update_protocol module_argo_update_protocol; do
+            input=''
+            "$action"
+            [[ $(st_get '.argo.protocol') == xhttp && "$changes" -eq 0 ]]
+            input=unexpected
+            if "$action"; then exit 1; fi
+            input=eof
+            if "$action"; then exit 1; fi
+            [[ $(st_get '.argo.protocol') == xhttp && "$changes" -eq 0 ]]
+        done
+        input=1
+        install_plan_argo_update_protocol
+        [[ $(st_get '.argo.protocol') == ws && "$changes" -eq 0 ]]
+        st_set '.argo.protocol = "xhttp"'
+        module_argo_update_protocol
+        [[ $(st_get '.argo.protocol') == ws && "$changes" -eq 1 ]]
+    ''', timeout=45)
+
+
 def test_transport_switch_is_guarded_while_trojan_auth_is_active():
-    for fn in ["install_plan_argo_update_protocol", "_module_argo_update_protocol_impl"]:
-        m = re.search(rf"{fn}\(\) \{{(?P<body>.*?)\n\}}", TEXT, re.S)
-        assert_true(m, f"{fn} function missing")
-        body = m.group("body")
-        assert_true(
-            "auth_protocol" in body and "trojan" in body,
-            f"{fn} must refuse switching transport away from WS while Trojan auth is active",
-        )
+    run_bash(r'''
+        source ./xray_2go.sh
+        set -e
+        st_init
+        st_set '.argo.enabled = true | .argo.protocol = "ws" | .argo.auth_protocol = "trojan" | .argo.trojan_password = "fixture"'
+        st_persist
+        argo_apply_fixed_tunnel_from_state() { exit 2; }
+        prompt() { printf -v "$2" '%s' 2; }
+        for action in install_plan_argo_update_protocol module_argo_update_protocol; do
+            if "$action"; then exit 1; fi
+            [[ $(st_get '.argo.protocol') == ws ]]
+        done
+    ''')
 
 
 def test_runtime_argo_updates_roll_back_in_memory_state_on_apply_failure():
@@ -3572,7 +3971,8 @@ _G_STATE="$_STATE_DEFAULT"
 _st_normalize_schema >/dev/null
 server=$(head -c 32 /dev/zero | base64 | tr -d '\\n')
 user=$(head -c 32 /dev/zero | base64 | tr -d '\\n')
-st_set '.ss2022.enabled = true | .ss2022.method = "2022-blake3-aes-256-gcm" | .ss2022.server_key = $server | .ss2022.user_key = $user' --arg server "$server" --arg user "$user" >/dev/null
+st_set '.ss2022.enabled = true | .ss2022.method = "2022-blake3-aes-256-gcm" | .ss2022.server_key = $server | .ss2022.user_key = $user | del(.ss2022.key_mode)' --arg server "$server" --arg user "$user" >/dev/null
+_st_normalize_schema >/dev/null
 platform_get_realip() { printf '203.0.113.10'; }
 plugin_refresh_runtime >/dev/null
 printf 'ports=%s\\n' "$(plugin_call ss2022 ports | paste -sd, -)"
@@ -3594,6 +3994,45 @@ printf 'link=%s\\n' "$(plugin_call ss2022 link)"
     assert_true(decoded.startswith("2022-blake3-aes-256-gcm:") and decoded.count(":") == 2, f"SS2022 link must encode method/server/user keys: {decoded}")
 
 
+def test_ss2022_single_key_profiles_generate_inbound_and_sip002_link():
+    import base64
+    import json
+    from urllib.parse import unquote, urlsplit
+
+    out = run_bash(r'''
+        source ./xray_2go.sh
+        set -e
+        st_init
+        st_set '.argo.enabled = false | .uuid = "00000000-0000-4000-8000-000000000000"'
+        plugin_refresh_runtime
+        platform_get_realip() { printf '%s' 2001:db8::10; }
+        for selection in 1 2 3; do
+            prompt() { printf -v "$2" '%s' "$selection"; }
+            install_plan_ss2022_update_method >/dev/null
+            _module_ss2022_enable_prepare
+            install_plan_validate >/dev/null
+            plugin_call ss2022 inbound | jq -c .
+            plugin_call ss2022 link
+        done
+    ''', timeout=35)
+    inbounds = [json.loads(line) for line in out.splitlines() if line.startswith('{')]
+    links = [urlsplit(line) for line in out.splitlines() if line.startswith('ss://')]
+    methods = (
+        ('2022-blake3-aes-256-gcm', 32),
+        ('2022-blake3-aes-128-gcm', 16),
+        ('2022-blake3-chacha20-poly1305', 32),
+    )
+    assert len(inbounds) == len(links) == len(methods)
+    for inbound, link, (method, key_bytes) in zip(inbounds, links, methods, strict=True):
+        settings = inbound['settings']
+        assert inbound['protocol'] == 'shadowsocks' and settings['network'] == 'tcp,udp'
+        assert settings['method'] == method and 'clients' not in settings
+        key = settings['password']
+        assert len(base64.b64decode(key, validate=True)) == key_bytes
+        assert link.username == method and unquote(link.password or '') == key
+        assert link.hostname == '2001:db8::10' and link.port == 8388
+
+
 def test_ss2022_runtime_config_uses_plugin_collector():
     out = run_bash("""
 source ./xray_2go.sh
@@ -3608,7 +4047,7 @@ config_synthesize | jq -c '{count:(.inbounds|length), ss:(.inbounds[] | select(.
     assert_true('"count":1' in out and '"ss":{"port":8388' in out and '"method":"2022-blake3-aes-256-gcm"' in out, f"SS2022 config synthesis failed: {out}")
 
 
-def test_ss2022_enable_prepare_generates_valid_key_pair():
+def test_ss2022_enable_prepare_generates_one_key_by_default():
     out = run_bash("""
 source ./xray_2go.sh
 _G_STATE="$_STATE_DEFAULT"
@@ -3619,11 +4058,11 @@ method=$(st_get '.ss2022.method')
 server=$(st_get '.ss2022.server_key')
 user=$(st_get '.ss2022.user_key')
 val_ss2022_key "$method" "$server" >/dev/null || exit 11
-val_ss2022_key "$method" "$user" >/dev/null || exit 12
+[[ -z "$user" ]] || exit 12
 printf 'enabled=%s method=%s server_len=%s user_len=%s\\n' "$(st_get '.ss2022.enabled')" "$method" "$(printf '%s' "$server" | wc -c)" "$(printf '%s' "$user" | wc -c)"
 """)
     assert_true("enabled=true" in out and "method=2022-blake3-aes-256-gcm" in out, f"SS2022 enable preparation failed: {out}")
-    assert_true("server_len=44" in out and "user_len=44" in out, f"SS2022 generated key lengths are wrong: {out}")
+    assert_true("server_len=44" in out and "user_len=0" in out, f"SS2022 generated key lengths are wrong: {out}")
 
 
 def test_ss2022_install_plan_validation_accepts_enabled_state():
@@ -3642,30 +4081,71 @@ printf 'validated\\n'
 
 
 def test_ss2022_transaction_rolls_back_state_and_disk_on_apply_failure():
-    out = run_bash("""
-source ./xray_2go.sh
-_G_STATE="$_STATE_DEFAULT"
-_st_normalize_schema >/dev/null
-server=$(head -c 32 /dev/zero | base64 | tr -d '\\n')
-user=$(head -c 32 /dev/zero | base64 | tr -d '\\n')
-st_set '.ss2022.enabled = true | .ss2022.method = "2022-blake3-aes-256-gcm" | .ss2022.server_key = $server | .ss2022.user_key = $user' --arg server "$server" --arg user "$user" >/dev/null
-st_persist
-config_apply() { return 37; }
-new_server=$(head -c 16 /dev/zero | base64 | tr -d '\\n')
-new_user=$(head -c 16 /dev/zero | base64 | tr -d '\\n')
-_module_update_state_transaction "probe method" _module_ss2022_update_method_inner true 2022-blake3-aes-128-gcm "$new_server" "$new_user" >/dev/null 2>&1 || :
-_module_update_state_transaction "probe listen" _module_update_listen_transaction_inner ss2022 127.0.0.1 >/dev/null 2>&1 || :
-printf 'method=%s listen=%s disk_method=%s disk_listen=%s server_same=%s\\n' \\
-    "$(st_get '.ss2022.method')" \\
-    "$(st_get '.ss2022.listen')" \\
-    "$(jq -r '.ss2022.method' "$STATE_FILE")" \\
-    "$(jq -r '.ss2022.listen' "$STATE_FILE")" \\
-    "$( [ "$(st_get '.ss2022.server_key')" = "$server" ] && printf yes || printf no )"
-""")
-    assert_true(
-        "method=2022-blake3-aes-256-gcm listen=0.0.0.0 disk_method=2022-blake3-aes-256-gcm disk_listen=0.0.0.0 server_same=yes" in out,
-        f"SS2022 transactional update did not restore state/config inputs: {out}",
-    )
+    run_bash(r'''
+        source ./xray_2go.sh
+        set -e
+        st_init
+        _ss2022_update_credentials install 2022-blake3-aes-256-gcm dual
+        _module_ss2022_enable_prepare
+        st_persist
+        before=$(st_get '.ss2022')
+        printf 'original' > "$CONFIG_FILE"
+        config_apply() { printf 'failed change' > "$CONFIG_FILE"; return 37; }
+        prompt() { printf -v "$2" '%s' 3; }
+        if module_ss2022_update_method; then exit 1; fi
+        [[ $(st_get '.ss2022') == "$before" ]]
+        [[ $(jq '.ss2022' "$STATE_FILE") == "$before" ]]
+        [[ $(<"$CONFIG_FILE") == original ]]
+        if module_ss2022_regenerate_keys; then exit 1; fi
+        [[ $(st_get '.ss2022') == "$before" ]]
+        prompt() { printf -v "$2" '%s' 127.0.0.1; }
+        if module_ss2022_update_listen; then exit 1; fi
+        [[ $(st_get '.ss2022.listen') == 0.0.0.0 ]]
+    ''', timeout=40)
+
+
+def test_ss2022_draft_disable_and_reenable_preserves_legacy_credentials():
+    run_bash(r'''
+        source ./xray_2go.sh
+        set -e
+        st_init
+        _ss2022_update_credentials install 2022-blake3-aes-256-gcm dual
+        _module_ss2022_enable_prepare
+        before=$(st_get '.ss2022')
+        install_plan_ss2022_toggle
+        [[ $(st_get '.ss2022.enabled') == false ]]
+        install_plan_ss2022_toggle
+        [[ $(st_get '.ss2022') == "$before" ]]
+    ''')
+
+
+def test_ss2022_runtime_switch_and_rotation_preserve_profile():
+    run_bash(r'''
+        source ./xray_2go.sh
+        set -e
+        st_init
+        _ss2022_update_credentials install 2022-blake3-aes-256-gcm dual
+        _module_ss2022_enable_prepare
+        st_persist
+        plugin_refresh_runtime
+        config_apply() { plugin_call ss2022 inbound > "$CONFIG_FILE"; }
+        config_print_nodes() { :; }
+        prompt() { printf -v "$2" '%s' "$selection"; }
+        selection=3
+        module_ss2022_update_method
+        [[ $(st_get '.ss2022.key_mode') == single && -z $(st_get '.ss2022.user_key') ]]
+        jq -e '.ss2022.key_mode == "single" and .ss2022.method == "2022-blake3-chacha20-poly1305"' "$STATE_FILE" >/dev/null
+        jq -e '.settings | has("clients") | not' "$CONFIG_FILE" >/dev/null
+        first=$(st_get '.ss2022.server_key')
+        module_ss2022_regenerate_keys
+        [[ $(st_get '.ss2022.server_key') != "$first" && -z $(st_get '.ss2022.user_key') ]]
+        selection=5
+        module_ss2022_update_method
+        [[ $(st_get '.ss2022.key_mode') == dual ]]
+        jq -e '.settings.method == "2022-blake3-aes-128-gcm" and (.settings.clients | length == 1)' "$CONFIG_FILE" >/dev/null
+        if _ss2022_update_credentials install 2022-blake3-chacha20-poly1305 dual; then exit 1; fi
+    ''', timeout=40)
+
 
 def test_port_update_starts_transaction_before_state_mutation():
     out = run_bash("""
@@ -3952,6 +4432,27 @@ unified_menu_argo runtime </dev/null
     assert_true('UNEXPECTED_PAUSE' not in out, out)
 
 
+def test_console_redraws_after_deployment_exit_and_pauses_once_for_results():
+    out = run_bash(r'''
+        source ./xray_2go.sh
+        st_init >/dev/null
+        _menu_collect_status() { _MENU_XI=0; _MENU_CX=1; }
+        _menu_render() { echo console; }
+        install_wizard_render() { echo wizard; }
+        install_plan_render_summary() { echo advanced; }
+        install_wizard_reality() { echo deployed; }
+        module_xray_upgrade() { echo upgraded; }
+        module_config_update_shortcut() { echo update_failed; return 1; }
+        prompt() { IFS= read -r "$2"; }
+        _pause() { echo feedback; }
+        menu <<< $'d\n0\nd\n3\n0\nd\n1\nx\ns\n0'
+    ''')
+    events = re.findall(r'^(console|wizard|advanced|deployed|upgraded|update_failed|feedback)$', out, re.M)
+    assert_true(events == ['console', 'wizard', 'console', 'wizard', 'advanced', 'console',
+                           'wizard', 'deployed', 'feedback', 'console', 'upgraded', 'feedback',
+                           'console', 'update_failed', 'feedback', 'console'], events)
+
+
 def test_main_menu_status_and_key_dispatch():
     out = run_bash(r'''
 source ./xray_2go.sh
@@ -3975,7 +4476,7 @@ _menu_render
 printf '%s\n' ROUTES
 _menu_render() { :; }
 module_dispatch() { printf 'route=%s\n' "$*"; }
-(menu <<< $'1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\nd\nu\ns\n12\n0')
+(menu <<< $'1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\nd\nu\ns\nx\n12\n0')
 module_dispatch() { IFS= read -r input; printf 'action stdin=%s\n' "$input"; }
 _menu_select_action s <<< original-input
     ''', timeout=70)
@@ -3986,13 +4487,13 @@ _menu_select_action s <<< original-input
     assert_true('Xray-2go 控制台' in installed and '运行中' in installed, installed)
     for detail in ['long-argo-domain-for-terminal-width-check.example.com', '2001:db8:1234:5678:9101:abcd:eded:42', '61107']:
         assert_true(detail in installed, installed)
-    for label in ['连接', '入站管理', '维护', '1. 查看节点与连接提示', '2. Argo 固定隧道', '10. Shadowsocks 2022', '11. 更新 UUID', 'u. 卸载整套 Xray-2go']:
+    for label in ['连接', '入站管理', '维护', '1. 查看节点与连接提示', '2. Argo 固定隧道', '10. Shadowsocks 2022', '11. 更新 UUID', 'x. 升级 Xray 内核', 'u. 卸载整套 Xray-2go']:
         assert_true(label in installed, installed)
     overview = installed.split('连接', 1)[0]
     assert_true('Reality' not in overview and '未启用' not in overview, overview)
     expected = ['nodes show', 'argo', 'reality', 'vltcp', 'vlquic', 'ff', 'cforigin',
                 'socks', 'http', 'ss2022', 'config update_uuid', 'xray install',
-                'xray uninstall', 'config update_shortcut']
+                'xray uninstall', 'config update_shortcut', 'xray upgrade']
     actual = re.findall(r'^route=(.*)$', routes, re.MULTILINE)
     assert_true(actual == expected, f'main menu routes: {actual!r}')
     assert_true('无效选项' in routes and '已退出' in routes, routes)
@@ -4009,8 +4510,12 @@ def test_ss2022_updates_use_transactional_state_commit():
     method_body = _function_body("module_ss2022_update_method")
     keys_body = _function_body("module_ss2022_regenerate_keys")
     listen_body = _function_body("module_update_listen_action")
-    assert_true("_module_update_state_transaction" in method_body, "SS2022 method updates must use the transactional state helper")
-    assert_true("_module_update_state_transaction" in keys_body, "SS2022 key rotation must use the transactional state helper")
+    select_body = _function_body("_ss2022_select_method")
+    credentials_body = _function_body("_module_ss2022_apply_credentials")
+    assert_true("_ss2022_select_method runtime" in method_body, "SS2022 method updates must select the runtime path")
+    assert_true("_module_ss2022_apply_credentials" in select_body, "SS2022 runtime method selection must use the shared credential update")
+    assert_true("_module_ss2022_apply_credentials" in keys_body, "SS2022 key rotation must use the shared runtime credential update")
+    assert_true("_module_update_state_transaction" in credentials_body, "SS2022 credential updates must use the transactional state helper")
     assert_true("_module_update_listen_transaction" in listen_body, "listen updates must use the transactional state helper")
     for body in (method_body, keys_body, listen_body):
         assert_true("_module_persist_after_optional_apply" not in body, "SS2022 updates must not use the non-transactional persistence helper")
