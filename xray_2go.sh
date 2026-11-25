@@ -98,8 +98,10 @@ _TXN_PRE_TUNNEL_ACTIVE=0
 _TXN_TUNNEL_RESTART_ATTEMPTED=0
 _TXN_PRE_XRAY_ENABLED=0
 _TXN_PRE_TUNNEL_ENABLED=0
-_TXN_FW_SEQUENCE=0
-_TXN_FW_RECORD_FAILED=0
+_FW_SCOPE_DIR=""
+declare -A _FW_LEDGER_STATE=()
+_FW_SEQUENCE=0
+_FW_RECORD_FAILED=0
 _TXN_ARTIFACT_PATHS=()
 _UPDATE_PID=""
 
@@ -117,7 +119,7 @@ _trap_int() {
         kill -TERM "${_UPDATE_PID}" 2>/dev/null || true
         wait "${_UPDATE_PID}" 2>/dev/null || true
     fi
-    if [ "${_TXN_ACTIVE:-0}" -eq 1 ] || [ "${_TXN_FW_ONLY:-0}" -eq 1 ]; then
+    if [ "${_TXN_ACTIVE:-0}" -eq 1 ]; then
         local _keep_snapshot=0
         trap '' INT TERM
         _transaction_rollback || _keep_snapshot=1
@@ -1441,11 +1443,12 @@ _argo_xhttp_download_settings() {
 _argo_xhttp_client_stream() {
     local _kind="$1" _profile _settings _host _down _public
     _host=$(st_get '.argo.domain') || return 1
+    [ -n "${_host}" ] && [ "${_host}" != null ] || return 1
     _settings=$(_xhttp_client_settings argo /argo "${_host}") || return 1
     if [ "${_kind}" = split ]; then
         _argo_xhttp_split_active || return 1
         _public=$(st_get '.reality.pbk') || return 1
-        [ -n "${_public}" ] || return 1
+        [ -n "${_public}" ] && [ "${_public}" != null ] || return 1
         _profile=$(_xhttp_saved_profile argo) || return 1
         _down=$(_argo_xhttp_download_settings "${_profile}" "${_host}") || return 1
         jq -c --arg mode "$(jq -r '.split.mode // "packet-up"' <<< "${_profile}")" --argjson down "${_down}" \
@@ -1482,15 +1485,7 @@ _ff_xhttp_client_stream() {
 }
 
 _ff_xhttp_link() {
-    local _address _stream _mode _extra
-    _address=$(platform_get_realip)
-    [ -n "${_address}" ] || { log_warn "无法获取服务器 IP，FreeFlow 节点已跳过"; return 0; }
-    _stream=$(_ff_xhttp_client_stream "${_address}") || return 1
-    _mode=$(jq -r '.xhttpSettings.mode' <<< "${_stream}") || return 1
-    _extra=$(jq -r '.xhttpSettings.extra // empty | tojson | @uri' <<< "${_stream}") || return 1
-    printf 'vless://%s@%s:%s?encryption=none&security=none&type=xhttp&host=%s&path=%s&mode=%s%s#FreeFlow-XHTTP\n' \
-        "$(st_get '.uuid')" "${_address}" "$(port_of ff)" "${_address}" "$(urlencode_path "$(st_get '.ff.path')")" \
-        "${_mode}" "${_extra:+&extra=${_extra}}"
+    _xhttp_link ff
 }
 
 _vlquic_xhttp_client_stream() {
@@ -1502,14 +1497,7 @@ _vlquic_xhttp_client_stream() {
 }
 
 _vlquic_xhttp_link() {
-    local _domain _stream _mode _extra
-    _domain=$(st_get '.vlquic.domain')
-    [ -n "${_domain}" ] || return 0
-    _stream=$(_vlquic_xhttp_client_stream "${_domain}") || return 1
-    _mode=$(jq -r '.xhttpSettings.mode' <<< "${_stream}") || return 1
-    _extra=$(jq -r '(.xhttpSettings.extra // {}) + {xhttpModeH3:true} | tojson | @uri' <<< "${_stream}") || return 1
-    printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=chrome&alpn=h3&type=xhttp&host=%s&path=%%2F&mode=%s&extra=%s&xhttpModeH3=true#VLESS-XHTTP-H3\n' \
-        "$(st_get '.uuid')" "${_domain}" "$(port_of vlquic)" "${_domain}" "${_domain}" "${_mode}" "${_extra}"
+    _xhttp_link vlquic
 }
 
 _reality_xhttp_client_stream() {
@@ -1527,16 +1515,7 @@ _reality_xhttp_client_stream() {
 }
 
 _reality_xhttp_link() {
-    local _ip _stream _mode _extra
-    _stream=$(_reality_xhttp_client_stream) || return 1
-    _ip=$(platform_get_realip)
-    [ -n "${_ip}" ] || { log_warn "无法获取服务器 IP，Reality 节点已跳过"; return 0; }
-    if [[ "${_ip}" == *:* && "${_ip}" != \[*\] ]]; then _ip="[${_ip}]"; fi
-    _mode=$(jq -r '.xhttpSettings.mode' <<< "${_stream}") || return 1
-    _extra=$(jq -r '.xhttpSettings.extra // empty | tojson | @uri' <<< "${_stream}") || return 1
-    printf 'vless://%s@%s:%s?encryption=none&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=xhttp&path=%%2F&mode=%s%s&support-x25519mlkem768=true#Reality-XHTTP\n' \
-        "$(st_get '.uuid')" "${_ip}" "$(port_of reality)" "$(st_get '.reality.sni')" "$(st_get '.reality.pbk')" \
-        "$(st_get '.reality.sid')" "${_mode}" "${_extra:+&extra=${_extra}}"
+    _xhttp_link reality
 }
 
 _cforigin_xhttp_client_stream() {
@@ -1550,44 +1529,48 @@ _cforigin_xhttp_client_stream() {
 }
 
 _cforigin_xhttp_link() {
-    local _domain _uuid _edge_port _penc _stream _mode _extra _alpn='' _h3flag='' _tag
-    _domain=$(st_get '.cforigin.domain')
-    [ -n "${_domain}" ] || { log_warn "请先配置 CF Origin 域名，再导出分享链接"; return 1; }
-    _uuid=$(st_get '.uuid')
-    _edge_port=$(st_get '.cforigin.edge_port')
-    _penc=$(urlencode_path "$(st_get '.cforigin.path')")
-    _stream=$(_cforigin_xhttp_client_stream) || return 1
-    _mode=$(jq -r '.xhttpSettings.mode' <<< "${_stream}") || return 1
-    _extra=$(jq -r '
-        if .tlsSettings.alpn == ["h3"] then .xhttpSettings.extra.xhttpModeH3 = true else . end |
-        .xhttpSettings.extra // empty | tojson | @uri
-    ' <<< "${_stream}") || return 1
-    _tag="CF-Origin-XHTTP"
-    if [ "$(st_get '.cforigin.edge_h3')" = true ]; then
-        _alpn='&alpn=h3'
-        _h3flag='&xhttpModeH3=true'
-        _tag="CF-Origin-XHTTP-H3-Experimental"
-    fi
-    printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=chrome&type=xhttp&host=%s&path=%s&mode=%s%s%s%s#%s\n' \
-        "${_uuid}" "${_domain}" "${_edge_port}" "${_domain}" "${_domain}" "${_penc}" \
-        "${_mode}" "${_alpn}" "${_extra:+&extra=${_extra}}" "${_h3flag}" "${_tag}"
+    _xhttp_link cforigin
 }
 
 _argo_xhttp_link() {
-    local _outbound
-    _outbound=$(_argo_xhttp_export_json "$1") || return 1
-    jq -r '
+    _xhttp_link argo "$1"
+}
+
+_xhttp_link() {
+    local _module="$1" _outbound
+    _outbound=$("_${_module}_xhttp_export_json" "${2:-}") || return 1
+    _xhttp_link_from_outbound "${_module}" "${_outbound}"
+}
+
+_xhttp_link_from_outbound() {
+    jq -r --arg id "$1" '
         .settings.vnext[0] as $peer | .streamSettings as $stream | $stream.xhttpSettings as $xhttp |
         ($peer.address | if contains(":") then "[" + . + "]" else . end) as $address |
         ($stream.realitySettings // $stream.tlsSettings) as $security |
+        ($stream.tlsSettings.alpn == ["h3"]) as $h3 |
+        (if $id == "argo" then
+            if $stream.security == "reality" then "Argo-XHTTP-Split" else "Argo-XHTTP" end
+         elif $id == "reality" then "Reality-XHTTP"
+         elif $id == "ff" then "FreeFlow-XHTTP"
+         elif $id == "vlquic" then "VLESS-XHTTP-H3"
+         elif $h3 then "CF-Origin-XHTTP-H3-Experimental"
+         else "CF-Origin-XHTTP" end) as $tag |
         "vless://\($peer.users[0].id)@\($address):\($peer.port)?encryption=none&security=\($stream.security)" +
-        "&sni=\($security.serverName | @uri)&fp=chrome&type=xhttp&host=\($xhttp.host | @uri)&path=\($xhttp.path | @uri)&mode=\($xhttp.mode)" +
-        (if $stream.security == "reality" then
+        (if $security then "&sni=\($security.serverName | @uri)&fp=chrome" else "" end) +
+        (if $id == "reality" then "&pbk=\($security.password | @uri)&sid=\($security.shortId | @uri)" else "" end) +
+        (if $id == "vlquic" then "&alpn=h3" else "" end) +
+        "&type=xhttp" +
+        (if $xhttp.host != null then "&host=\($xhttp.host | if $id == "ff" then . else @uri end)" else "" end) +
+        "&path=\($xhttp.path | @uri)&mode=\($xhttp.mode)" +
+        (if $id == "argo" and $stream.security == "reality" then
             "&pbk=\($security.password | @uri)&sid=\($security.shortId | @uri)&support-x25519mlkem768=true"
         else "" end) +
-        (if $xhttp.extra then "&extra=\($xhttp.extra | @uri)" else "" end) +
-        (if $stream.security == "reality" then "#Argo-XHTTP-Split" else "#Argo-XHTTP" end)
-    ' <<< "${_outbound}"
+        (if $h3 and $id == "cforigin" then "&alpn=h3" else "" end) +
+        (if $h3 then "&extra=\(($xhttp.extra // {}) + {xhttpModeH3:true} | @uri)&xhttpModeH3=true"
+         elif $xhttp.extra then "&extra=\($xhttp.extra | @uri)" else "" end) +
+        (if $id == "reality" then "&support-x25519mlkem768=true" else "" end) +
+        "#\($tag)"
+    ' <<< "${2}"
 }
 
 _argo_xhttp_split_inbound() {
@@ -2354,31 +2337,45 @@ _fw_apply_step() {
     [ "${_before}" != ambiguous ] || return 1
     _state=$(_fw_rule_state "${_backend}" "${_layer}" "${_port}" "${_proto}") || return 1
     [ "${_state}" = "${_before}" ] || return 1
-    _step=$((_TXN_FW_SEQUENCE + 1))
-    _entry="${_TXN_DIR}/firewall.${_step}"
+    _step=$((_FW_SEQUENCE + 1))
+    _entry="${_FW_SCOPE_DIR}/firewall.${_step}"
     if ! printf '%s %s %s %s %s %s\n' "$@" > "${_entry}.before"; then
-        _TXN_FW_RECORD_FAILED=1
+        _FW_RECORD_FAILED=1
         return 1
     fi
-    _TXN_FW_SEQUENCE=${_step}
+    _FW_SEQUENCE=${_step}
     _fw_change_backend "$@" || return 1
     if ! _state=$(_fw_rule_state "${_backend}" "${_layer}" "${_port}" "${_proto}") ||
        ! _fw_state_matches "${_state}" "${_target}" ||
        ! printf '%s\n' "${_state}" > "${_entry}.after"; then
-        _TXN_FW_RECORD_FAILED=1
+        _FW_RECORD_FAILED=1
         return 1
     fi
 }
 
-_fw_restore_removed_rule_record() {
-    local _rule="$1:$2/$3" _slot
-    _slot=$(awk -F '\t' -v p="${_FW_RULES_FILE}" '$2 == 1 && $3 == p { print $1 }' "${_TXN_DIR}/manifest") || return 1
-    [ -n "${_slot}" ] || return 0
-    if grep -Fxq -- "${_rule}" "${_TXN_DIR}/files/${_slot}"; then
-        _fw_mark_rule "$@"
+_fw_ledger_snapshot_state() {
+    local _snapshot="$1" _marker="$1.state" _expected _digest
+    _expected="${_FW_LEDGER_STATE[${_snapshot##*/}]-}"
+    [ -d "${_snapshot%/*}" ] && [ ! -L "${_snapshot%/*}" ] || return 1
+    [ -f "${_marker}" ] && [ ! -L "${_marker}" ] || return 1
+    [ -n "${_expected}" ] && cmp -s -- "${_marker}" <(printf '%s\n' "${_expected}") || return 1
+    if [ "${_expected}" = absent ]; then
+        [ ! -e "${_snapshot}" ] && [ ! -L "${_snapshot}" ] || return 1
+        printf 'absent\n'
     else
-        [ "$?" -eq 1 ]
+        [ -f "${_snapshot}" ] && [ ! -L "${_snapshot}" ] || return 1
+        _digest=$(sha256sum < "${_snapshot}") || return 1
+        _digest=${_digest%% *}
+        [ "present ${_digest}" = "${_expected}" ] || return 1
+        printf '%s\n' "${_digest}"
     fi
+}
+
+_fw_restore_removed_rule_record() {
+    local _rule="$1:$2/$3" _snapshot="${_FW_SCOPE_DIR}/firewall-ledgers/${_FW_RULES_FILE##*/}" _state
+    _state=$(_fw_ledger_snapshot_state "${_snapshot}") || return 1
+    [ "${_state}" != absent ] && grep -Fxq -- "${_rule}" "${_snapshot}" || return 1
+    _fw_mark_rule "$@"
 }
 
 _fw_undo_step() {
@@ -2409,24 +2406,67 @@ _fw_undo_step() {
     fi
 }
 
-# Uninstall holds its own lock. Give each removal a rollback scope so a retry
-# continues from the rules whose removal and ownership updates both succeeded.
+_fw_scope_begin() {
+    local _dir="$1" _file _snapshot _digest _state
+    shift
+    mkdir "${_dir}/firewall-ledgers" || return 1
+    _FW_LEDGER_STATE=()
+    for _file in "${_FW_RULES_FILE}" "$@"; do
+        _snapshot="${_dir}/firewall-ledgers/${_file##*/}"
+        if [ -e "${_file}" ] || [ -L "${_file}" ]; then
+            [ -f "${_file}" ] && [ ! -L "${_file}" ] || return 1
+            _digest=$(sha256sum < "${_file}") || return 1
+            cp -a -- "${_file}" "${_snapshot}" || return 1
+            _state="present ${_digest%% *}"
+        else
+            _state=absent
+        fi
+        _FW_LEDGER_STATE["${_file##*/}"]="${_state}"
+        printf '%s\n' "${_state}" > "${_snapshot}.state" || return 1
+        _fw_ledger_snapshot_state "${_snapshot}" >/dev/null || return 1
+    done
+    _FW_SCOPE_DIR="${_dir}"
+    _FW_SEQUENCE=0
+    _FW_RECORD_FAILED=0
+}
+
+_fw_keep_snapshot() {
+    [ "${_FW_RECORD_FAILED}" -eq 1 ] || return 1
+    log_error "防火墙变更记录失败，事务快照保留于：${_FW_SCOPE_DIR}"
+    return 0
+}
+
+_fw_finish_standalone() {
+    local _dir="${_FW_SCOPE_DIR}" _keep=0
+    [ -n "${_dir}" ] || return 0
+    if [ "$1" -ne 0 ] && ! _fw_restore_managed_snapshot; then
+        log_error "防火墙回滚未完全成功，快照保留于：${_dir}"
+        _keep=1
+    elif _fw_keep_snapshot; then
+        _keep=1
+    fi
+    _FW_SCOPE_DIR=""
+    if [ "${_keep}" -eq 0 ] && ! rm -rf -- "${_dir}"; then
+        log_warn "防火墙快照清理失败：${_dir}"
+    fi
+}
+
+# Uninstall holds its own lock. Keep each successful removal on retry.
 _fw_run() {
-    if [ -n "${_TXN_DIR}" ]; then "$@"; return $?; fi
-    local _TXN_DIR="" _TXN_FW_ONLY=0 _TXN_FW_SEQUENCE=0 _TXN_FW_RECORD_FAILED=0
-    local _rc=0 _keep_snapshot=0 _traps
+    if [ -n "${_FW_SCOPE_DIR}" ]; then "$@"; return $?; fi
+    local _FW_SCOPE_DIR="" _FW_SEQUENCE=0 _FW_RECORD_FAILED=0
+    local -A _FW_LEDGER_STATE=()
+    local _dir _rc=0 _traps
     mkdir -p "${WORK_DIR}" || return 1
-    _TXN_DIR=$(mktemp -d "${WORK_DIR}/.txn_XXXXXX") || return 1
-    _TXN_FW_ONLY=1
-    if ! mkdir "${_TXN_DIR}/files" || ! _transaction_snapshot_file "${_FW_RULES_FILE}" 0; then
-        _transaction_end 1
+    _dir=$(mktemp -d "${WORK_DIR}/.txn_XXXXXX") || return 1
+    if ! _fw_scope_begin "${_dir}"; then
+        log_error "创建防火墙快照失败，快照保留于：${_dir}"
         return 1
     fi
     _traps=$(trap -p INT TERM)
-    trap '_trap_int' INT TERM
+    trap 'trap "" INT TERM; _fw_finish_standalone 130; _trap_int' INT TERM
     "$@" || _rc=$?
-    if [ "${_rc}" -ne 0 ]; then _transaction_rollback || _keep_snapshot=1; fi
-    _transaction_end "${_keep_snapshot}"
+    _fw_finish_standalone "${_rc}"
     trap - INT TERM
     eval "${_traps}"
     return "${_rc}"
@@ -2466,7 +2506,7 @@ _fw_open_port_inner() {
         _fw_apply_step "${_backend}" rule "${_port}" "${_proto}" "${_state}" present || return 1
     fi
     if ! _fw_mark_rule "${_backend}" "${_port}" "${_proto}"; then
-        _TXN_FW_RECORD_FAILED=1
+        _FW_RECORD_FAILED=1
         return 1
     fi
     log_ok "防火墙已开放: ${_port}/${_proto} (${_backend})"
@@ -2505,7 +2545,7 @@ _fw_close_port_inner() {
         fi
     fi
     if ! _fw_unmark_rule "${_backend}" "${_port}" "${_proto}"; then
-        _TXN_FW_RECORD_FAILED=1
+        _FW_RECORD_FAILED=1
         return 1
     fi
 }
@@ -2539,17 +2579,44 @@ EOF
         else
             rm -f "${_FW_PORTS_FILE}" 2>/dev/null || _failed=1
         fi
-        [ "${_failed}" -eq 0 ] || _TXN_FW_RECORD_FAILED=1
+        [ "${_failed}" -eq 0 ] || _FW_RECORD_FAILED=1
     fi
     [ "${_failed}" -eq 0 ] || { log_error "部分防火墙规则同步失败"; return 1; }
 }
 
+_fw_restore_ledger() {
+    local _file="$1" _snapshot="${_FW_SCOPE_DIR}/firewall-ledgers/${1##*/}" _state _staged _digest
+    _state=$(_fw_ledger_snapshot_state "${_snapshot}") || return 1
+    if [ "${_state}" = absent ]; then
+        rm -f -- "${_file}"
+        return $?
+    fi
+    # Stage the verified copy so a failed copy leaves the current ledger intact.
+    _staged=$(mktemp "${_snapshot}.restore_XXXXXX") || return 1
+    cp -a -- "${_snapshot}" "${_staged}" || return 1
+    [ -f "${_staged}" ] && [ ! -L "${_staged}" ] || return 1
+    _digest=$(sha256sum < "${_staged}") || return 1
+    [ "${_digest%% *}" = "${_state}" ] || return 1
+    mv -fT -- "${_staged}" "${_file}"
+}
+
 _fw_restore_managed_snapshot() {
-    local _step _entry _failed=0
-    for ((_step=_TXN_FW_SEQUENCE; _step>0; _step--)); do
-        _entry="${_TXN_DIR}/firewall.${_step}"
+    local _step _entry _failed=0 _file
+    for ((_step=_FW_SEQUENCE; _step>0; _step--)); do
+        _entry="${_FW_SCOPE_DIR}/firewall.${_step}"
         if ! _fw_undo_step "${_entry}"; then
             log_warn "无法恢复防火墙变更：${_entry}.before"
+            _failed=1
+        fi
+    done
+    # Keep current ownership evidence if any live change could not be undone.
+    if [ "${_failed}" -eq 0 ] && ! _fw_restore_ledger "${_FW_RULES_FILE}"; then
+        log_warn "无法恢复防火墙账本：${_FW_RULES_FILE}"
+        _failed=1
+    fi
+    for _file; do
+        if ! _fw_restore_ledger "${_file}"; then
+            log_warn "无法恢复防火墙账本：${_file}"
             _failed=1
         fi
     done
@@ -2659,24 +2726,34 @@ svc_exec() {
     return "${_rc}"
 }
 
-svc_status() {
-    local _name="$1" _rc
-    _rc=0
+# 0 active, 1 stopped, 2 unknown, 3 service absent.
+_svc_runtime_state() {
+    local _name="$1" _rc=0
     svc_exec status "${_name}" >/dev/null 2>&1 || _rc=$?
-    [ "${_rc}" -eq 0 ] && return 0
+    case "${_rc}" in
+        0) return 0 ;;
+        3) return 1 ;;
+    esac
     if is_systemd; then
-        { [ "${_rc}" -eq 3 ] || [ "${_rc}" -eq 4 ]; } && return 1
-        return 2
-    fi
-    if is_openrc; then
-        [ "${_rc}" -eq 3 ] && return 1
+        [ "${_rc}" -eq 4 ] && return 3
+    elif is_openrc; then
         if [ "${_rc}" -eq 1 ] &&
             [ ! -e "${_SVC_OPENRC_DIR}/${_name}" ] && [ ! -L "${_SVC_OPENRC_DIR}/${_name}" ]; then
-            return 1
+            return 3
         fi
+    elif [ "${_rc}" -eq 1 ]; then
+        return 1
     fi
-    if ! is_openrc && [ "${_rc}" -eq 1 ]; then return 1; fi
     return 2
+}
+
+svc_status() {
+    local _status=0
+    _svc_runtime_state "$1" || _status=$?
+    case "${_status}" in
+        3) return 1 ;;
+        *) return "${_status}" ;;
+    esac
 }
 
 svc_enabled_status() {
@@ -2891,7 +2968,10 @@ svc_verify_health() {
             log_ok "${_svc} 运行正常 (${_i}s 内就绪)"; return 0; }
     done
     log_error "${_svc} 启动失败"
-    if is_systemd; then
+    # systemd status and journal output may include the tunnel token.
+    if [ "${_svc}" = "${_SVC_TUNNEL}" ]; then
+        log_warn "请检查本地 Tunnel 服务和认证配置"
+    elif is_systemd; then
         journalctl -u "${_svc}" --no-pager -n 20 2>/dev/null >&2 || true
         systemctl status "${_svc}" --no-pager -l 2>/dev/null >&2 || true
     fi
@@ -3062,8 +3142,6 @@ _transaction_collect_artifacts() {
         "${CONFIG_FILE}"
         "${STATE_FILE}"
         "${_CONFIG_HASH_FILE}"
-        "${_FW_PORTS_FILE}"
-        "${_FW_RULES_FILE}"
         "${_ARGO_ENV_FILE}"
         "${ARGO_BIN}"
         "${_ACME_ENV_FILE}"
@@ -3074,7 +3152,7 @@ _transaction_collect_artifacts() {
         "${_SVC_OPENRC_DIR}/${_SVC_XRAY}"
         "${_SVC_OPENRC_DIR}/${_SVC_TUNNEL}"
         "${_SYSCTL_FILE}"
-        "${_cforigin_cert_artifacts[@]}"
+        "${_cert_artifacts[@]}"
     )
     local _p
     for _p in "${STATE_FILE}".*.bak "${CONFIG_FILE}".*.bak; do
@@ -3132,14 +3210,21 @@ _transaction_begin() {
         return 1
     fi
     if [ "${_install_transaction:-0}" -eq 1 ]; then
-        if check_xray_install; then
-            log_error "Xray-2go 已安装。如需重装，请先用维护菜单卸载"
+        if ! _require_first_deploy; then
             _transaction_lock_release
             return 1
         fi
         _st_check_disk_state || { _transaction_lock_release; return 1; }
     else
         _st_refresh_transaction_state || { _transaction_lock_release; return 1; }
+    fi
+    if [ "$#" -gt 0 ]; then
+        local _check_rc=0
+        "$@" || _check_rc=$?
+        if [ "${_check_rc}" -ne 0 ]; then
+            _transaction_lock_release
+            return "${_check_rc}"
+        fi
     fi
     mkdir -p "${WORK_DIR}" || { _transaction_lock_release; return 1; }
     _TXN_DIR=$(mktemp -d "${WORK_DIR}/.txn_XXXXXX") || {
@@ -3150,15 +3235,13 @@ _transaction_begin() {
     _TXN_PRE_STATE="${_G_STATE}"
     _TXN_PRE_STATE_BASE="${_G_STATE_BASE}"
     _TXN_PRE_STATE_DISK="${_G_STATE_DISK}"
-    _transaction_snapshot_files || {
+    { _transaction_snapshot_files && _fw_scope_begin "${_TXN_DIR}" "${_FW_PORTS_FILE}"; } || {
         rm -rf "${_TXN_DIR}" 2>/dev/null || true
         _TXN_DIR=""
         _transaction_lock_release
         log_error "创建事务文件快照失败"
         return 1
     }
-    _TXN_FW_SEQUENCE=0
-    _TXN_FW_RECORD_FAILED=0
     _TXN_PRE_XRAY_ACTIVE=0
     _TXN_XRAY_RESTART_ATTEMPTED=0
     _TXN_PRE_TUNNEL_ACTIVE=0
@@ -3173,14 +3256,9 @@ _transaction_begin() {
 }
 
 _transaction_restore_files() {
-    local _restore_fw="$1" _p _i _exists
-    if [ "${_TXN_FW_ONLY:-0}" -eq 1 ]; then
-        local -a _TXN_ARTIFACT_PATHS=("${_FW_RULES_FILE}")
-    else
-        _transaction_collect_artifacts
-    fi
+    local _p _i _exists
+    _transaction_collect_artifacts
     for _p in "${_TXN_ARTIFACT_PATHS[@]}"; do
-        [ "${_p}" != "${_FW_RULES_FILE}" ] || [ "${_restore_fw}" -eq 1 ] || continue
         if ! awk -F '\t' -v p="${_p}" '$2 == 1 && $3 == p { found=1 } END { exit(found ? 0 : 1) }' \
             "${_TXN_DIR}/manifest"; then
             rm -rf -- "${_p}" 2>/dev/null || return 1
@@ -3188,7 +3266,6 @@ _transaction_restore_files() {
     done
     while IFS=$'\t' read -r _i _exists _p; do
         [ -n "${_p:-}" ] || continue
-        [ "${_p}" != "${_FW_RULES_FILE}" ] || [ "${_restore_fw}" -eq 1 ] || continue
         rm -rf -- "${_p}" 2>/dev/null || return 1
         [ "${_exists}" = 1 ] || continue
         mkdir -p "$(dirname "${_p}")" 2>/dev/null || return 1
@@ -3227,18 +3304,10 @@ _transaction_restore_service() {
 }
 
 _transaction_rollback() {
-    local _failed=0 _restored_state _reload=0 _restore_fw=0
-    if _fw_restore_managed_snapshot; then
-        _restore_fw=1
-    else
-        _failed=1
-    fi
-    if [ "${_TXN_FW_ONLY:-0}" -eq 1 ]; then
-        [ "${_restore_fw}" -eq 1 ] && _transaction_restore_files 1
-        return $?
-    fi
+    local _failed=0 _restored_state _reload=0
+    _fw_restore_managed_snapshot "${_FW_PORTS_FILE}" || _failed=1
     if [ "${_install_hosts_pending:-0}" -eq 1 ]; then lifecycle_rollback_hosts || _failed=1; fi
-    if _transaction_restore_files "${_restore_fw}"; then
+    if _transaction_restore_files; then
         _reload="${_TXN_XRAY_RESTART_ATTEMPTED}"
         _G_SYSD_DIRTY=1
         svc_reload_daemon || _failed=1
@@ -3271,29 +3340,32 @@ _transaction_end() {
     _TXN_ACTIVE=0
     if [ "${_keep_snapshot}" -eq 1 ]; then
         log_error "事务回滚未完全成功，快照保留于：${_TXN_DIR}"
-    elif [ "${_TXN_FW_RECORD_FAILED}" -eq 1 ]; then
-        log_error "防火墙变更记录失败，事务快照保留于：${_TXN_DIR}"
-    elif ! rm -rf -- "${_TXN_DIR}"; then
+    elif ! _fw_keep_snapshot && ! rm -rf -- "${_TXN_DIR}"; then
         log_warn "事务快照清理失败：${_TXN_DIR}"
     fi
-    if [ "${_TXN_FW_ONLY:-0}" -eq 1 ]; then _TXN_DIR=""; return 0; fi
     _transaction_lock_release
     _TXN_DIR=""
     _TXN_PRE_STATE=""
-    _TXN_FW_SEQUENCE=0
-    _TXN_FW_RECORD_FAILED=0
+    _FW_SCOPE_DIR=""
+    _FW_LEDGER_STATE=()
     _TXN_ARTIFACT_PATHS=()
 }
 
 _transaction_run() {
     local _label="$1" _rc=0 _keep_snapshot=0 _failure_pause=0
     shift
+    local -a _check=()
+    if [ "$1" = --check ]; then
+        _check=("$2")
+        shift 2
+    fi
     if [ "${_TXN_ACTIVE:-0}" -eq 1 ]; then
+        if [ "${#_check[@]}" -gt 0 ]; then "${_check[@]}" || return $?; fi
         "$@"
         return $?
     fi
     local _PLUGIN_SNAPSHOT_STAMP="" _PLUGIN_SNAPSHOT_PORTS="" _PLUGIN_SNAPSHOT_INBOUNDS=""
-    _transaction_begin || return 1
+    _transaction_begin "${_check[@]}" || return $?
     "$@" || _rc=$?
     if [ "${_rc}" -ne 0 ]; then
         if _transaction_rollback; then
@@ -3954,6 +4026,18 @@ module_cforigin_update_listen() {
     log_ok "监听地址已更新: ${_l}"
 }
 
+_argo_activate_tunnel() {
+    local _action="$1"
+    if [ "${_action}" = restart ] && [ "${_TXN_ACTIVE}" -eq 1 ]; then
+        _TXN_TUNNEL_RESTART_ATTEMPTED=1
+    fi
+    svc_exec_mut "${_action}" "${_SVC_TUNNEL}" || {
+        log_error "Argo 服务操作失败 (${_action})"
+        return 1
+    }
+    svc_verify_health "${_SVC_TUNNEL}" 6
+}
+
 module_argo_enable_inner() {
     if [ ! -f "${ARGO_BIN}" ] || [ ! -x "${ARGO_BIN}" ]; then
         download_cloudflared || return 1
@@ -3966,14 +4050,7 @@ module_argo_enable_inner() {
         log_error "Argo 服务启用失败"
         return 1
     }
-    svc_exec_mut start "${_SVC_TUNNEL}" || {
-        log_error "Argo 启动失败，请检查域名和 Tunnel 认证"
-        return 1
-    }
-    svc_verify_health "${_SVC_TUNNEL}" 6 || {
-        log_error "Argo 健康检查失败，请检查域名和 Tunnel 认证"
-        return 1
-    }
+    _argo_activate_tunnel start || return 1
     _commit_state_and_firewall || return 1
     log_ok "Argo 已启用并启动"
 }
@@ -4183,13 +4260,15 @@ module_vlquic_disable() {
 
 module_vlquic_update_cert() { _module_update_certificate vlquic; }
 
-_module_tls_cert_fingerprint() {
+_cert_runtime_fingerprint() {
     local _module="$1" _field _file
     if [ "${_module}" = cforigin ] && [ "$(st_get '.cforigin.origin_tls')" != true ]; then
         return 0
     fi
+    st_get '.[$id].domain' --arg id "${_module}" || return 1
     for _field in cert key; do
-        _file=$(st_get '.[$inbound_id][$field]' --arg inbound_id "${_module}" --arg field "${_field}") || return 1
+        _file=$(st_get '.[$id][$field]' --arg id "${_module}" --arg field "${_field}") || return 1
+        printf '%q\n' "${_file}"
         if [ -f "${_file}" ]; then
             sha256sum < "${_file}" || { log_error "${_module} 证书或私钥内容无法读取"; return 1; }
         else
@@ -4198,30 +4277,171 @@ _module_tls_cert_fingerprint() {
     done
 }
 
-_module_tls_apply_config() {
-    local _module="$1" _old_fingerprint="$2" _new_fingerprint _reload=""
-    _new_fingerprint=$(_module_tls_cert_fingerprint "${_module}") || return 1
-    [ "${_new_fingerprint}" = "${_old_fingerprint}" ] || _reload=force
-    config_apply tls "${_reload}"
+_cert_resolve_path() {
+    local _rest="$1" _resolved='' _part _link _hops=0
+    [[ "${_rest}" = /* ]] || _rest="${PWD}/${_rest}"
+    # Resolve symlinks even if issuance will create some of the directories.
+    while [ -n "${_rest}" ]; do
+        _part=${_rest%%/*}
+        if [[ "${_rest}" = */* ]]; then _rest=${_rest#*/}; else _rest=''; fi
+        case "${_part}" in
+            ''|.) continue ;;
+            ..) _resolved=${_resolved%/*}; continue ;;
+        esac
+        if [ -L "${_resolved}/${_part}" ]; then
+            _hops=$((_hops + 1))
+            [ "${_hops}" -le 40 ] || return 1
+            _link=$(readlink -- "${_resolved}/${_part}" && printf '.') || return 1
+            _link=${_link%$'\n.'}
+            if [[ "${_link}" = /* ]]; then _resolved=''; fi
+            _rest="${_link}/${_rest}"
+        else
+            _resolved+="/${_part}"
+        fi
+    done
+    printf '%s\n' "${_resolved:-/}"
 }
 
-_module_vlquic_save_cert() {
-    local _old_fingerprint="" _enabled
-    _enabled=$(st_get '.vlquic.enabled')
-    if [ "${_enabled}" = true ]; then
-        _old_fingerprint=$(_module_tls_cert_fingerprint vlquic) || return 1
+_cert_affected_inbounds() {
+    local _target="$1" _enabled_only="$2" _id _field _file _canonical _dest _canonical_dest
+    for _id in vlquic cforigin; do
+        if [ "${_enabled_only}" -eq 1 ] && [ "$(st_get '.[$id].enabled' --arg id "${_id}")" != true ]; then
+            continue
+        fi
+        if [ "${_id}" = "${_target}" ]; then
+            printf '%s\n' "${_id}"
+            continue
+        fi
+        [ "${#_cert_artifacts[@]}" -gt 0 ] || continue
+        if [ "${_id}" = cforigin ] && [ "$(st_get '.cforigin.origin_tls')" != true ]; then continue; fi
+        for _field in cert key; do
+            _file=$(st_get '.[$id][$field]' --arg id "${_id}" --arg field "${_field}") || return 1
+            [ -n "${_file}" ] || continue
+            _canonical=$(_cert_resolve_path "${_file}") || _canonical="${_file}"
+            for _dest in "${_cert_artifacts[@]}"; do
+                _canonical_dest=$(_cert_resolve_path "${_dest}") || _canonical_dest="${_dest}"
+                if [[ "${_canonical}" = "${_canonical_dest}" || "${_file}" -ef "${_dest}" ]]; then
+                    printf '%s\n' "${_id}"
+                    continue 3
+                fi
+            done
+        done
+    done
+    return 0
+}
+
+_cert_write_paths() {
+    _cert_artifacts=()
+    if [ "${_cert_target}" = cforigin ]; then
+        [ "${#_CFORIGIN_ISSUE[@]}" -gt 0 ] || return 0
+    else
+        [ "${#_VLQUIC_ISSUE[@]}" -gt 0 ] || return 0
     fi
-    st_set '.vlquic += $draft' --argjson draft "$1" || return 1
-    _cert_stage='签发或校验证书'
-    _vlquic_apply_cert || return 1
-    if [ "${_enabled}" = true ]; then
+    _cert_artifacts=("${_CERT_DIR}/${_cert_domain}/fullchain.pem" "${_CERT_DIR}/${_cert_domain}/privkey.pem")
+}
+
+_cert_check_destination() {
+    local _dest="$1" _path _links
+    if [ -L "${_dest}" ] || { [ -e "${_dest}" ] && [ ! -f "${_dest}" ]; }; then
+        log_error '签发目的地必须是普通文件，无法安全覆盖此路径'
+        return 1
+    fi
+    [ -e "${_dest}" ] || return 0
+    _links=$(stat -c '%h' -- "${_dest}") || return 1
+    [ "${_links}" -eq 1 ] || { log_error '签发目的地有硬链接，无法安全回滚'; return 1; }
+    _path=$(_cert_resolve_path "${_dest}") || return 1
+    # mountinfo escapes whitespace and backslashes in mount point paths.
+    _path=${_path//\\/\\134}
+    _path=${_path// /\\040}
+    _path=${_path//$'\t'/\\011}
+    _path=${_path//$'\n'/\\012}
+    if ! X2G_CERT_MOUNT_PATH="${_path}" awk '$5 == ENVIRON["X2G_CERT_MOUNT_PATH"] { found=1 } END { exit found }' /proc/self/mountinfo; then
+        log_error '无法确认签发目的地可安全恢复，请使用普通文件路径'
+        return 1
+    fi
+}
+
+_cert_check_impact() {
+    local _id _dest _enabled _saved_refs _draft_refs
+    _cert_affected=$(_cert_affected_inbounds "${_cert_target}" 0) || return 1
+    if [ "${_cert_approved}" != '*' ]; then
+        for _id in ${_cert_affected}; do
+            _enabled=$(st_get '.[$id].enabled' --arg id "${_id}")
+            if [ "${_enabled}" = true ] && [[ $'\n'${_cert_approved}$'\n' != *$'\n'"${_id}"$'\n'* ]]; then
+                log_warn '可能受影响的入站已增加，请重新确认'
+                return 75
+            fi
+        done
+    fi
+    if [ "$(jq -r '.acme_method' <<< "${_cert_draft}")" = manual_existing ]; then
+        _saved_refs=$(jq -c '.cforigin | {cert, key}' <<< "${_G_STATE}") || return 1
+        _draft_refs=$(jq -c '{cert, key}' <<< "${_cert_draft}") || return 1
+        if [ "${_saved_refs}" != "${_draft_refs}" ]; then
+            if [ "${_cert_approved}" = '*' ]; then
+                log_error '已配置的证书文件由其他会话更新，请重新选择证书来源'
+                return 1
+            fi
+            _cert_draft=$(jq -c --argjson refs "${_saved_refs}" '. + $refs' <<< "${_cert_draft}") || return 1
+            log_warn '已配置的证书文件由其他会话更新，请确认沿用最新保存的文件'
+            return 75
+        fi
+    fi
+    for _dest in "${_cert_artifacts[@]}"; do
+        # ACME may follow links or truncate a shared inode. The file snapshot
+        # can restore a managed path, but cannot undo writes through these aliases.
+        _cert_check_destination "${_dest}" || return 1
+    done
+}
+
+_cert_apply_draft() {
+    local _id _enabled _after _reload=''
+    local -a _issue=()
+    local -A _before=()
+    for _id in ${_cert_affected}; do
+        _before["${_id}"]=$(_cert_runtime_fingerprint "${_id}") || return 1
+    done
+    _enabled=$(st_get '.[$id].enabled' --arg id "${_cert_target}") || return 1
+    st_set '.[$id] += $draft' --arg id "${_cert_target}" --argjson draft "${_cert_draft}" || return 1
+    if [ "${_cert_target}" = cforigin ]; then
+        _issue=("${_CFORIGIN_ISSUE[@]}")
+    else
+        _issue=("${_VLQUIC_ISSUE[@]}")
+        _vlquic_check_ready plan || return 1
+    fi
+    if [ "${#_issue[@]}" -gt 0 ]; then
+        _cert_stage='签发证书'
+        "${_issue[@]}" || return 1
+    fi
+    _cert_stage='校验证书'
+    if [ "${_cert_target}" = vlquic ]; then
+        _vlquic_check_ready || return 1
+    elif [ "${_enabled}" = true ]; then
+        _cforigin_check_ready || return 1
+    else
+        _cforigin_check_origin_tls "${_cert_domain}" || return 1
+    fi
+    for _id in ${_cert_affected}; do
+        _after=$(_cert_runtime_fingerprint "${_id}") || return 1
+        [ "${_after}" != "${_before[${_id}]}" ] || continue
+        if [ "${_id}" != "${_cert_target}" ]; then
+            if [ "${_id}" = vlquic ]; then
+                _vlquic_check_ready || return 1
+            else
+                _cforigin_check_origin_tls "$(st_get '.cforigin.domain')" || return 1
+            fi
+        fi
+        if [ "$(st_get '.[$id].enabled' --arg id "${_id}")" = true ]; then _reload=force; fi
+    done
+    if [ "${_enabled}" = true ] || [ -n "${_reload}" ]; then
         _cert_stage='验证并重新加载 Xray'
-        _module_tls_apply_config vlquic "${_old_fingerprint}" || return 1
+        config_apply tls "${_reload}" || return 1
+    fi
+    if [ "${_cert_target}" = vlquic ] && [ "${_enabled}" = true ]; then
         _cert_stage='保存配置及防火墙'
         _commit_state_and_firewall
     else
         _cert_stage='保存配置'
-        st_persist
+        st_persist || { log_error 'state.json 写入失败'; return 1; }
     fi
 }
 
@@ -4234,18 +4454,25 @@ _cert_read_draft() {
         if $id == "cforigin" then {origin_tls} else {} end' <<< "${_G_STATE}")
 }
 
+_cert_preview() {
+    local _cert_target="$1" _cert_domain="$2"
+    local -a _cert_artifacts=()
+    _cert_write_paths
+    _cert_affected_inbounds "${_cert_target}" 1
+}
+
 _cert_submit_draft() {
-    local _module="$1" _domain _cert_stage='读取或保存证书配置' _cert_recovery='未应用变更'
-    local -a _cforigin_cert_artifacts=()
-    _domain=$(jq -er '.domain' <<< "${_cert_draft}") || return 1
-    if [ "${_module}" = cforigin ] && [ "${#_CFORIGIN_ISSUE[@]}" -gt 0 ]; then
-        _cforigin_cert_artifacts=("${_CERT_DIR}/${_domain}/fullchain.pem" "${_CERT_DIR}/${_domain}/privkey.pem")
-    fi
-    if ! _transaction_run "更新 $(module_label "${_module}") 证书" "_module_${_module}_save_cert" "${_cert_draft}"; then
-        log_error "证书更新失败（${_cert_stage}）：${_cert_recovery}"
-        return 1
-    fi
-    log_ok "${_domain} 的证书配置已更新"
+    local _cert_target="$1" _cert_approved="${2-*}" _cert_domain _cert_affected='' _rc=0
+    local _cert_stage='读取或保存证书配置' _cert_recovery='未应用变更'
+    local -a _cert_artifacts=()
+    _cert_domain=$(jq -er '.domain' <<< "${_cert_draft}") || return 1
+    _cert_write_paths
+    _transaction_run "更新 $(module_label "${_cert_target}") 证书" --check _cert_check_impact _cert_apply_draft || _rc=$?
+    case "${_rc}" in
+        75) return 75 ;;
+        0) log_ok "${_cert_domain} 的证书配置已更新" ;;
+        *) log_error "证书更新失败（${_cert_stage}）：${_cert_recovery}"; return 1 ;;
+    esac
 }
 
 _module_update_certificate() {
@@ -4268,6 +4495,7 @@ _workbench_certificates() {
 
 _menu_certificates() {
     local _module="$1" _runtime="$2" _cert_draft='' _cert_source='' _expires _path _domain _choice _confirm
+    local _affected _id _rc
     local -a _VLQUIC_ISSUE=() _CFORIGIN_ISSUE=()
     while true; do
         log_title "$(module_label "${_module}") / 证书"
@@ -4295,15 +4523,28 @@ _menu_certificates() {
             *) log_error '无效证书操作'; continue ;;
         esac
         _domain=$(jq -r '.domain' <<< "${_cert_draft}")
-        printf '  域名 %s · 来源 %s\n' "${_domain}" "${_cert_source}"
-        if [ "${_runtime}" -eq 1 ] && [ "$(st_get '.[$id].enabled' --arg id "${_module}")" = true ]; then
-            printf '  入站已启用，Xray 可能重新加载。\n'
-        fi
-        prompt '确认提交证书配置？(y/N): ' _confirm || return 0
-        [ "${_confirm,,}" = y ] || continue
-        if [ "${_runtime}" -eq 1 ]; then
-            if ! _cert_submit_draft "${_module}"; then _pause; continue; fi
-        else
+        while true; do
+            printf '  域名 %s · 来源 %s\n' "${_domain}" "${_cert_source}"
+            if [ "${_runtime}" -eq 1 ]; then
+                _affected=$(_cert_preview "${_module}" "${_domain}") || continue 2
+                if [ -n "${_affected}" ]; then
+                    printf '  可能受影响的已启用入站\n'
+                    for _id in ${_affected}; do printf '  · %s\n' "$(module_label "${_id}")"; done
+                    printf '  Xray 可能重新加载。若已停止，重启可能将它启动。\n'
+                fi
+            fi
+            prompt '确认提交证书配置？(y/N): ' _confirm || return 0
+            [ "${_confirm,,}" = y ] || continue 2
+            [ "${_runtime}" -eq 1 ] || break
+            _rc=0
+            _cert_submit_draft "${_module}" "${_affected}" || _rc=$?
+            case "${_rc}" in
+                0) break ;;
+                75) : ;;
+                *) _pause; continue 2 ;;
+            esac
+        done
+        if [ "${_runtime}" -ne 1 ]; then
             st_set '.[$id] += $draft' --arg id "${_module}" --argjson draft "${_cert_draft}" || continue
             # 交给外层工作台保存签发计划。
             if [ "${_module}" = cforigin ]; then
@@ -4318,29 +4559,6 @@ _menu_certificates() {
         _cert_draft=''
         _VLQUIC_ISSUE=(); _CFORIGIN_ISSUE=()
     done
-}
-
-_module_cforigin_save_cert() {
-    local _old_fingerprint="" _enabled
-    _enabled=$(st_get '.cforigin.enabled')
-    if [ "${_enabled}" = true ]; then
-        _old_fingerprint=$(_module_tls_cert_fingerprint cforigin) || return 1
-    fi
-    st_set '.cforigin += $draft' --argjson draft "$1" || return 1
-    if [ "${#_CFORIGIN_ISSUE[@]}" -gt 0 ]; then
-        _cert_stage='签发证书'
-        "${_CFORIGIN_ISSUE[@]}" || return 1
-    fi
-    _cert_stage='校验证书'
-    if [ "${_enabled}" = true ]; then
-        _cforigin_check_ready || return 1
-        _cert_stage='验证并重新加载 Xray'
-        _module_tls_apply_config cforigin "${_old_fingerprint}" || return 1
-    else
-        _cforigin_check_origin_tls "$(st_get '.cforigin.domain')" || return 1
-    fi
-    _cert_stage='保存配置'
-    st_persist || { log_error "state.json 写入失败"; return 1; }
 }
 
 module_cforigin_update_edge_port() {
@@ -4990,10 +5208,12 @@ argo_apply_fixed_tunnel_from_state() {
     _argo_prepare_fixed_tunnel_from_state || return 1
     svc_apply_tunnel || return 1
     svc_reload_daemon || return 1
-    svc_exec_mut enable "${_SVC_TUNNEL}" 2>/dev/null || true
+    svc_exec_mut enable "${_SVC_TUNNEL}" || {
+        log_error "Argo 服务启用失败"
+        return 1
+    }
     config_apply || return 1
-    _TXN_TUNNEL_RESTART_ATTEMPTED=1
-    svc_exec_mut restart "${_SVC_TUNNEL}" || { log_error "tunnel 重启失败"; return 1; }
+    _argo_activate_tunnel restart || return 1
     _commit_state_and_firewall || return 1
     log_ok "固定隧道本地配置已同步 (domain=$(st_get '.argo.domain'))"
 }
@@ -5816,15 +6036,8 @@ module_nodes_show() {
 }
 
 _module_argo_restart_inner() {
-    svc_exec_mut restart "${_SVC_TUNNEL}" || {
-        log_error "${_SVC_TUNNEL} 重启失败"
-        return 1
-    }
+    _argo_activate_tunnel restart || return 1
     log_ok "${_SVC_TUNNEL} 已重启"
-    svc_verify_health "${_SVC_TUNNEL}" 6 || {
-        log_error "${_SVC_TUNNEL} 健康检查失败"
-        return 1
-    }
 }
 
 module_restart_action() {
@@ -5855,10 +6068,12 @@ module_status_action() {
     local _target="${1:-}"
     case "${_target}" in
         xray)
-            check_xray_install || { printf 'not installed'; return 2; }
-            svc_exec status "${_SVC_XRAY}" \
-                && { printf 'running'; return 0; } \
-                || { printf 'stopped'; return 1; }
+            case "$(_deployment_state)" in
+                running)     printf 'running'; return 0 ;;
+                stopped)     printf 'stopped'; return 1 ;;
+                uninstalled) printf 'not installed'; return 2 ;;
+                *)           printf 'unknown'; return 4 ;;
+            esac
             ;;
         argo)
             [ "$(st_get '.argo.enabled')" = "true" ] || { printf 'disabled'; return 3; }
@@ -6061,10 +6276,7 @@ _module_toggle_xpad_inner() {
 }
 
 _xray_runtime_status() {
-    local _rc
-    module_status_action xray >/dev/null
-    _rc=$?
-    [ "${_rc}" -eq 0 ] && printf 'running' || printf 'stopped'
+    module_status_action xray || :
 }
 
 _menu_print_module_status() {
@@ -6132,19 +6344,28 @@ check_argo() {
 
 # ── 主菜单 ────────────────────────────────────────────────────────────────────
 
-_menu_collect_status() {
+_deployment_state() {
     local _status=0
-    svc_exec status "${_SVC_XRAY}" >/dev/null 2>&1 || _status=$?
-    _MENU_STATE=unknown
-    if [ "${_status}" -eq 0 ]; then
-        _MENU_STATE=running
-    elif [ "${_status}" -eq 3 ]; then
-        _MENU_STATE=stopped
-    elif { is_systemd && [ "${_status}" -eq 4 ]; } ||
-         { is_openrc && [ "${_status}" -eq 1 ] &&
-           [ ! -e "${_SVC_OPENRC_DIR}/${_SVC_XRAY}" ] && [ ! -L "${_SVC_OPENRC_DIR}/${_SVC_XRAY}" ]; }; then
-        if check_xray_install; then _MENU_STATE=stopped; else _MENU_STATE=uninstalled; fi
-    fi
+    _svc_runtime_state "${_SVC_XRAY}" || _status=$?
+    case "${_status}" in
+        0) printf 'running' ;;
+        1) printf 'stopped' ;;
+        3) if check_xray_install; then printf 'stopped'; else printf 'uninstalled'; fi ;;
+        *) printf 'unknown' ;;
+    esac
+}
+
+_require_first_deploy() {
+    case "$(_deployment_state)" in
+        uninstalled) return 0 ;;
+        unknown) log_error '无法确认 Xray-2go 是否已安装，拒绝首次部署' ;;
+        *) log_error 'Xray-2go 已安装。如需重装，请先用维护菜单卸载' ;;
+    esac
+    return 1
+}
+
+_menu_collect_status() {
+    _MENU_STATE=$(_deployment_state)
 }
 
 _menu_render() {
@@ -6252,7 +6473,7 @@ _menu_node_health() {
 
 _menu_node_formats() {
     local _node="$1" _choice _formats=2
-    local _kind="${_node_kinds[_node]}" _module="${_node_modules[_node]}"
+    local _kind="${_node_kinds[_node]}" _outbound="${_node_outbounds[_node]}"
     if [ "${_kind}" = link ]; then
         _menu_node_health
         _print_link "${_node_links[_node]}"
@@ -6271,14 +6492,10 @@ _menu_node_formats() {
         case "${_choice}" in
             0) return 0 ;;
             1) _print_link "${_node_links[_node]}" ;;
-            2) if [ "${_module}" = argo ]; then
-                   _argo_xhttp_export_json "${_kind}" || log_error '无法生成 Xray 出站 JSON'
-               else
-                   "_${_module}_xhttp_export_json" || log_error '无法生成 Xray 出站 JSON'
-               fi ;;
+            2) printf '%s\n' "${_outbound}" ;;
             3) if [ "${_kind}" != split ]; then log_error '无效格式编号'; continue; fi
-               _argo_xhttp_mihomo_warn_differences || log_warn '无法检查 Mihomo 下行覆盖差异'
-               _argo_xhttp_export_mihomo || log_error '无法生成 Mihomo provider' ;;
+               _argo_xhttp_mihomo_warn_differences "${_outbound}" || log_warn '无法检查 Mihomo 下行覆盖差异'
+               _argo_xhttp_export_mihomo "${_outbound}" || log_error '无法生成 Mihomo provider' ;;
             *) log_error '无效格式编号'; continue ;;
         esac
         _pause
@@ -6286,11 +6503,46 @@ _menu_node_formats() {
 }
 
 _menu_nodes() {
-    local _filter="${1:-}" _module _links _link _name _kind _choice _index _count _total
-    local -a _node_names=() _node_links=() _node_modules=() _node_kinds=() _unavailable=()
+    local _filter="${1:-}" _module _links _link _name _kind _choice _index _count _total _outbound
+    local -a _node_names=() _node_links=() _node_outbounds=() _node_kinds=() _unavailable=() _kinds=()
     for _module in "${_PLUGIN_REGISTRY[@]}"; do
         [ -z "${_filter}" ] || [ "${_module}" = "${_filter}" ] || continue
         plugin_call "${_module}" enabled || continue
+        _kinds=()
+        case "${_module}" in
+            argo)
+                if [ "$(st_get '.argo.auth_protocol + ":" + .argo.protocol')" = vless:xhttp ]; then
+                    _kinds=(normal)
+                    if _argo_xhttp_split_active; then _kinds+=(split); fi
+                fi ;;
+            ff|cforigin) [ "$(st_get '.[$id].protocol' --arg id "${_module}")" != xhttp ] || _kinds=(direct) ;;
+            reality) [ "$(st_get '.reality.network')" != xhttp ] || _kinds=(direct) ;;
+            vlquic) _kinds=(direct) ;;
+        esac
+        if [ "${#_kinds[@]}" -gt 0 ]; then
+            for _kind in "${_kinds[@]}"; do
+                case "${_kind}" in
+                    normal) _name=Argo-XHTTP ;;
+                    split) _name=Argo-XHTTP-Split ;;
+                    *) _name=$(module_label "${_module}") ;;
+                esac
+                if ! _outbound=$("_${_module}_xhttp_export_json" "${_kind}" 2>/dev/null) ||
+                   ! _link=$(_xhttp_link_from_outbound "${_module}" "${_outbound}") ||
+                   ! _link=$(plugin_filter_links "${_module}" <<< "${_link}") || [ -z "${_link}" ]; then
+                    if [ "${_kind}" = split ]; then
+                        log_warn 'Argo XHTTP 分离节点暂不可导出，请检查域名、Reality 公钥和公网地址'
+                    else
+                        _unavailable+=("${_name}")
+                    fi
+                    continue
+                fi
+                _node_names+=("${_name}")
+                _node_links+=("${_link}")
+                _node_outbounds+=("${_outbound}")
+                _node_kinds+=("${_kind}")
+            done
+            continue
+        fi
         if ! _links=$(plugin_collect_links "${_module}" 2>/dev/null) || [ -z "${_links}" ]; then
             _unavailable+=("$(module_label "${_module}")")
             continue
@@ -6299,22 +6551,11 @@ _menu_nodes() {
         while IFS= read -r _link; do
             _count=$((_count + 1))
             _name="$(module_label "${_module}")"
-            _kind='link'
-            case "${_module}:${_link##*#}" in
-                argo:Argo-XHTTP) _kind=normal; _name=Argo-XHTTP ;;
-                argo:Argo-XHTTP-Split) _kind='split'; _name=Argo-XHTTP-Split ;;
-                *)
-                    case "${_module}" in
-                        ff|reality|vlquic|cforigin)
-                            if [[ "${_link}" == *'type=xhttp&'* || "${_link}" == *'type=xhttp#'* ]]; then _kind=direct; fi ;;
-                    esac
-                    [ "${_count}" -eq 1 ] || _name+=" · ${_count}"
-                    ;;
-            esac
+            [ "${_count}" -eq 1 ] || _name+=" · ${_count}"
             _node_names+=("${_name}")
             _node_links+=("${_link}")
-            _node_modules+=("${_module}")
-            _node_kinds+=("${_kind}")
+            _node_outbounds+=("")
+            _node_kinds+=(link)
         done <<< "${_links}"
     done
     _total=${#_node_links[@]}
@@ -7047,10 +7288,10 @@ install_execute_current_plan() {
     local _install_transaction=1 _install_hosts_pending=0
     command -v flock >/dev/null 2>&1 || { log_error "首次部署需要 flock，以保护并发操作"; return 1; }
     install_plan_validate || return 1
-    local -a _cforigin_cert_artifacts=()
+    local -a _cert_artifacts=()
     if [ "$(st_get '.cforigin.enabled')" = true ] && [ "${#_CFORIGIN_ISSUE[@]}" -gt 0 ]; then
         local _domain="${_CFORIGIN_ISSUE[2]}"
-        _cforigin_cert_artifacts=("${_CERT_DIR}/${_domain}/fullchain.pem" "${_CERT_DIR}/${_domain}/privkey.pem")
+        _cert_artifacts=("${_CERT_DIR}/${_domain}/fullchain.pem" "${_CERT_DIR}/${_domain}/privkey.pem")
     fi
     if _transaction_run "部署 Xray-2go" _install_issue_certs_and_start; then
         _CFORIGIN_ISSUE=()
@@ -7334,8 +7575,8 @@ _argo_xhttp_export_json() {
 }
 
 _argo_xhttp_mihomo_warn_differences() {
-    local _outbound _warnings
-    _outbound=$(_argo_xhttp_export_json split) || return 1
+    local _outbound="${1:-}" _warnings
+    [ -n "${_outbound}" ] || _outbound=$(_argo_xhttp_export_json split) || return 1
     _warnings=$(jq -r '
         .streamSettings as $stream |
         $stream.xhttpSettings.extra.downloadSettings as $down |
@@ -7355,8 +7596,8 @@ _argo_xhttp_mihomo_warn_differences() {
 }
 
 _argo_xhttp_export_mihomo() {
-    local _outbound
-    _outbound=$(_argo_xhttp_export_json split) || return 1
+    local _outbound="${1:-}"
+    [ -n "${_outbound}" ] || _outbound=$(_argo_xhttp_export_json split) || return 1
     jq '
         def omit_null: with_entries(select(.value != null));
         def string_or_null: if . == null then null else tostring end;
@@ -8313,12 +8554,7 @@ install_plan_menu() {
 }
 
 module_xray_install() {
-    local _MENU_STATE
-    _menu_collect_status
-    if [ "${_MENU_STATE}" != uninstalled ]; then
-        log_warn '仅在确认 Xray-2go 未安装时可以开始部署'
-        return 1
-    fi
+    _require_first_deploy || return 1
     install_wizard_menu
 }
 
