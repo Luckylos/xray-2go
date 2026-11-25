@@ -97,6 +97,7 @@ def test_lifecycle_lock_service_and_pending_guards():
         platform_preflight() { touch "$WORK_DIR/bad-preflight"; }
         plugin_refresh_runtime() { touch "$WORK_DIR/bad-plugin-refresh"; }
         cli_dispatch() { :; }
+        prompt() { IFS= read -r "$2"; }
         printf '0\n' | main
         [[ ! -e $STATE_FILE && ! -e $WORK_DIR/bad-platform-init &&
             ! -e $WORK_DIR/bad-preflight && ! -e $WORK_DIR/bad-plugin-refresh &&
@@ -114,7 +115,9 @@ def test_uninstall_restarts_after_state_removed_and_blocks_update():
         fw_force_cleanup() { :; }
         lifecycle_rollback_sysctl() { :; }
         lifecycle_rollback_hosts() { :; }
-        prompt() { printf -v "$2" y; }
+        prompt() {
+            if [[ "$1" == '选择操作'* ]]; then IFS= read -r "$2"; else printf -v "$2" y; fi
+        }
     '''
     stages = (
         r'''mkdir -p "$WORK_DIR" "$(dirname "$SELF_DEST")"
@@ -132,7 +135,7 @@ def test_uninstall_restarts_after_state_removed_and_blocks_update():
             ! -e $WORK_DIR/unexpected-preflight && ! -e $WORK_DIR/unexpected-plugins ]]
         ''',
         r'''_svc_remove_units() { [[ ${detected:-} == 1 ]]; }
-        main <<< u
+        main <<< 1
         [[ ! -e $_UNINSTALL_PENDING && ! -e $STATE_FILE && ! -e $SELF_DEST ]]
         ''',
     )
@@ -1269,7 +1272,7 @@ def test_cforigin_edge_h3_toggle_and_link():
     assert_true('"edge_h3": false' in TEXT, "CF Origin edge_h3 default missing")
     assert_true(".cforigin.edge_h3 = false" in TEXT, "CF Origin edge_h3 normalization/reset missing")
     assert_true("实验性客户端到 Cloudflare Edge HTTP/3" in TEXT, "initial CF Origin Edge HTTP/3 prompt must mark experimental")
-    assert_true("切换客户端到 Cloudflare Edge HTTP/3" in TEXT, "CF Origin management toggle missing")
+    assert_true("切换 Cloudflare Edge HTTP/3" in TEXT, "CF Origin management toggle missing")
     assert_true("CF-Origin-XHTTP-H3-Experimental" in TEXT, "CF Origin H3 link tag must mark experimental")
     assert_true("这不是 H3/QUIC 源站回源" in TEXT, "Cloudflare hint must clarify Edge H3 is not origin H3")
     assert_true("失败可回退普通 XHTTP/WS" in TEXT, "Cloudflare H3 prompt/hint must include rollback path")
@@ -1530,8 +1533,8 @@ def test_argo_env_final_token_validation_and_menu_install_state():
     env_body = TEXT[TEXT.index('_svc_write_argo_env()'):TEXT.index('svc_apply_xray()')]
     assert_true('val_argo_token' in env_body, "Argo env writer must revalidate final token before writing env")
     assert_true('Argo token 格式异常，拒绝写入 env' in TEXT, "Argo env writer should fail closed on invalid persisted token")
-    assert_true('check_xray_install()' in TEXT and '_MENU_XI' in TEXT, "menu should track installed state separately from running state")
-    assert_true('Xray-2go 已安装但未运行' in TEXT, "install menu should not treat stopped service as uninstalled")
+    assert_true('check_xray_install()' in TEXT and '_MENU_STATE' in TEXT, "menu should track installed state separately from running state")
+    assert_true('已安装 · 未运行' in TEXT, "install menu should not treat stopped service as uninstalled")
     assert_true('自动修正' not in TEXT and '不会自动更换' in TEXT, "port conflict prompts must match current fail/manual behavior")
 
 
@@ -1673,7 +1676,7 @@ def test_single_file_module_dispatch_actions():
         assert_true(fn in TEXT, f"module action helper missing: {fn}")
     for marker in ['# core/global actions', '# Common module actions are dispatched from the registry above.', '# field/config update actions', '# key/toggle actions', '# complex/specialized actions']:
         assert_true(marker in dispatch_body, f"module_dispatch should be grouped for readability: {marker}")
-    assert_true('module_dispatch reality restart' in TEXT and 'module_dispatch vltcp show' in TEXT, "module menus should route representative actions through shared dispatch")
+    assert_true('module_dispatch xray restart' in TEXT and 'module_dispatch argo restart' in TEXT, "module menus should route representative actions through shared dispatch")
 
 
 def test_single_file_module_enable_disable_actions():
@@ -1692,7 +1695,7 @@ def test_single_file_module_uninstall_update_actions():
         assert_true(fn in TEXT, f"module uninstall/update helper missing: {fn}")
     for body_name in ['unified_menu_freeflow()', 'unified_menu_reality()', 'unified_menu_vltcp()', 'unified_menu_vlquic()', 'unified_menu_cforigin()', 'unified_menu_socks()', 'unified_menu_http()']:
         body = TEXT[TEXT.index(body_name):TEXT.index('\n}\n', TEXT.index(body_name))]
-        assert_true('_menu_confirm_uninstall' in body and '_pause; return 0' in body, f"{body_name} should provide runtime uninstall closure inside the unified workbench")
+        assert_true('_menu_confirm_uninstall' in body and ' uninstall || continue' in body, f"{body_name} should provide runtime uninstall closure inside the unified workbench")
 
 
 def test_single_file_module_config_update_actions():
@@ -1844,8 +1847,10 @@ def test_install_plan_menu_is_advanced_install_entry():
     for fn in ['unified_menu_argo()', 'unified_menu_freeflow()', 'unified_menu_reality()', 'unified_menu_vltcp()', 'unified_menu_socks()', 'unified_menu_http()', 'unified_menu_vlquic()', 'unified_menu_cforigin()']:
         assert_true(fn in TEXT, f"unified install/runtime workbench missing: {fn}")
     body = TEXT[TEXT.index('module_xray_install()'):TEXT.index('\n}\n', TEXT.index('module_xray_install()'))]
-    assert_true('install_plan_reset_defaults' in body, "module_xray_install should initialize the draft plan")
     assert_true('install_wizard_menu' in body, "first install should enter the deployment wizard")
+    wizard = _function_body('install_wizard_menu')
+    assert_true(wizard.index('install_plan_reset_defaults') < wizard.index('install_plan_menu'),
+                "the deployment wizard should initialize the draft before custom deployment")
     assert_true('install_plan_menu' not in body, "advanced install plan must not be the default first-install entry")
     for forbidden in ['ask_argo_mode', 'ask_freeflow_mode', 'ask_reality_mode', 'ask_vltcp_mode', 'ask_socks_mode', 'ask_vlquic_mode', 'ask_cforigin_mode']:
         assert_true(forbidden not in body, f"default install entry should not directly chain {forbidden}")
@@ -1869,7 +1874,7 @@ def test_deployment_wizard_exposes_recommended_paths():
     wizard = TEXT.split('install_wizard_menu() {', 1)[1].split(chr(10) + '}' + chr(10), 1)[0]
     for marker in ['install_wizard_render', 'install_wizard_reality', 'install_wizard_argo', 'install_plan_menu']:
         assert_true(marker in wizard, f"wizard route missing: {marker}")
-    for marker in ['VLESS + Reality TCP', 'Argo Tunnel', '高级自定义部署']:
+    for marker in ['快速部署 Reality', '快速部署 Argo', '自定义部署']:
         assert_true(marker in TEXT, f"wizard option label missing: {marker}")
 
 
@@ -1891,9 +1896,9 @@ def test_install_plan_field_level_submenus_exist_for_common_modules():
 def test_interactive_menu_copy_is_guided_and_consistent():
     assert_true('_menu_print_action 0 "返回上一级"' in TEXT, "submenu back label should say return to upper level")
     assert_true('Xray-2go 控制台' in TEXT, "main menu title should be localized")
-    assert_true('开始部署（快速向导）' in TEXT, "main menu install copy should name the guided deployment entry")
-    assert_true('快速部署向导' in TEXT and '高级自定义部署' in TEXT, "first-install path should expose guided and advanced modes")
-    for token in ['进入 Reality 配置页', '运行安装前检查', '预览并确认安装', 'prompt "请选择部署方案 (0-3，回车选 1): " _c', '确认开始部署？(y/N): ', '请选择操作 $( [ "${_runtime}" -eq 1 ] && printf', '返回上一级']:
+    assert_true('快速部署 Reality' in TEXT and '快速部署 Argo' in TEXT, "main menu install copy should name the guided deployment entry")
+    assert_true('Xray-2go · 首次部署' in TEXT and '自定义部署' in TEXT, "first-install path should expose guided and advanced modes")
+    for token in ['进入 Reality 配置页', '运行安装前检查', '预览并确认安装', 'prompt "请选择部署方案 (0-3，回车选 1): " _c', '确认开始部署？(y/N): ', '选择工作台操作', '返回上一级']:
         assert_true(token in TEXT, f"interactive menu copy token missing: {token}")
 
 
@@ -2834,10 +2839,14 @@ def test_argo_xhttp_editor_and_selected_exports():
         _argo_xhttp_menu 0 <<< $'7\n2\n900-100\n128-768\n3\n2\n0\n0'
         jq -e '.argo.xhttp | .server.xPaddingBytes == "128-768" and
             .server.xPaddingObfsMode == true and .client.xmux.maxConnections == 2' <<< "${_G_STATE}" >/dev/null
-        _argo_xhttp_menu 0 <<< $'2\n'"$candidate"$'\n'"$fixed"$'\n7\n3\n3\n-\n4\n4\n7\nstream-up\n0\n4\n1\n0\n1\n1\n2\n1\n2\n2\n0\n0'
+        _argo_xhttp_menu 0 <<< $'2\n'"$candidate"$'\n'"$fixed"$'\n7\n3\n3\n-\n4\n4\n0\n0'
+        _argo_split_menu 0 <<< $'2\nstream-up\n0'
         jq -e '.argo.xhttp | .mode == "auto" and .client.xmux.maxConcurrency == 4 and
             .split.download.xhttpSettings.extra.xmux.maxConnections == 5' <<< "${_G_STATE}" >/dev/null
-        _argo_xhttp_export_menu <<< $'2\n3\n0\n'
+        plugin_refresh_runtime
+        _PLUGIN_REGISTRY=(argo)
+        _print_link() { printf '%s\n' "$1"; }
+        _menu_nodes argo <<< $'1\n1\n0\n2\n1\n2\n3\n0\n0'
         st_set '.argo.xhttp.split.download.security = "tls" |
             .argo.xhttp.split.download.tlsSettings = {serverName:"down.example.com",alpn:["h2"]}'
         printf 'TLS_DOWN=%s\n' "$(_argo_xhttp_export_mihomo | jq -c .)"
@@ -3363,12 +3372,14 @@ def test_freeflow_and_direct_h3_xhttp_workbench_profiles():
             printf '%s-legacy=%s\n' "$m" "$(plugin_collect_links "$m")"
         done
         draft='{"server":{"xPaddingBytes":"128-768"},"client":{"xmux":{"maxConnections":4}}}'
-        unified_menu_freeflow install <<< $'x\n1\n3\n2\n'"$draft"$'\n3\n1\n3\n2\n0\n0'
-        unified_menu_vlquic install <<< $'x\n1\n4\n2\n'"$draft"$'\n3\n1\n3\n2\n0\n0'
+        unified_menu_freeflow install <<< $'x\n1\n3\n2\n'"$draft"$'\n0\n0'
+        unified_menu_vlquic install <<< $'x\n1\n4\n2\n'"$draft"$'\n0\n0'
         for m in ff vlquic; do
             if "_${m}_xhttp_set_profile" 0 '{"client":{"xhttpModeH3":false}}'; then exit 1; fi
             printf '%s-in=%s\n' "$m" "$(plugin_call "$m" inbound | jq -ce .)"
             printf '%s-link=%s\n' "$m" "$(plugin_collect_links "$m")"
+            _print_link() { printf '%s\n' "$1"; }
+            _menu_nodes "$m" <<< $'1\n2\n0'
             printf '%s-out=%s\n' "$m" "$("_${m}_xhttp_export_json" | jq -ce .)"
             "_${m}_xhttp_set_profile" 0 null
             printf '%s-reset=%s\n' "$m" "$(plugin_collect_links "$m")"
@@ -3411,7 +3422,7 @@ def test_reality_xhttp_workbench_profiles_and_legacy_transport():
         clear() { :; }
         _pause() { :; }
         prompt() { IFS= read -r "$2"; }
-        unified_menu_reality install <<< $'x\n1\n3\n2\n{"server":{"xPaddingBytes":"128-768","scMaxBufferedPosts":35},"client":{"xmux":{"maxConnections":4}}}\n5\n3\n6\n0\n3\n1\n3\n2\n0\n0'
+        unified_menu_reality install <<< $'x\n1\n3\n2\n{"server":{"xPaddingBytes":"128-768","scMaxBufferedPosts":35},"client":{"xmux":{"maxConnections":4}}}\n5\n3\n6\n0\n0\n0'
         for bad in '{"split":{"port":28443}}' '{"client":{"xhttpModeH3":true}}' '{"server":false}'; do
             if _reality_xhttp_set_profile 0 "$bad"; then exit 1; fi
         done
@@ -3491,8 +3502,10 @@ def test_cforigin_xhttp_menu_profiles_and_links():
             fi
             IFS= read -r "$2"
         }
-        _cforigin_xhttp_menu 0 <<< $'2\n'"$rejected"$'\n'"$corrected"$'\n5\n3\n4\n0\n3\n1\n3\n2\n0'
+        _cforigin_xhttp_menu 0 <<< $'2\n'"$rejected"$'\n'"$corrected"$'\n5\n3\n4\n0\n0'
         printf 'H3=%s\n' "$(_plg_cforigin_link)"
+        _print_link() { printf '%s\n' "$1"; }
+        _menu_nodes cforigin <<< $'1\n2\n0'
         printf 'OUTBOUND=%s\n' "$(_cforigin_xhttp_export_json | jq -c .)"
         st_set '.cforigin.protocol="ws"'
         printf 'WS=%s\n' "$(_plg_cforigin_link)"
@@ -3508,7 +3521,7 @@ def test_cforigin_xhttp_menu_profiles_and_links():
     json_start = '{\n  "protocol": "vless"'
     assert_true(out.count(json_start) == 1, out)
     exported_json, _ = json.JSONDecoder().raw_decode(out[out.index(json_start):])
-    assert_true('XHTTP 参数与节点导出' in out, out)
+    assert_true('高级设置（XHTTP）' in out, out)
     values = dict(re.findall(r'^(LEGACY|INBOUND|NORMAL|H3|OUTBOUND|WS|DEFAULT)=(.*)$', out, re.MULTILINE))
     assert exported_json == json.loads(values['OUTBOUND'])
     legacy = parse_qs(urlsplit(values['LEGACY']).query)
@@ -5031,7 +5044,7 @@ def test_cforigin_plan_defers_certificate_issuance():
         prompt() {
             case "$2" in
                 _domain) printf -v "$2" '%s' 'origin.fixture.invalid' ;;
-                _email) printf -v "$2" '%s' 'admin@fixture.invalid' ;;
+                _email_input) printf -v "$2" '%s' 'admin@fixture.invalid' ;;
                 _c) printf -v "$2" '%s' "$confirm" ;;
                 *) printf -v "$2" '%s' '' ;;
             esac
@@ -5252,8 +5265,8 @@ def test_direct_h3_plan_defers_certificate_issuance():
         prompt() {
             case "$2" in
                 _domain) printf -v "$2" '%s' h3.fixture.invalid ;;
-                _m) printf -v "$2" '%s' 3 ;;
-                _email) printf -v "$2" '%s' admin@fixture.invalid ;;
+                _source) printf -v "$2" '%s' 3 ;;
+                _email_input) printf -v "$2" '%s' admin@fixture.invalid ;;
                 _c) printf -v "$2" '%s' "$confirm" ;;
             esac
         }
@@ -5413,7 +5426,7 @@ def test_port_prompt_distinguishes_eof_from_blank():
     assert out.count('RANDOM_CALLED') == 1 and 'BLANK_SELECTED_RANDOM' in out, out
 
 
-def test_management_action_pauses_once():
+def test_workbench_feedback_stays_visible_without_extra_pause():
     out = run_bash(r'''
         source ./xray_2go.sh
         st_init
@@ -5425,14 +5438,14 @@ def test_management_action_pauses_once():
         prompt() { IFS= read -r "$2"; }
         _pause() { printf 'ACTION_PAUSE\n'; }
         module_cforigin_uninstall() { printf 'UNINSTALL_RAN\n'; }
-        unified_menu_cforigin runtime <<< $'2\n3\n2\n9\nu\nn\n0'
+        unified_menu_cforigin runtime <<< $'2\n3\n99\nu\n\n0'
         jq -e '.cforigin.enabled == false and .cforigin.protocol == "xhttp"' "${STATE_FILE}" >/dev/null || exit 1
         printf 'CHECK_STATUS\n'
         module_dispatch cforigin update_protocol <<< '3' || exit 1
         printf 'UPDATE_RETURNED_SUCCESS\n'
     ''', timeout=30)
     menu_out, _, action_out = out.partition('CHECK_STATUS')
-    assert menu_out.count('ACTION_PAUSE') == 3, menu_out
+    assert 'ACTION_PAUSE' not in menu_out and 'CF Origin 协议已更新: xhttp' in menu_out, menu_out
     assert '无效选项' in menu_out and 'UNINSTALL_RAN' not in menu_out, menu_out
     assert 'UPDATE_RETURNED_SUCCESS' in action_out and 'ACTION_PAUSE' not in action_out, action_out
 
@@ -5443,19 +5456,18 @@ source ./xray_2go.sh
 st_init >/dev/null
 st_set '.argo.protocol="xhttp"'
 clear() { :; }
-check_xray_install() { return 0; }
-check_xray() { return 0; }
+svc_exec() { return 0; }
 _manage_module_entry_check() { :; }
 _pause() { printf 'UNEXPECTED_PAUSE\n'; }
 prompt() { printf 'page=%s\n' "$1"; IFS= read -r "$2"; }
-(menu <<< $'2\nx\n0\n0\n0')
+(menu <<< $'2\n1\nx\n0\n0\n0\n0')
 (install_plan_menu <<< $'1\n0\n0')
 unified_menu_argo runtime </dev/null
     ''')
     pages = re.findall(r'^page=(.*)$', out, re.MULTILINE)
-    expected = ['输入编号或按键', '(0-9/x/r/h/v/u)', '(0-7)', '(0-9/x/r/h/v/u)',
-                '输入编号或按键', '(0-13)', '(0-9/x)', '(0-13)', '(0-9/x/r/h/v/u)']
-    assert_true(len(pages) == len(expected) and all(hint in page for hint, page in zip(expected, pages)), pages)
+    expected = ['输入编号', '选择入站', '选择工作台操作', '选择高级设置', '选择工作台操作',
+                '选择入站', '输入编号', '(0-13)', '选择工作台操作', '(0-13)', '选择工作台操作']
+    assert_true(len(pages) == len(expected) and all(hint in page for hint, page in zip(expected, pages, strict=True)), pages)
     assert_true('UNEXPECTED_PAUSE' not in out, out)
 
 
@@ -5463,68 +5475,310 @@ def test_console_redraws_after_deployment_exit_and_pauses_once_for_results():
     out = run_bash(r'''
         source ./xray_2go.sh
         st_init >/dev/null
-        _menu_collect_status() { _MENU_XI=0; _MENU_CX=1; }
+        state=uninstalled
+        _menu_collect_status() { _MENU_STATE="$state"; }
         _menu_render() { echo console; }
         install_wizard_render() { echo wizard; }
         install_plan_render_summary() { echo advanced; }
-        install_wizard_reality() { echo deployed; }
+        install_wizard_reality() { echo deployed; state=stopped; }
         module_xray_upgrade() { echo upgraded; }
         module_config_update_shortcut() { echo update_failed; return 1; }
         prompt() { IFS= read -r "$2"; }
         _pause() { echo feedback; }
-        menu <<< $'d\n0\nd\n3\n0\nd\n1\nx\ns\n0'
+        menu <<< $'3\n0\n1\n3\n3\n2\n0\n0'
     ''')
     events = re.findall(r'^(console|wizard|advanced|deployed|upgraded|update_failed|feedback)$', out, re.M)
-    assert_true(events == ['console', 'wizard', 'console', 'wizard', 'advanced', 'console',
-                           'wizard', 'deployed', 'feedback', 'console', 'upgraded', 'feedback',
-                           'console', 'update_failed', 'feedback', 'console'], events)
+    assert_true(events == ['wizard', 'advanced', 'wizard', 'deployed', 'feedback', 'console',
+                           'upgraded', 'feedback', 'update_failed', 'feedback', 'console'], events)
 
 
 def test_main_menu_status_and_key_dispatch():
     out = run_bash(r'''
 source ./xray_2go.sh
 st_init >/dev/null
+is_systemd() { return 0; }
+is_openrc() { return 1; }
+systemctl() { [[ "$1" == cat && "$unit_present" == true ]]; }
+unit_present=false
 clear() { :; }
 _pause() { :; }
 prompt() { IFS= read -r "$2"; }
-check_xray() { return 1; }
-check_xray_install() { return 1; }
+svc_exec() { return "$status"; }
+status=4
+unit_present=true
+_menu_collect_status
+[[ "$_MENU_STATE" == stopped ]] || exit 90
+unit_present=false
+is_systemd() { return 1; }
+is_openrc() { return 0; }
+status=1
+_menu_collect_status
+[[ "$_MENU_STATE" == uninstalled ]] || exit 91
+mkdir -p "$_SVC_OPENRC_DIR"
+touch "$_SVC_OPENRC_DIR/$_SVC_XRAY"
+_menu_collect_status
+[[ "$_MENU_STATE" == unknown ]] || exit 92
+is_systemd() { return 0; }
+is_openrc() { return 1; }
+status=4
 printf '%s\n' FIRST
-_menu_collect_status
-_menu_render
-check_xray() { return 0; }
-check_xray_install() { return 0; }
+menu <<< 0
+status=0
 check_argo() { printf running; }
-st_set '.argo.enabled=true | .argo.protocol="xhttp" | .argo.domain="long-argo-domain-for-terminal-width-check.example.com" |
-    .http.enabled=true | .http.listen="2001:db8:1234:5678:9101:abcd:eded:42" | .ports.http=61107'
+st_set '.argo.enabled=true | .argo.protocol="xhttp" | .argo.domain="argo.example.com" |
+    .http.enabled=true | .http.listen="2001:db8::42" | .ports.http=61107'
 printf '%s\n' INSTALLED
-_menu_collect_status
-_menu_render
+menu <<< 0
+printf '%s\n' UNKNOWN
+status=1
+menu <<< 0
 printf '%s\n' ROUTES
+status=3
 _menu_render() { :; }
+_menu_nodes() { echo nodes; }
 module_dispatch() { printf 'route=%s\n' "$*"; }
-(menu <<< $'1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\nd\nu\ns\nx\n12\n0')
-module_dispatch() { IFS= read -r input; printf 'action stdin=%s\n' "$input"; }
-_menu_select_action s <<< original-input
+menu <<< $'1\n2\n1\n0\n3\n1\n\n2\n3\n4\n5\n12\n0'
     ''', timeout=70)
     plain = re.sub(r'\x1b\[[0-9;]*m', '', out)
     first, installed = plain.split('FIRST\n', 1)[1].split('INSTALLED\n', 1)
-    installed, routes = installed.split('ROUTES\n', 1)
-    assert_true('未安装' in first and 'd. 开始部署（快速向导）' in first, first)
+    installed, unknown = installed.split('UNKNOWN\n', 1)
+    unknown, routes = unknown.split('ROUTES\n', 1)
+    assert_true('1. 快速部署 Reality' in first and '3. 自定义部署' in first, first)
     assert_true('Xray-2go 控制台' in installed and '运行中' in installed, installed)
-    for detail in ['long-argo-domain-for-terminal-width-check.example.com', '2001:db8:1234:5678:9101:abcd:eded:42', '61107']:
+    for detail in ['argo.example.com', '2001:db8::42', '61107']:
         assert_true(detail in installed, installed)
-    for label in ['连接', '入站管理', '维护', '1. 查看节点与连接提示', '2. Argo 固定隧道', '10. Shadowsocks 2022', '11. 更新 UUID', 'x. 升级 Xray 内核', 'u. 卸载整套 Xray-2go']:
-        assert_true(label in installed, installed)
-    overview = installed.split('连接', 1)[0]
-    assert_true('Reality' not in overview and '未启用' not in overview, overview)
-    expected = ['nodes show', 'argo', 'reality', 'vltcp', 'vlquic', 'ff', 'cforigin',
-                'socks', 'http', 'ss2022', 'config update_uuid', 'xray install',
-                'xray uninstall', 'config update_shortcut', 'xray upgrade']
-    actual = re.findall(r'^route=(.*)$', routes, re.MULTILINE)
-    assert_true(actual == expected, f'main menu routes: {actual!r}')
-    assert_true('无效选项' in routes and '已退出' in routes, routes)
-    assert_true('action stdin=original-input' in routes, routes)
+    for label in ['1. 查看与导出节点', '2. 管理入站', '3. 维护']:
+        assert_true(label in installed and label in unknown, installed + unknown)
+    assert_true('状态未知' in unknown and '快速部署' not in unknown, unknown)
+    assert_true('nodes' in routes and '无效选项' in routes and '已取消' in routes, routes)
+    expected = ['argo', 'config update_shortcut', 'xray upgrade', 'config update_uuid', 'xray uninstall']
+    assert_true(re.findall(r'^route=(.*)$', routes, re.MULTILINE) == expected, routes)
+
+
+def test_console_exports_stopped_nodes_with_short_paths():
+    out = run_bash(r'''
+source ./xray_2go.sh
+st_init >/dev/null
+_MENU_STATE=stopped
+_PLUGIN_REGISTRY=(argo vltcp)
+st_set '.argo.enabled=true | .argo.protocol="xhttp" | .vltcp.enabled=true'
+plugin_call() {
+    local name="$1" action="$2"
+    if [ "$action" = enabled ]; then [ "$name" = argo ] || [ "$name" = vltcp ]; return; fi
+    if [ "$name" = argo ]; then
+        printf '%s\n' 'vless://demo@argo.example.com:443#Argo-XHTTP' 'vless://demo@argo.example.com:443#Argo-XHTTP-Split'
+    else
+        printf '%s\n' 'vless://demo@direct.example.com:443#Direct'
+    fi
+}
+_argo_xhttp_export_json() { echo "json $1"; }
+_argo_xhttp_export_mihomo() { echo provider; }
+_argo_xhttp_mihomo_warn_differences() { :; }
+_pause() { echo feedback; }
+prompt() { printf 'page=%s\n' "$1"; IFS= read -r "$2"; }
+printf '%s\n' MULTIPLE
+_menu_nodes <<< $'2\n2\n3\n0\n0'
+printf '%s\n' SINGLE
+_PLUGIN_REGISTRY=(vltcp)
+_menu_nodes </dev/null
+    ''')
+    multiple, single = out.split('SINGLE\n', 1)
+    assert_true('当前服务未运行' in multiple and '当前服务未运行' in single, out)
+    assert_true(multiple.index('Argo-XHTTP') < multiple.index('Argo-XHTTP-Split'), multiple)
+    assert_true('json split' in multiple and 'provider' in multiple and multiple.count('feedback') == 2, multiple)
+    assert_true('page=' not in single and single.count('feedback') == 1 and '#Direct' in single, single)
+
+    out = run_bash(r'''
+source ./xray_2go.sh
+_MENU_STATE=unknown
+_PLUGIN_REGISTRY=(fixture)
+_fixture_enabled() { return 0; }
+_fixture_link() { printf '%s\n' 'testproto://fixture-first' 'testproto://fixture-second'; }
+plugin_call() { "_$1_$2"; }
+_print_link() { printf 'export=%s\n' "$1"; }
+_pause() { echo feedback; }
+prompt() { IFS= read -r "$2"; }
+_menu_nodes <<< $'3\n0'
+    ''')
+    browse, _, exports = out.partition('export=')
+    assert '状态未知' in browse and 'testproto://' not in browse
+    assert 'testproto://fixture-first' in exports and 'testproto://fixture-second' in exports
+    assert exports.count('feedback') == 1
+
+
+def test_console_cert_retry_keeps_draft_and_confirms_before_apply():
+    out = run_bash(r'''
+source ./xray_2go.sh
+st_init >/dev/null
+st_set '.cforigin.domain="old.example.org" | .cforigin.enabled=true'
+prompt() { printf 'prompt=%s\n' "$1"; IFS= read -r "$2"; }
+prompt_secret() { prompt "$@"; }
+_pause() { echo feedback; }
+attempt=0
+_transaction_run() {
+    attempt=$((attempt+1))
+    domain=$(jq -r '.domain' <<< "$3")
+    printf 'submit=%s:%s:%s\n' "$domain" "${_CFORIGIN_ISSUE[0]}" "$attempt"
+    if [ "$attempt" -eq 1 ]; then _cert_stage='签发证书'; _cert_recovery='已恢复变更前的配置与服务状态'; return 1; fi
+}
+_MENU_HIDE_LINKS=1
+_menu_certificates cforigin 1 <<< $'1\nbad domain\n\n\ninvalid-email\nadmin@demo.invalid\n\nfixture-token\ny\n2\ny\n0'
+    ''')
+    assert_true(out.count('submit=old.example.org:acme_issue_cf_token_to_state:') == 2, out)
+    assert_true(out.count('prompt=回源域名') == 2 and out.count('prompt=ACME 邮箱') == 2, out)
+    assert_true('Xray 可能重新加载' in out and out.count('feedback') == 1, out)
+    assert_true('fixture-token' not in out and '签发证书）：已恢复变更前的配置与服务状态' in out, out)
+
+
+def _console_pty(sandbox, script, exchanges):
+    import errno
+    import os
+    import pty
+    import select
+    import signal
+    import time
+    from contextlib import suppress
+
+    env = sandbox.environment()
+    env.pop('BASH_ENV', None)
+    assert env['X2G_TEST_ROOT'] == str(sandbox.root)
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.chdir(ROOT)
+        # The child needs a controlling terminal and the fixture script is test-owned.
+        os.execvpe('bash', ['bash', '--noprofile', '--norc', '-c', script], env)  # noqa: S606
+    pending = b''
+    pages = []
+    reaped = False
+    try:
+        for step, (marker, answer) in enumerate([*exchanges, (None, None)]):
+            needle = marker.encode() if marker else None
+            deadline = time.monotonic() + 8
+            while needle is None or needle not in pending:
+                remaining = deadline - time.monotonic()
+                assert remaining > 0 and select.select([fd], [], [], remaining)[0], f'TTY timed out at step {step} ({marker!r})'
+                try:
+                    pending += os.read(fd, 4096)
+                except OSError as error:
+                    if error.errno != errno.EIO or needle is not None:
+                        raise
+                    break
+            stop = len(pending) if needle is None else pending.index(needle) + len(needle)
+            pages.append(pending[:stop].decode(errors='replace'))
+            pending = pending[stop:]
+            if answer is not None:
+                os.write(fd, (answer + '\n').encode())
+        _, status = os.waitpid(pid, 0)
+        reaped = True
+        assert os.waitstatus_to_exitcode(status) == 0
+        return pages
+    finally:
+        if not reaped:
+            with suppress(ProcessLookupError):
+                os.killpg(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
+        os.close(fd)
+
+
+def test_console_pty_deployment_preview_and_pending_uninstall():
+    with XraySandbox() as sandbox:
+        pages = _console_pty(sandbox, r'''
+source ./xray_2go.sh
+st_init >/dev/null
+svc_exec() { return 4; }
+is_systemd() { return 0; }
+check_xray_install() { return 1; }
+port_mgr_in_use() { return 1; }
+clear() { :; }
+install_execute_current_plan() { printf 'unexpected installation\n'; return 95; }
+menu
+        ''', [('请选择部署方案', '1'), ('确认开始部署？', ''), ('请选择部署方案', '0')])
+    assert '443' in pages[1] and '确认部署' in pages[1]
+    assert 'unexpected installation' not in ''.join(pages)
+    assert '按回车键继续' not in ''.join(pages)
+    with XraySandbox() as sandbox:
+        pages = _console_pty(sandbox, r'''
+source ./xray_2go.sh
+mkdir -p "$WORK_DIR"
+touch "${_UNINSTALL_PENDING}"
+check_root() { :; }
+platform_detect_init() { :; }
+platform_preflight() { printf 'unexpected initialization\n'; return 98; }
+_module_xray_uninstall_locked() { printf 'uninstall fixture\n'; }
+main
+        ''', [('选择操作 (0-1): ', '1'), ('(y/N): ', 'y')])
+    assert '继续卸载' in pages[0] and 'uninstall fixture' in pages[-1]
+    assert 'unexpected initialization' not in ''.join(pages)
+
+
+def test_console_pty_stopped_exports_and_port_edit():
+    with XraySandbox() as sandbox:
+        pages = _console_pty(sandbox, r'''
+source ./xray_2go.sh
+st_init >/dev/null
+st_set '.argo.enabled=true | .argo.protocol="xhttp" | .argo.domain="argo.fixture.invalid" |
+        .argo.xhttp.split={port:28443,mode:"stream-up"} | .vltcp.enabled=true |
+        .reality.enabled=true | .reality.pvk="fixture-private" | .reality.pbk="fixture-public" | .reality.sid="abcd"'
+plugin_refresh_runtime
+platform_get_realip() { echo 192.0.2.10; }
+svc_exec() { return 3; }
+port_mgr_in_use() { return 1; }
+_manage_module_entry_check() { :; }
+_commit_port_change() { st_set '.ports[$id]=$port' --arg id "$1" --argjson port "$2"; }
+menu
+_PLUGIN_REGISTRY=(vltcp)
+menu
+        ''', [
+            ('输入编号 (0-3): ', '1'), ('选择节点: ', '2'), ('选择格式 (0-3): ', '3'),
+            ('按回车键继续', ''), ('选择格式 (0-3): ', '0'), ('选择节点: ', '0'),
+            ('输入编号 (0-3): ', '2'), ('选择入站: ', '3'), ('选择工作台操作: ', '2'),
+            ('新端口', 'bad'), ('新端口', '32443'), ('选择工作台操作: ', '0'),
+            ('选择入站: ', '0'), ('输入编号 (0-3): ', '0'), ('输入编号 (0-3): ', '1'),
+            ('按回车键继续', ''), ('输入编号 (0-3): ', '0'),
+        ])
+    assert '当前服务未运行' in pages[1]
+    assert pages[1].index('Argo-XHTTP') < pages[1].index('Argo-XHTTP-Split')
+    assert '://' not in pages[1] and '"proxies"' in pages[3]
+    assert '32443' in pages[11] and '://' not in pages[11]
+    assert '选择节点' not in pages[15] and '选择格式' not in pages[15] and 'vless://' in pages[15]
+    assert ''.join(pages).count('按回车键继续') == 2
+
+
+def test_console_pty_cert_from_workbench_retries_after_rollback():
+    with XraySandbox() as sandbox:
+        pages = _console_pty(sandbox, r'''
+source ./xray_2go.sh
+st_init >/dev/null
+st_set '.argo.enabled=false | .cforigin.enabled=true | .cforigin.domain="origin.fixture.invalid"'
+svc_exec() { return 0; }
+_manage_module_entry_check() { :; }
+_transaction_begin() { :; }
+_transaction_rollback() { _G_STATE="$before"; }
+_transaction_end() { :; }
+before=$_G_STATE
+attempt=0
+acme_issue_cf_token_to_state() {
+    attempt=$((attempt+1))
+    if [ "$attempt" -eq 1 ]; then log_error '签发服务暂时失败'; return 1; fi
+    printf 'fixture issuance succeeded\n'
+}
+_cforigin_check_ready() { :; }
+_module_tls_apply_config() { :; }
+menu
+        ''', [
+            ('输入编号 (0-3): ', '2'), ('选择入站: ', '1'), ('选择工作台操作: ', '9'),
+            ('选择证书操作: ', '1'), ('回源域名', ''), ('选择证书来源', ''),
+            ('ACME 邮箱', 'bad'), ('ACME 邮箱', 'user@fixture.invalid'),
+            ('需重新输入，0 返回）: ', 'fixture-token'), ('确认提交证书配置？', 'y'),
+            ('按回车键继续', ''), ('选择证书操作: ', '2'), ('确认提交证书配置？', 'y'),
+            ('选择证书操作: ', '0'), ('选择工作台操作: ', '0'),
+            ('选择入站: ', '0'), ('输入编号 (0-3): ', '0'),
+        ])
+    assert 'Cloudflare API Token' in pages[5] and 'Xray 可能重新加载' in pages[9]
+    assert '签发证书）：已恢复变更前的配置与服务状态' in pages[10]
+    assert 'fixture issuance succeeded' in pages[13] and '证书配置已更新' in pages[13]
+    assert 'fixture-token' not in ''.join(pages), 'the terminal echoed the secret input'
+    assert ''.join(pages).count('按回车键继续') == 1
 
 
 def _function_body(name):

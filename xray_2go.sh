@@ -163,9 +163,8 @@ prompt() {
 }
 
 prompt_secret() {
-    printf '%s%s%s' "${C_RED}" "$1" "${C_RST}" >&2
     local _prompt_status=0
-    read -r -s "$2" </dev/tty || _prompt_status=$?
+    read -r -s -p "${C_RED}$1${C_RST}" "$2" </dev/tty || _prompt_status=$?
     printf '\n' >&2
     return "${_prompt_status}"
 }
@@ -3041,6 +3040,7 @@ _config_apply_inner() {
 config_apply() { with_lock _config_apply_inner "$@"; }
 
 config_print_nodes() {
+    [ "${_MENU_HIDE_LINKS:-0}" -eq 0 ] || return 0
     local _links
     _links=$(plugin_collect_links "${1:-}") || return 1
 
@@ -3127,13 +3127,13 @@ _transaction_begin() {
         return 1
     }
     if [ -e "${_UNINSTALL_PENDING}" ]; then
-        log_error "卸载未完成，请先用主菜单 u 继续清理"
+        log_error "卸载未完成，请先用首页继续卸载"
         _transaction_lock_release
         return 1
     fi
     if [ "${_install_transaction:-0}" -eq 1 ]; then
         if check_xray_install; then
-            log_error "Xray-2go 已安装。如需重装，请先用主菜单 u 卸载"
+            log_error "Xray-2go 已安装。如需重装，请先用维护菜单卸载"
             _transaction_lock_release
             return 1
         fi
@@ -3286,7 +3286,7 @@ _transaction_end() {
 }
 
 _transaction_run() {
-    local _label="$1" _rc=0 _keep_snapshot=0
+    local _label="$1" _rc=0 _keep_snapshot=0 _failure_pause=0
     shift
     if [ "${_TXN_ACTIVE:-0}" -eq 1 ]; then
         "$@"
@@ -3296,13 +3296,23 @@ _transaction_run() {
     _transaction_begin || return 1
     "$@" || _rc=$?
     if [ "${_rc}" -ne 0 ]; then
-        _transaction_rollback || {
+        if _transaction_rollback; then
+            if [ -n "${_cert_recovery+x}" ]; then
+                _cert_recovery='已恢复变更前的配置与服务状态'
+            elif [ "${_MENU_HIDE_LINKS:-0}" -eq 1 ] && [ "${_MENU_ACTION_PAUSES:-0}" -eq 0 ]; then
+                log_warn "${_label}失败，已恢复变更前的配置与服务状态"
+                _failure_pause=1
+            fi
+        else
+            if [ -n "${_cert_recovery+x}" ]; then _cert_recovery='回滚未完全成功，请查看事务诊断'; fi
             log_error "${_label} 失败"
             _keep_snapshot=1
             _rc=1
-        }
+            if [ -z "${_cert_recovery+x}" ] && [ "${_MENU_HIDE_LINKS:-0}" -eq 1 ] && [ "${_MENU_ACTION_PAUSES:-0}" -eq 0 ]; then _failure_pause=1; fi
+        fi
     fi
     _transaction_end "${_keep_snapshot}"
+    if [ "${_failure_pause}" -eq 1 ]; then _pause; fi
     return "${_rc}"
 }
 
@@ -4171,14 +4181,7 @@ module_vlquic_disable() {
     log_ok "VLESS-XHTTP-H3 已禁用"
 }
 
-module_vlquic_update_cert() {
-    local -a _VLQUIC_ISSUE=()
-    _transaction_run "更新 VLESS-XHTTP-H3 证书" _module_vlquic_save_cert || return 1
-    log_ok "VLESS-XHTTP-H3 域名/证书已更新"
-    if [ "$(st_get '.vlquic.enabled')" = true ]; then
-        config_print_nodes vlquic || true
-    fi
-}
+module_vlquic_update_cert() { _module_update_certificate vlquic; }
 
 _module_tls_cert_fingerprint() {
     local _module="$1" _field _file
@@ -4208,34 +4211,113 @@ _module_vlquic_save_cert() {
     if [ "${_enabled}" = true ]; then
         _old_fingerprint=$(_module_tls_cert_fingerprint vlquic) || return 1
     fi
-    vlquic_config_cert && _vlquic_apply_cert || return 1
+    st_set '.vlquic += $draft' --argjson draft "$1" || return 1
+    _cert_stage='签发或校验证书'
+    _vlquic_apply_cert || return 1
     if [ "${_enabled}" = true ]; then
-        _module_tls_apply_config vlquic "${_old_fingerprint}" && _commit_state_and_firewall
+        _cert_stage='验证并重新加载 Xray'
+        _module_tls_apply_config vlquic "${_old_fingerprint}" || return 1
+        _cert_stage='保存配置及防火墙'
+        _commit_state_and_firewall
     else
+        _cert_stage='保存配置'
         st_persist
     fi
 }
 
-module_cforigin_update_cert() {
-    local _draft _domain
-    local -a _CFORIGIN_ISSUE=() _cforigin_cert_artifacts=()
-    _cforigin_read_cert_draft || return 1
-    _domain=$(jq -r '.domain' <<< "${_draft}") || return 1
-    if [ "${#_CFORIGIN_ISSUE[@]}" -gt 0 ]; then
+module_cforigin_update_cert() { _module_update_certificate cforigin; }
+
+_cert_read_draft() {
+    local _G_STATE="${_G_STATE}"
+    "$1_config_cert" || return 1
+    _cert_draft=$(jq -c --arg id "$1" '.[$id] | {domain, cert, key, acme_method} +
+        if $id == "cforigin" then {origin_tls} else {} end' <<< "${_G_STATE}")
+}
+
+_cert_submit_draft() {
+    local _module="$1" _domain _cert_stage='读取或保存证书配置' _cert_recovery='未应用变更'
+    local -a _cforigin_cert_artifacts=()
+    _domain=$(jq -er '.domain' <<< "${_cert_draft}") || return 1
+    if [ "${_module}" = cforigin ] && [ "${#_CFORIGIN_ISSUE[@]}" -gt 0 ]; then
         _cforigin_cert_artifacts=("${_CERT_DIR}/${_domain}/fullchain.pem" "${_CERT_DIR}/${_domain}/privkey.pem")
     fi
-    _transaction_run "更新 CF Origin 证书" _module_cforigin_save_cert "${_draft}" || return 1
-    log_ok "CF Origin 域名/证书已更新"
-    if [ "$(st_get '.cforigin.enabled')" = "true" ]; then
-        config_print_nodes cforigin
-        cforigin_print_cloudflare_hint
+    if ! _transaction_run "更新 $(module_label "${_module}") 证书" "_module_${_module}_save_cert" "${_cert_draft}"; then
+        log_error "证书更新失败（${_cert_stage}）：${_cert_recovery}"
+        return 1
+    fi
+    log_ok "${_domain} 的证书配置已更新"
+}
+
+_module_update_certificate() {
+    local _cert_draft
+    local -a _VLQUIC_ISSUE=() _CFORIGIN_ISSUE=()
+    _cert_read_draft "$1" && _cert_submit_draft "$1"
+}
+
+_workbench_certificates() {
+    local -a _cert_issue_plan=()
+    local _cert_plan_saved=0
+    _menu_certificates "$@"
+    if [ "${_cert_plan_saved}" -eq 1 ]; then
+        case "$1" in
+            cforigin) _CFORIGIN_ISSUE=("${_cert_issue_plan[@]}") ;;
+            vlquic) _VLQUIC_ISSUE=("${_cert_issue_plan[@]}") ;;
+        esac
     fi
 }
 
-_cforigin_read_cert_draft() {
-    local _G_STATE="${_G_STATE}"
-    cforigin_config_cert || return 1
-    _draft=$(jq -c '.cforigin | {domain, origin_tls, cert, key, acme_method}' <<< "${_G_STATE}")
+_menu_certificates() {
+    local _module="$1" _runtime="$2" _cert_draft='' _cert_source='' _expires _path _domain _choice _confirm
+    local -a _VLQUIC_ISSUE=() _CFORIGIN_ISSUE=()
+    while true; do
+        log_title "$(module_label "${_module}") / 证书"
+        _domain=$(st_get '.[$id].domain' --arg id "${_module}")
+        _path=$(st_get '.[$id].cert' --arg id "${_module}")
+        if [ -n "${_path}" ]; then
+            _expires=$(LC_ALL=C openssl x509 -noout -enddate -in "${_path}" 2>/dev/null) || _expires='有效期无法读取'
+            printf '  %s · 到期时间 %s\n' "${_domain}" "${_expires#notAfter=}"
+            if ! openssl x509 -noout -checkend 0 -in "${_path}" >/dev/null 2>&1; then
+                log_warn '证书已过期或无法读取'
+            fi
+        elif [ "${_module}" = cforigin ] && [ -n "${_domain}" ] && [ "$(st_get '.cforigin.origin_tls')" = false ]; then
+            printf '  %s · 明文 HTTP 回源\n' "${_domain}"
+        else
+            printf '  %s · 尚无证书\n' "${_domain:-未配置域名}"
+        fi
+        _menu_print_action 1 '配置证书'
+        if [ -n "${_cert_draft}" ]; then _menu_print_action 2 '重试刚才的配置'; fi
+        _menu_print_back
+        prompt '选择证书操作: ' _choice || return 0
+        case "${_choice}" in
+            0) return 0 ;;
+            1) _cert_read_draft "${_module}" || continue ;;
+            2) [ -n "${_cert_draft}" ] || { log_error '没有待重试的配置'; continue; } ;;
+            *) log_error '无效证书操作'; continue ;;
+        esac
+        _domain=$(jq -r '.domain' <<< "${_cert_draft}")
+        printf '  域名 %s · 来源 %s\n' "${_domain}" "${_cert_source}"
+        if [ "${_runtime}" -eq 1 ] && [ "$(st_get '.[$id].enabled' --arg id "${_module}")" = true ]; then
+            printf '  入站已启用，Xray 可能重新加载。\n'
+        fi
+        prompt '确认提交证书配置？(y/N): ' _confirm || return 0
+        [ "${_confirm,,}" = y ] || continue
+        if [ "${_runtime}" -eq 1 ]; then
+            if ! _cert_submit_draft "${_module}"; then _pause; continue; fi
+        else
+            st_set '.[$id] += $draft' --arg id "${_module}" --argjson draft "${_cert_draft}" || continue
+            # 交给外层工作台保存签发计划。
+            if [ "${_module}" = cforigin ]; then
+                _cert_issue_plan=("${_CFORIGIN_ISSUE[@]}")
+            else
+                _cert_issue_plan=("${_VLQUIC_ISSUE[@]}")
+            fi
+            _cert_plan_saved=1
+            log_ok '证书配置已写入部署计划'
+            return 0
+        fi
+        _cert_draft=''
+        _VLQUIC_ISSUE=(); _CFORIGIN_ISSUE=()
+    done
 }
 
 _module_cforigin_save_cert() {
@@ -4246,13 +4328,18 @@ _module_cforigin_save_cert() {
     fi
     st_set '.cforigin += $draft' --argjson draft "$1" || return 1
     if [ "${#_CFORIGIN_ISSUE[@]}" -gt 0 ]; then
+        _cert_stage='签发证书'
         "${_CFORIGIN_ISSUE[@]}" || return 1
     fi
+    _cert_stage='校验证书'
     if [ "${_enabled}" = true ]; then
-        _cforigin_check_ready && _module_tls_apply_config cforigin "${_old_fingerprint}" || return 1
+        _cforigin_check_ready || return 1
+        _cert_stage='验证并重新加载 Xray'
+        _module_tls_apply_config cforigin "${_old_fingerprint}" || return 1
     else
         _cforigin_check_origin_tls "$(st_get '.cforigin.domain')" || return 1
     fi
+    _cert_stage='保存配置'
     st_persist || { log_error "state.json 写入失败"; return 1; }
 }
 
@@ -4572,70 +4659,122 @@ acme_issue_http01_to_state() {
     acme_install_cert_to_state "${_prefix}" "${_domain}" "http01"
 }
 
-cforigin_config_cert() {
-    echo ""; log_title "CF Origin 源站 TLS 证书配置"
-    local _domain _email
-    prompt "回源域名（需已接入 Cloudflare 并开启橙云）: " _domain || return 1
-    _domain=$(val_domain "${_domain}") || return 1
-    local -a _issue=()
-    echo ""
-    printf "  ${C_GRN}1.${C_RST} Cloudflare API Token ${C_YLW}[推荐：Zone:Read + DNS:Edit]${C_RST}\n"
-    printf "  ${C_GRN}2.${C_RST} Cloudflare Global API Key\n"
-    printf "  ${C_GRN}3.${C_RST} HTTP-01 standalone ${C_YLW}[需要80端口]${C_RST}\n"
-    printf "  ${C_GRN}4.${C_RST} 使用已有证书文件\n"
-    printf "  ${C_GRN}5.${C_RST} 保留/使用已配置证书路径 ${C_YLW}[手动已配 CF 回源时常用]${C_RST}\n"
-    printf "  ${C_GRN}6.${C_RST} 明文 HTTP 回源 ${C_RED}[不推荐]${C_RST}\n"
-    local _m; prompt "请选择 (1-6，回车默认1): " _m || return 1
-    if [ "${_m:-1}" != "4" ] && [ "${_m:-1}" != "5" ] && [ "${_m:-1}" != "6" ]; then
-        prompt "ACME 邮箱（用于 Let's Encrypt 账户，不能使用 example.com）: " _email || return 1
-        case "${_email:-}" in
-            *@example.com|*@example.org|*@example.net|''|*' '*|*"'"*|*'"'*|*'`'*|*'\\'*) log_error "ACME 邮箱不合法"; return 1 ;;
+_cert_prompt_email() {
+    local _email_input
+    while prompt "$1（0 返回）: " _email_input; do
+        case "${_email_input}" in
+            0) return 1 ;;
+            *@example.com|*@example.org|*@example.net) ;;
+            *) if [[ "${_email_input}" =~ ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
+                   printf -v "$2" '%s' "${_email_input}"
+                   return 0
+               fi ;;
         esac
-        printf '%s' "${_email}" | grep -qE '^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$' \
-            || { log_error "ACME 邮箱格式不合法"; return 1; }
-    fi
-    case "${_m:-1}" in
-        1)
-            local _token
-            prompt_secret "Cloudflare API Token（需 Zone:Read + DNS:Edit，不会显示在节点/日志中）: " _token || return 1
-            [ -n "${_token:-}" ] || { log_error "Cloudflare API Token 不能为空"; return 1; }
-            _issue=(acme_issue_cf_token_to_state cforigin "${_domain}" "${_token}" "${_email}") ;;
-        2)
-            local _cf_key _cf_email
-            prompt "Cloudflare 账号邮箱: " _cf_email || return 1
-            prompt_secret "Cloudflare Global API Key（不会显示在节点/日志中）: " _cf_key || return 1
-            [ -n "${_cf_key:-}" ] && [ -n "${_cf_email:-}" ] || { log_error "Cloudflare 邮箱和 API Key 不能为空"; return 1; }
-            _issue=(acme_issue_cf_key_to_state cforigin "${_domain}" "${_cf_key}" "${_cf_email}" "${_email}") ;;
-        3)
-            log_warn "HTTP-01 需要域名 A 记录指向本机且 80/tcp 开放/空闲"
-            _issue=(acme_issue_http01_to_state cforigin "${_domain}" "${_email}") ;;
-        4)
-            local _cert _key
-            prompt "fullchain.pem 路径: " _cert || return 1
-            prompt_secret "privkey.pem 路径: " _key || return 1
-            [ -f "${_cert}" ] || { log_error "证书文件不存在: ${_cert}"; return 1; }
-            [ -f "${_key}" ]  || { log_error "私钥文件不存在: ${_key}"; return 1; }
-            st_set '.cforigin.origin_tls = true | .cforigin.cert = $c | .cforigin.key = $k | .cforigin.acme_method = "manual"' \
-                --arg c "${_cert}" --arg k "${_key}" || return 1 ;;
-        5)
-            local _cert _key
-            _cert=$(st_get '.cforigin.cert'); _key=$(st_get '.cforigin.key')
-            if [ -z "${_cert:-}" ] || [ -z "${_key:-}" ] || [ ! -f "${_cert}" ] || [ ! -f "${_key}" ]; then
-                log_error "当前没有可用的已配置证书路径；请选择 1-4 配置证书，或 6 明文回源"
-                return 1
-            fi
-            st_set '.cforigin.origin_tls = true | .cforigin.acme_method = "manual_existing"' || return 1 ;;
-        6)
-            log_warn "已选择明文 HTTP 回源：需要 Cloudflare Flexible 或等效配置，不推荐。"
-            st_set '.cforigin.origin_tls = false | .cforigin.cert = "" | .cforigin.key = "" | .cforigin.acme_method = "plain_http"' || return 1 ;;
-        *) log_error "无效选项，请按提示输入"; return 1 ;;
-    esac
-    if [ "${#_issue[@]}" -gt 0 ]; then
-        st_set '.cforigin.origin_tls = true | .cforigin.cert = "" | .cforigin.key = ""' || return 1
-    fi
-    st_set '.cforigin.domain = $d' --arg d "${_domain}" || return 1
-    _CFORIGIN_ISSUE=("${_issue[@]}")
+        log_error '请输入有效的邮箱地址'
+    done
+    return 1
 }
+
+_cert_prompt_secret() {
+    local _secret
+    while prompt_secret "$1（需重新输入，0 返回）: " _secret; do
+        [ "${_secret}" != 0 ] || return 1
+        if [ -n "${_secret}" ]; then printf -v "$2" '%s' "${_secret}"; return 0; fi
+        log_error '凭证不能为空'
+    done
+    return 1
+}
+
+_cert_prompt_file() {
+    local _file _hint='' _read=prompt
+    [ -z "$3" ] || _hint='，回车保留'
+    [ "${4:-}" != secret ] || _read=prompt_secret
+    while "${_read}" "$1（0 返回${_hint}）: " _file; do
+        [ "${_file}" != 0 ] || return 1
+        _file="${_file:-$3}"
+        if [ -f "${_file}" ]; then printf -v "$2" '%s' "${_file}"; return 0; fi
+        log_error "$1不存在，请重新输入"
+    done
+    return 1
+}
+
+_tls_cert_config() {
+    local _module="$1" _domain _saved _domain_label _email _source _last=4 _method
+    local _cert='' _key='' _token _cf_key _cf_email _tls=true _issue_suffix='' _label
+    local -a _issue=() _prefix=()
+    local -a _sources=('Cloudflare API Token' 'Cloudflare Global API Key' 'HTTP-01 standalone'
+        '使用已有证书文件' '沿用已配置证书' '明文 HTTP 回源')
+    _label=$(module_label "${_module}")
+    _saved=$(st_get '.[$id].domain' --arg id "${_module}")
+    if [ "${_module}" = cforigin ]; then
+        _last=6
+        _domain_label='回源域名（Cloudflare 已代理）'
+        _prefix=(cforigin)
+        _issue_suffix=_to_state
+    else
+        _domain_label='入口域名（DNS only 直连 VPS）'
+    fi
+    [ -z "${_saved}" ] || _domain_label+=" [${_saved}]"
+    while true; do
+        prompt "${_domain_label}（0 返回）: " _domain || return 1
+        [ "${_domain}" != 0 ] || return 1
+        _domain="${_domain:-${_saved}}"
+        val_domain "${_domain}" >/dev/null && break
+    done
+    while true; do
+        local _choice
+        log_title "证书来源"
+        for ((_choice=1; _choice<=_last; _choice++)); do
+            _menu_print_action "${_choice}" "${_sources[_choice-1]}"
+        done
+        _menu_print_back
+        prompt "选择证书来源 (0-${_last}，回车选 1): " _source || return 1
+        _source="${_source:-1}"
+        [ "${_source}" != 0 ] || return 1
+        _menu_index_valid "${_source}" "${_last}" || { log_error '无效证书来源'; continue; }
+        if [ "${_source}" = 5 ]; then
+            _cert=$(st_get '.cforigin.cert'); _key=$(st_get '.cforigin.key')
+            _check_tls_certificate "${_label}" "${_domain}" "${_cert}" "${_key}" || continue
+        fi
+        break
+    done
+    if [ "${_source}" -le 3 ]; then
+        _cert_prompt_email 'ACME 邮箱' _email || return 1
+    fi
+    case "${_source}" in
+        1) _cert_prompt_secret 'Cloudflare API Token（Zone:Read + DNS:Edit）' _token || return 1
+           _method=cf_token
+           _issue=("acme_issue_cf_token${_issue_suffix}" "${_prefix[@]}" "${_domain}" "${_token}" "${_email}") ;;
+        2) _cert_prompt_email 'Cloudflare 账号邮箱' _cf_email || return 1
+           _cert_prompt_secret 'Cloudflare Global API Key' _cf_key || return 1
+           _method=cf_key
+           _issue=("acme_issue_cf_key${_issue_suffix}" "${_prefix[@]}" "${_domain}" "${_cf_key}" "${_cf_email}" "${_email}") ;;
+        3) log_info 'HTTP-01 需要域名指向本机，且 80/tcp 可从公网访问'
+           _method=http01
+           _issue=("acme_issue_http01${_issue_suffix}" "${_prefix[@]}" "${_domain}" "${_email}") ;;
+        4) until
+               _cert_prompt_file '证书文件路径' _cert "${_cert}" || return 1
+               _cert_prompt_file '私钥文件路径' _key "${_key}" secret || return 1
+               _check_tls_certificate "${_label}" "${_domain}" "${_cert}" "${_key}"
+           do :; done
+           _method=manual ;;
+        5) _method=manual_existing ;;
+        6) log_warn '明文 HTTP 回源需要 Cloudflare Flexible 或等效配置'
+           _method=plain_http; _tls=false ;;
+    esac
+    if [ "${_module}" = cforigin ]; then
+        st_set '.cforigin += {domain:$d, cert:$c, key:$k, acme_method:$m, origin_tls:$tls}' \
+            --arg d "${_domain}" --arg c "${_cert}" --arg k "${_key}" --arg m "${_method}" --argjson tls "${_tls}" || return 1
+        _CFORIGIN_ISSUE=("${_issue[@]}")
+    else
+        st_set '.vlquic += {domain:$d, cert:$c, key:$k, acme_method:$m}' \
+            --arg d "${_domain}" --arg c "${_cert}" --arg k "${_key}" --arg m "${_method}" || return 1
+        _VLQUIC_ISSUE=("${_issue[@]}")
+    fi
+    if [ -n "${_cert_source+x}" ]; then _cert_source="${_sources[_source-1]}"; fi
+}
+
+cforigin_config_cert() { _tls_cert_config cforigin; }
 
 _cforigin_check_ready() {
     case "$(st_get '.cforigin.protocol')" in ws|httpupgrade|xhttp) : ;; *) log_error "CF Origin 协议非法"; return 1 ;; esac
@@ -4676,54 +4815,7 @@ _check_tls_certificate() {
     }
 }
 
-vlquic_config_cert() {
-    echo ""; log_title "VLESS-XHTTP-H3 证书配置"
-    local _domain _email _method _cert="" _key=""
-    local -a _issue=()
-    prompt "入口域名（需 DNS only 直连 VPS）: " _domain || return 1
-    _domain=$(val_domain "${_domain}") || return 1
-    echo ""
-    printf "  ${C_GRN}1.${C_RST} Cloudflare Global API Key ${C_YLW}[简单]${C_RST}\n"
-    printf "     获取链接: https://dash.cloudflare.com/profile/api-tokens\n"
-    printf "  ${C_GRN}2.${C_RST} Cloudflare API Token ${C_YLW}[最小权限推荐]${C_RST}\n"
-    printf "     创建链接: https://dash.cloudflare.com/profile/api-tokens\n"
-    printf "  ${C_GRN}3.${C_RST} HTTP-01 standalone ${C_YLW}[需要80端口]${C_RST}\n"
-    printf "  ${C_GRN}4.${C_RST} 使用已有证书文件\n"
-    local _m; prompt "请选择 (1-4，回车默认1): " _m || return 1
-    if [ "${_m:-1}" != "4" ]; then
-        prompt "ACME 邮箱（用于 Let's Encrypt 账户，不能使用 example.com）: " _email || return 1
-        case "${_email:-}" in
-            *@example.com|*@example.org|*@example.net|''|*' '*|*"'"*|*'"'*|*'`'*|*'\'*) log_error "ACME 邮箱不合法"; return 1 ;;
-        esac
-        printf '%s' "${_email}" | grep -qE '^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$'             || { log_error "ACME 邮箱格式不合法"; return 1; }
-    fi
-    case "${_m:-1}" in
-        1)
-            local _cf_key _cf_email
-            prompt "Cloudflare 账号邮箱: " _cf_email || return 1
-            prompt_secret "Cloudflare Global API Key（不会显示在节点/日志中）: " _cf_key || return 1
-            _method=cf_key
-            _issue=(acme_issue_cf_key "${_domain}" "${_cf_key}" "${_cf_email}" "${_email}") ;;
-        2)
-            local _token
-            prompt_secret "Cloudflare API Token（需 Zone:Read + DNS:Edit，不会显示在节点/日志中）: " _token || return 1
-            _method=cf_token
-            _issue=(acme_issue_cf_token "${_domain}" "${_token}" "${_email}") ;;
-        3)
-            log_warn "HTTP-01 需要域名 A 记录指向本机且 80/tcp 开放/空闲"
-            _method=http01
-            _issue=(acme_issue_http01 "${_domain}" "${_email}") ;;
-        4)
-            prompt "fullchain.pem 路径: " _cert || return 1
-            prompt_secret "privkey.pem 路径: " _key || return 1
-            _check_tls_certificate VLESS-XHTTP-H3 "${_domain}" "${_cert}" "${_key}" || return 1
-            _method=manual ;;
-        *) log_error "无效选项，请按提示输入"; return 1 ;;
-    esac
-    st_set '.vlquic.domain = $d | .vlquic.cert = $c | .vlquic.key = $k | .vlquic.acme_method = $m' \
-        --arg d "${_domain}" --arg c "${_cert}" --arg k "${_key}" --arg m "${_method}" || return 1
-    _VLQUIC_ISSUE=("${_issue[@]}")
-}
+vlquic_config_cert() { _tls_cert_config vlquic; }
 
 _vlquic_check_ready() {
     local _domain
@@ -5516,12 +5608,12 @@ module_config_update_uuid() {
     local _v; prompt "新 UUID（回车自动生成）: " _v || return 1
     if [ -z "${_v:-}" ]; then
         _v=$(crypto_gen_uuid) || { log_error "UUID 生成失败"; return 1; }
-        log_info "已生成 UUID: ${_v}"
+        log_info "已生成 UUID"
     fi
     # 通过 val_uuid 统一校验，防止配置注入
     val_uuid "${_v}" >/dev/null || return 1
     _transaction_run "更新 UUID" _module_config_save_uuid "${_v}" || return 1
-    log_ok "UUID 已更新: ${_v}"; config_print_nodes
+    log_ok "UUID 已更新"; config_print_nodes
 }
 
 # ==============================================================================
@@ -5838,6 +5930,7 @@ module_dispatch() {
     esac
     case "${_mod}:${_action}" in
         # core/global actions
+        xray:restart) module_xray_restart ;;
         xray:install) module_xray_install ;;
         xray:upgrade) module_xray_upgrade ;;
         xray:uninstall) module_xray_uninstall ;;
@@ -5886,15 +5979,15 @@ module_dispatch() {
 _menu_select_port() {
     local _proto="${1:-tcp}" _outvar="${2:-}" _port_input _proto_label
     _proto_label="${_proto^^}"
-    prompt "${3:-新端口（回车随机）: }" _port_input || return 1
-    if [ -z "${_port_input:-}" ]; then
-        if [ -n "${4:-}" ]; then
-            _port_input="$4"
-        else
-            _port_input=$(port_mgr_random_proto "${_proto}") || return 1
+    while true; do
+        prompt "${3:-新端口（回车随机，0 返回）: }" _port_input || return 1
+        [ "${_port_input}" != 0 ] || return 1
+        if [ -z "${_port_input}" ]; then
+            _port_input="${4:-}"
+            [ -n "${_port_input}" ] || _port_input=$(port_mgr_random_proto "${_proto}") || return 1
         fi
-    fi
-    val_port "${_port_input}" >/dev/null || return 1
+        val_port "${_port_input}" >/dev/null && break
+    done
     local _busy
     case "${_proto}" in
         udp)  port_mgr_in_use_udp "${_port_input}" && _busy=1 || _busy=0 ;;
@@ -6040,85 +6133,220 @@ check_argo() {
 # ── 主菜单 ────────────────────────────────────────────────────────────────────
 
 _menu_collect_status() {
-    if check_xray >/dev/null 2>&1; then _MENU_CX=0; else _MENU_CX=$?; fi
-    if check_xray_install; then _MENU_XI=1; else _MENU_XI=0; fi
-}
-
-# 区组、按键、显示名称、模块和动作。显示与分派共用这份主菜单定义。
-_menu_actions() {
-    cat <<'MENU'
-连接|1|查看节点与连接提示|nodes|show
-入站管理|2|Argo 固定隧道|argo|
-入站管理|3|Reality|reality|
-入站管理|4|VLESS-TCP|vltcp|
-入站管理|5|VLESS-XHTTP-H3|vlquic|
-入站管理|6|FreeFlow|ff|
-入站管理|7|CF Origin 回源|cforigin|
-入站管理|8|SOCKS5|socks|
-入站管理|9|HTTP 代理|http|
-入站管理|10|Shadowsocks 2022|ss2022|
-维护|11|更新 UUID|config|update_uuid
-维护|d|开始部署（快速向导）|xray|install
-维护|s|更新快捷方式/脚本|config|update_shortcut
-维护|x|升级 Xray 内核|xray|upgrade
-维护|u|卸载整套 Xray-2go|xray|uninstall
-维护|0|退出程序||
-MENU
+    local _status=0
+    svc_exec status "${_SVC_XRAY}" >/dev/null 2>&1 || _status=$?
+    _MENU_STATE=unknown
+    if [ "${_status}" -eq 0 ]; then
+        _MENU_STATE=running
+    elif [ "${_status}" -eq 3 ]; then
+        _MENU_STATE=stopped
+    elif { is_systemd && [ "${_status}" -eq 4 ]; } ||
+         { is_openrc && [ "${_status}" -eq 1 ] &&
+           [ ! -e "${_SVC_OPENRC_DIR}/${_SVC_XRAY}" ] && [ ! -L "${_SVC_OPENRC_DIR}/${_SVC_XRAY}" ]; }; then
+        if check_xray_install; then _MENU_STATE=stopped; else _MENU_STATE=uninstalled; fi
+    fi
 }
 
 _menu_render() {
-    local _module _summary _section _key _label _last_section='' _color
-    [ ! -t 1 ] || clear
+    local _module _summary
+    printf '\n'
     log_title "Xray-2go 控制台"
-    if [ "${_MENU_CX}" -eq 0 ]; then
-        printf '  Xray  %s运行中%s\n' "${C_GRN}" "${C_RST}"
-    elif [ "${_MENU_XI}" -eq 1 ]; then
-        printf '  Xray  %s已安装 · 未运行%s\n' "${C_YLW}" "${C_RST}"
-    else
-        printf '  Xray  %s未安装%s\n' "${C_YLW}" "${C_RST}"
-        printf '  首次使用请按 d 打开快速向导。\n'
-    fi
-
+    case "${_MENU_STATE}" in
+        running) printf '  Xray  %s运行中%s\n' "${C_GRN}" "${C_RST}" ;;
+        stopped) printf '  Xray  %s已安装 · 未运行%s\n' "${C_YLW}" "${C_RST}" ;;
+        *) printf '  Xray  %s状态未知%s\n' "${C_YLW}" "${C_RST}" ;;
+    esac
     for _module in ${_MODULE_IDS}; do
         _summary=$(module_summary "${_module}")
         [ "${_summary}" != '未启用' ] || continue
-        printf '  %s\n    %s\n' "$(module_label "${_module}")" "${_summary}"
+        printf '  %s  %s\n' "$(module_label "${_module}")" "${_summary}"
     done
-
-    while IFS='|' read -r _section _key _label _; do
-        if [ "${_section}" != "${_last_section}" ]; then
-            printf '\n%s%s%s\n' "${C_BOLD}" "${_section}" "${C_RST}"
-            _last_section="${_section}"
-        fi
-        _color="${C_GRN}"
-        [ "${_key}" != u ] || _color="${C_RED}"
-        printf '  %s%2s.%s %s\n' "${_color}" "${_key}" "${C_RST}" "${_label}"
-    done < <(_menu_actions)
     printf '\n'
+    _menu_print_action 1 '查看与导出节点'
+    _menu_print_action 2 '管理入站'
+    _menu_print_action 3 '维护'
+    _menu_print_action 0 '退出'
 }
 
 _menu_return_to_parent() {
     if [ -n "${_menu_redraw+x}" ]; then _menu_redraw=1; fi
 }
 
-_menu_select_action() {
-    local _selected="$1" _key _module _action _matched=0 _menu_redraw=0
-    while IFS='|' read -r _ _key _ _module _action; do
-        [ "${_key}" = "${_selected}" ] || continue
-        _matched=1
-        break
-    done < <(_menu_actions)
-    if [ "${_matched}" -eq 0 ]; then
-        log_error "无效选项，请输入菜单中显示的编号或按键"
-    elif [ "${_key}" = 0 ]; then
-        log_info "已退出"
-        exit 0
-    else
-        if module_dispatch "${_module}" ${_action:+"${_action}"} && [ "${_menu_redraw}" -eq 1 ]; then
-            return 0
+_menu_inbounds() {
+    local _module _summary _choice _index
+    local -a _active_inbounds _inactive_inbounds _details _modules
+    while true; do
+        _active_inbounds=(); _inactive_inbounds=(); _details=()
+        for _module in ${_MODULE_IDS}; do
+            _summary=$(module_summary "${_module}")
+            if [ "${_summary}" = '未启用' ]; then
+                _inactive_inbounds+=("${_module}")
+            else
+                _active_inbounds+=("${_module}")
+                _details+=("${_summary}")
+            fi
+        done
+        _modules=("${_active_inbounds[@]}" "${_inactive_inbounds[@]}")
+        log_title '管理入站'
+        for _index in "${!_modules[@]}"; do
+            _menu_print_action "$((_index + 1))" "$(module_label "${_modules[_index]}") · ${_details[_index]:-未启用}"
+        done
+        _menu_print_back
+        prompt '选择入站: ' _choice || return 0
+        if [ "${_choice}" = 0 ]; then return 0; fi
+        if _menu_index_valid "${_choice}" "${#_modules[@]}"; then
+            module_dispatch "${_modules[_choice-1]}" || _pause
+        else
+            log_error '无效入站编号'
         fi
+    done
+}
+
+_menu_index_valid() {
+    [[ "$1" =~ ^[1-9][0-9]{0,5}$ ]] && [ "$1" -le "$2" ]
+}
+
+_menu_confirm_interrupt() {
+    local _confirm
+    prompt "$1，将中断相关连接。继续？(y/N): " _confirm || return 1
+    case "${_confirm}" in
+        y|Y) return 0 ;;
+        *) log_info '已取消'; return 1 ;;
+    esac
+}
+
+_menu_maintenance() {
+    local _choice _MENU_ACTION_PAUSES=1
+    while true; do
+        [ ! -e "${_UNINSTALL_PENDING}" ] || return 0
+        log_title '维护'
+        _menu_print_action 1 '重启 Xray'
+        _menu_print_action 2 '更新脚本'
+        _menu_print_action 3 '更新 Xray 内核'
+        _menu_print_action 4 '更新 UUID'
+        _menu_print_action 5 '卸载整套 Xray-2go' "${C_RED}"
+        _menu_print_back
+        prompt '选择维护操作: ' _choice || return 0
+        case "${_choice}" in
+            0) return 0 ;;
+            1) _menu_confirm_interrupt '重启 Xray' || continue
+               module_dispatch xray restart ;;
+            2) module_dispatch config update_shortcut ;;
+            3) module_dispatch xray upgrade ;;
+            4) module_dispatch config update_uuid ;;
+            5) module_dispatch xray uninstall
+               _pause
+               return 0 ;;
+            *) log_error '无效维护编号'; continue ;;
+        esac
+        _pause
+    done
+}
+
+_menu_node_health() {
+    case "${_MENU_STATE:-unknown}" in
+        stopped) printf '  可导出已保存配置，当前服务未运行。\n' ;;
+        unknown) printf '  Xray 状态未知，以下节点根据已保存配置生成。\n' ;;
+    esac
+}
+
+_menu_node_formats() {
+    local _node="$1" _choice _formats=2
+    local _kind="${_node_kinds[_node]}" _module="${_node_modules[_node]}"
+    if [ "${_kind}" = link ]; then
+        _menu_node_health
+        _print_link "${_node_links[_node]}"
+        _pause
+        return 0
     fi
-    _pause
+    [ "${_kind}" != split ] || _formats=3
+    while true; do
+        log_title "${_node_names[_node]}"
+        _menu_node_health
+        _menu_print_action 1 '分享链接'
+        _menu_print_action 2 'Xray 出站 JSON'
+        [ "${_formats}" -ne 3 ] || _menu_print_action 3 'Mihomo provider'
+        _menu_print_back
+        prompt "选择格式 (0-${_formats}): " _choice || return 0
+        case "${_choice}" in
+            0) return 0 ;;
+            1) _print_link "${_node_links[_node]}" ;;
+            2) if [ "${_module}" = argo ]; then
+                   _argo_xhttp_export_json "${_kind}" || log_error '无法生成 Xray 出站 JSON'
+               else
+                   "_${_module}_xhttp_export_json" || log_error '无法生成 Xray 出站 JSON'
+               fi ;;
+            3) if [ "${_kind}" != split ]; then log_error '无效格式编号'; continue; fi
+               _argo_xhttp_mihomo_warn_differences || log_warn '无法检查 Mihomo 下行覆盖差异'
+               _argo_xhttp_export_mihomo || log_error '无法生成 Mihomo provider' ;;
+            *) log_error '无效格式编号'; continue ;;
+        esac
+        _pause
+    done
+}
+
+_menu_nodes() {
+    local _filter="${1:-}" _module _links _link _name _kind _choice _index _count _total
+    local -a _node_names=() _node_links=() _node_modules=() _node_kinds=() _unavailable=()
+    for _module in "${_PLUGIN_REGISTRY[@]}"; do
+        [ -z "${_filter}" ] || [ "${_module}" = "${_filter}" ] || continue
+        plugin_call "${_module}" enabled || continue
+        if ! _links=$(plugin_collect_links "${_module}" 2>/dev/null) || [ -z "${_links}" ]; then
+            _unavailable+=("$(module_label "${_module}")")
+            continue
+        fi
+        _count=0
+        while IFS= read -r _link; do
+            _count=$((_count + 1))
+            _name="$(module_label "${_module}")"
+            _kind='link'
+            case "${_module}:${_link##*#}" in
+                argo:Argo-XHTTP) _kind=normal; _name=Argo-XHTTP ;;
+                argo:Argo-XHTTP-Split) _kind='split'; _name=Argo-XHTTP-Split ;;
+                *)
+                    case "${_module}" in
+                        ff|reality|vlquic|cforigin)
+                            if [[ "${_link}" == *'type=xhttp&'* || "${_link}" == *'type=xhttp#'* ]]; then _kind=direct; fi ;;
+                    esac
+                    [ "${_count}" -eq 1 ] || _name+=" · ${_count}"
+                    ;;
+            esac
+            _node_names+=("${_name}")
+            _node_links+=("${_link}")
+            _node_modules+=("${_module}")
+            _node_kinds+=("${_kind}")
+        done <<< "${_links}"
+    done
+    _total=${#_node_links[@]}
+    if [ "${#_unavailable[@]}" -gt 0 ]; then
+        log_warn "无法生成节点，请检查必填配置和服务器地址：${_unavailable[*]}"
+    fi
+    if [ "${_total}" -eq 0 ]; then
+        _menu_node_health
+        [ "${#_unavailable[@]}" -ne 0 ] || log_info '没有已启用的入站'
+        _pause
+        return 0
+    fi
+    if [ "${_total}" -eq 1 ]; then _menu_node_formats 0; return; fi
+    while true; do
+        log_title '查看与导出节点'
+        _menu_node_health
+        for _index in "${!_node_names[@]}"; do
+            _menu_print_action "$((_index + 1))" "${_node_names[_index]} · ${_node_links[_index]%%://*} · 已启用"
+        done
+        _menu_print_action "$((_total + 1))" '全部分享链接'
+        _menu_print_back
+        prompt '选择节点: ' _choice || return 0
+        if [ "${_choice}" = 0 ]; then return 0; fi
+        if [ "${_choice}" = "$((_total + 1))" ]; then
+            for _link in "${_node_links[@]}"; do _print_link "${_link}"; done
+            _pause
+        elif _menu_index_valid "${_choice}" "${_total}"; then
+            _menu_node_formats "$((_choice - 1))"
+        else
+            log_error '无效节点编号'
+        fi
+    done
 }
 
 install_plan_reset_defaults() {
@@ -6278,7 +6506,7 @@ install_plan_render_summary() {
     clear; echo ""
     log_title "══ 自定义安装计划 ══"
     printf "  说明      : ${C_YLW}选择要启用的模块，完成配置后选择 11 预览并确认安装${C_RST}\n"
-    printf "  当前 UUID : ${C_CYN}%s${C_RST}\n" "$(st_get '.uuid')"
+    printf "  UUID：已配置\n"
     printf "  Argo      : %s\n" "$(install_plan_module_summary argo)"
     printf "  FreeFlow  : %s\n" "$(install_plan_module_summary ff)"
     printf "  Reality   : %s\n" "$(install_plan_module_summary reality)"
@@ -6716,11 +6944,11 @@ install_plan_configure_uuid() {
     prompt "新 UUID（回车自动生成）: " _v || return 1
     if [ -z "${_v:-}" ]; then
         _v=$(crypto_gen_uuid) || { log_error "UUID 生成失败"; return 1; }
-        log_info "已生成 UUID: ${_v}"
+        log_info "已生成 UUID"
     fi
     val_uuid "${_v}" >/dev/null || return 1
     st_set '.uuid = $u' --arg u "${_v}" || return 1
-    log_ok "安装计划 UUID 已更新: ${_v}"
+    log_ok "安装计划 UUID 已更新"
 }
 
 install_plan_validate() {
@@ -6836,6 +7064,11 @@ install_execute_current_plan() {
     fi
 
     log_ok "══ 安装完成，服务已启动 ══"
+    if [ "${_MENU_HIDE_LINKS:-0}" -eq 1 ]; then
+        log_info '在首页选择「查看与导出节点」获取客户端配置。'
+        cforigin_print_cloudflare_hint
+        return 0
+    fi
     if config_print_nodes; then
         log_info "复制上方对应节点的链接，在支持该协议及传输方式的客户端中选择从剪贴板导入。"
     else
@@ -6876,6 +7109,7 @@ _unified_runtime_status_for() {
 _unified_runtime_toggle() {
     local _mod="$1" _enabled="$2"
     if [ "${_enabled}" = "true" ]; then
+        _menu_confirm_interrupt "停用 $(module_label "${_mod}")" || return 0
         module_dispatch "${_mod}" disable || return 1
     else
         module_dispatch "${_mod}" enable || return 1
@@ -6895,14 +7129,7 @@ _unified_render_status() {
     fi
 }
 
-_unified_summary_for() {
-    local _runtime="$1" _mod="$2"
-    if [ "${_runtime}" -eq 1 ]; then
-        module_summary "${_mod}"
-    else
-        install_plan_module_summary "${_mod}"
-    fi
-}
+
 
 _unified_toggle_or_plan() {
     local _runtime="$1" _mod="$2" _enabled="$3" _plan_fn="$4"
@@ -7194,9 +7421,9 @@ _xhttp_edit_advanced() {
     local _module="$1" _runtime="$2" _current _draft
     _current=$(_xhttp_saved_profile "${_module}" | jq -c '. // {}') || return 1
     printf '当前 XHTTP JSON: %s\n' "${_current}"
-    while prompt '编辑单行 JSON（可直接粘贴，空行返回）: ' _draft '' && [ -n "${_draft}" ]; do
+    while prompt '编辑单行 JSON（可直接粘贴，回车或 0 返回）: ' _draft '' && [ -n "${_draft}" ]; do
+        [ "${_draft}" != 0 ] || return 0
         if "_${_module}_xhttp_set_profile" "${_runtime}" "${_draft}"; then
-            _pause
             return 0
         fi
     done
@@ -7227,7 +7454,6 @@ _xhttp_edit_field() {
             else setpath($field; if ($value | test("^[0-9]+$")) then $value | tonumber else $value end) end
         ' --arg inbound_id "${_module}" --arg path "${_field}" --arg value "${_raw}" --argjson server "${_server}")
         if "_${_module}_xhttp_set_profile" "${_runtime}" "${_profile}"; then
-            _pause
             return 0
         fi
     done
@@ -7235,7 +7461,6 @@ _xhttp_edit_field() {
 
 _xhttp_edit_common() {
     local _module="$1" _runtime="$2" _choice _field _label _last=6
-    [ "${_module}" != argo ] || _last=7
     while true; do
         log_title "══ $(module_label "${_module}") XHTTP 常用参数 ══"
         "_${_module}_xhttp_render_status"
@@ -7245,7 +7470,6 @@ _xhttp_edit_common() {
         _menu_print_action 4 "XMUX 最大并发数"
         _menu_print_action 5 "XMUX 每连接请求数"
         _menu_print_action 6 "XMUX 连接复用时长（秒）"
-        if [ "${_module}" = argo ]; then _menu_print_action 7 "分离节点上行模式"; fi
         _menu_print_back
         prompt "请选择常用参数 (0-${_last}): " _choice || return 0
         case "${_choice}" in
@@ -7256,116 +7480,105 @@ _xhttp_edit_common() {
             4) _field=client.xmux.maxConcurrency; _label='最大并发数或范围' ;;
             5) _field=client.xmux.hMaxRequestTimes; _label='每连接请求数或范围，如 600-900' ;;
             6) _field=client.xmux.hMaxReusableSecs; _label='连接复用时长或范围，如 1800-3000' ;;
-            7)
-                if [ "${_module}" != argo ]; then log_error "无效选项，请按提示输入"; continue; fi
-                if [ "$(st_get '.argo.xhttp.split | type')" != object ]; then
-                    log_warn "请先在上一级启用上下行分离"
-                    continue
-                fi
-                _field=split.mode; _label='packet-up 或 stream-up'
-                ;;
             *) log_error "无效选项，请按提示输入"; continue ;;
         esac
         _xhttp_edit_field "${_module}" "${_runtime}" "${_field}" "${_label}，输入 - 恢复该项默认值"
     done
 }
 
-_argo_xhttp_export_menu() {
-    local _choice _kind _label _formats
+_argo_split_summary() {
+    local _port _mode
+    _port=$(st_get '.argo.xhttp.split.port // empty')
+    _mode=$(st_get '.argo.xhttp.split.mode // "packet-up"')
+    if [ -n "${_port}" ]; then
+        printf '已配置 · %s · TCP/%s' "${_mode}" "${_port}"
+    else
+        printf '未配置'
+    fi
+}
+
+_argo_split_menu() {
+    local _runtime="$1" _choice _saved _profile
+    if [ "$(st_get '.argo.protocol')" != xhttp ] || [ "$(st_get '.argo.auth_protocol')" != vless ]; then
+        log_warn '上下行分离需要 Argo VLESS XHTTP'
+        return 1
+    fi
     while true; do
-        log_title "══ 导出 Argo XHTTP 节点 ══"
-        _menu_print_action 1 "普通 XHTTP"
-        if _argo_xhttp_split_active; then
-            _menu_print_action 2 "分离 XHTTP"
+        _saved=$(st_get '.argo.xhttp.split | type')
+        log_title 'Argo / 上下行分离'
+        printf '  %s\n' "$(_argo_split_summary)"
+        if [ "${_saved}" = object ]; then
+            _menu_print_action 1 '关闭上下行分离'
+            _menu_print_action 2 '修改上行模式'
+            _menu_print_action 3 '修改 REALITY 上行端口'
         else
-            _menu_print_action 2 "分离 XHTTP（未启用）"
+            _menu_print_action 1 '启用上下行分离，设置 REALITY 上行端口'
         fi
         _menu_print_back
-        prompt '选择节点 (0-2): ' _choice || return 0
+        prompt '选择分离设置: ' _choice || return 0
         case "${_choice}" in
             0) return 0 ;;
-            1) _kind=normal; _label='普通 XHTTP' ;;
-            2)
-                if ! _argo_xhttp_split_active; then
-                    log_warn "请先启用上下行分离"
-                    continue
-                fi
-                _kind='split'; _label='分离 XHTTP'
-                ;;
-            *) log_error "无效选项，请按提示输入"; continue ;;
+            1) if [ "${_saved}" = object ]; then
+                   _profile=$(_xhttp_saved_profile argo | jq -c 'del(.split)')
+                   _argo_xhttp_set_profile "${_runtime}" "${_profile:-null}" || true
+               else
+                   _xhttp_edit_field argo "${_runtime}" split.port 'REALITY 上行端口（独立于现有 Reality）'
+               fi ;;
+            2) [ "${_saved}" = object ] || { log_error '请先配置上下行分离'; continue; }
+               _xhttp_edit_field argo "${_runtime}" split.mode '上行模式（packet-up 或 stream-up）' ;;
+            3) [ "${_saved}" = object ] || { log_error '请先配置上下行分离'; continue; }
+               _xhttp_edit_field argo "${_runtime}" split.port 'REALITY 上行端口（独立于现有 Reality）' ;;
+            *) log_error '无效分离设置' ;;
         esac
-        while true; do
-            log_title "══ ${_label} ══"
-            _menu_print_action 1 "分享链接"
-            _menu_print_action 2 "客户端出站 JSON"
-            _formats='0-2'
-            if [ "$_kind" = split ]; then
-                _menu_print_action 3 "Mihomo 代理提供者配置（JSON）"
-                _formats='0-3'
-            fi
-            _menu_print_back
-            prompt "选择格式 ($_formats): " _choice || return 0
-            case "${_choice}" in
-                0) break ;;
-                1) _argo_xhttp_link "${_kind}" || log_warn "无法生成 ${_label} 分享链接"; _pause; break ;;
-                2) _argo_xhttp_export_json "${_kind}" || log_warn "无法生成 ${_label} 出站 JSON"; _pause; break ;;
-                3)
-                    if [ "$_kind" != split ]; then log_error "无效选项，请按提示输入"; continue; fi
-                    _argo_xhttp_mihomo_warn_differences || log_warn "无法检查 Mihomo 下行覆盖差异"
-                    _argo_xhttp_export_mihomo || log_warn "无法生成 ${_label} Mihomo 配置"
-                    _pause
-                    break
-                    ;;
-                *) log_error "无效选项，请按提示输入" ;;
-            esac
-        done
     done
 }
 
 _argo_xhttp_menu() {
     local _runtime="$1" _choice _profile
     if [ "$(st_get '.argo.protocol')" != xhttp ] || [ "$(st_get '.argo.auth_protocol')" != vless ]; then
-        log_warn "请先选择 Argo 的 VLESS XHTTP 传输"
+        log_warn '高级设置需要 Argo VLESS XHTTP'
         return 1
     fi
     while true; do
-        log_title "══ Argo XHTTP 配置 ══"
+        log_title 'Argo / 高级设置'
         _argo_xhttp_render_status
-        _menu_print_action 1 "使用 Xray 默认参数（auto，清空 Extra 和分离）"
-        _menu_print_action 2 "高级 Extra 与下行覆盖（单行 JSON）"
-        _menu_print_action 3 "启用分离或修改 REALITY 上行端口"
-        _menu_print_action 4 "导出客户端配置"
-        _menu_print_action 5 "恢复旧版 xPadding 配置"
-        _menu_print_action 6 "关闭分离，保留 Extra"
-        _menu_print_action 7 "逐项编辑常用参数"
+        _menu_print_action 1 '恢复默认模式和 Extra，保留分离配置'
+        _menu_print_action 2 '编辑 Extra 与下行覆盖 JSON'
+        _menu_print_action 5 '恢复旧版 xPadding 配置'
+        _menu_print_action 7 '逐项编辑模式、Padding 和 XMUX'
+        _menu_print_action 8 '切换旧版 xPadding'
         _menu_print_back
-        prompt "请选择操作 (0-7): " _choice || return 0
+        prompt '选择高级设置: ' _choice || return 0
         case "${_choice}" in
             0) return 0 ;;
-            1) _argo_xhttp_set_profile "${_runtime}" '{"server":{},"client":{}}' ;;
-            2)
-                log_info 'JSON 字段: mode, server（入站 Extra）, client（客户端 Extra）, split（port/mode/download）'
-                _xhttp_edit_advanced argo "${_runtime}"
-                continue ;;
-            3) _xhttp_edit_field argo "${_runtime}" split.port 'REALITY 上行端口（独立于现有 Reality）'; continue ;;
-            4) _argo_xhttp_export_menu; continue ;;
-            5) _argo_xhttp_set_profile "${_runtime}" null ;;
-            6)
-                _profile=$(_xhttp_saved_profile argo | jq -c 'del(.split)')
-                _argo_xhttp_set_profile "${_runtime}" "${_profile:-null}"
-                ;;
-            7) _xhttp_edit_common argo "${_runtime}"; continue ;;
-            *) log_error "无效选项，请按提示输入" ;;
+            1) _profile=$(_xhttp_saved_profile argo | jq -c '. // {} | del(.mode) | .server={} | .client={}')
+               _argo_xhttp_set_profile "${_runtime}" "${_profile}" || true ;;
+            2) log_info 'JSON 字段：mode、server、client、split（port/mode/download）'
+               _xhttp_edit_advanced argo "${_runtime}" ;;
+            5) _profile=$(_xhttp_saved_profile argo | jq -c 'if .split then {split} else null end')
+               _argo_xhttp_set_profile "${_runtime}" "${_profile}" || true ;;
+            7) _xhttp_edit_common argo "${_runtime}" ;;
+            8) _xhttp_legacy_padding argo "${_runtime}" ;;
+            *) log_error '无效高级设置' ;;
         esac
-        _pause
     done
+}
+
+_xhttp_legacy_padding() {
+    local _module="$1" _runtime="$2"
+    if [ "$(st_get '.[$id].xhttp.server | type' --arg id "${_module}")" = object ]; then
+        log_info '当前 Padding 由 Extra 管理。可编辑 Padding 或恢复旧版设置。'
+        return 0
+    fi
+    _unified_runtime_fn_or_plan "${_runtime}" "install_plan_${_module}_toggle_xpad" \
+        _menu_toggle_xpad "${_module}" "$(module_label "${_module}")"
 }
 
 unified_menu_argo() {
     local _mode="${1:-install}" _runtime=0
     _unified_mode_is_runtime "${_mode}" && { _runtime=1; _manage_module_entry_check || return; }
     while true; do
-        local _en _proto _port _domain _xpad _auth_mode _svc _summary _auth_proto _pw_state
+        local _en _proto _port _domain _xpad _auth_mode _svc _auth_proto _pw_state
         _en=$(st_get '.argo.enabled')
         _proto=$(st_get '.argo.protocol')
         _port=$(port_of argo)
@@ -7380,8 +7593,7 @@ unified_menu_argo() {
         fi
         [ -f "${WORK_DIR}/tunnel.json" ] && _auth_mode='json-cred' || { [ -n "$(st_get '.argo.token')" ] && [ "$(st_get '.argo.token')" != "null" ] && _auth_mode='token' || _auth_mode='未配置'; }
         _svc=$(_unified_runtime_status_for argo)
-        _summary=$(_unified_summary_for "${_runtime}" argo)
-        clear; echo ""; log_title "══ Argo 闭环工作台 ══"
+        log_title "══ Argo 闭环工作台 ══"
         _unified_render_mode_header "${_mode}" "需要 Cloudflare Tunnel 域名与 token/JSON 凭证"
         _unified_render_status "${_runtime}" "${_en}" "${_svc}"
         printf "  协议: ${C_GRN}%s${C_RST}  回源端口: ${C_YLW}%s${C_RST}\n" "${_proto}" "${_port}"
@@ -7389,26 +7601,26 @@ unified_menu_argo() {
         printf "  入站认证: ${C_GRN}%s${C_RST}  Trojan 密码: ${C_YLW}%s${C_RST}\n" "${_auth_proto}" "${_pw_state}"
         printf "  xPadding: ${C_YLW}%s${C_RST}\n" "${_xpad}"
         _hr
-        _menu_print_action 1 "切换启用状态"
+        _menu_print_action 1 "$([ "${_en}" = true ] && printf 停用 || printf 启用)入站"
         _menu_print_action 2 "修改传输协议（WS / XHTTP）"
         _menu_print_action 3 "修改回源端口"
         _menu_print_action 4 "修改域名"
         _menu_print_action 5 "修改密钥/凭证"
         _menu_print_action 6 "修改入站认证（VLESS / Trojan）"
         _menu_print_action 7 "修改 Trojan 密码（仅 Trojan）"
-        _menu_print_action 8 "切换旧版 xPadding（仅 XHTTP）"
-        _menu_print_action 9 "查看当前节点摘要"
-        _menu_print_action x "XHTTP 默认参数、Extra 和上下行分离"
+        if [ "${_proto}" = xhttp ] && [ "${_auth_proto}" = vless ]; then
+            _menu_print_action 9 "上下行分离 · $(_argo_split_summary)"
+            _menu_print_action x '高级设置（XHTTP）'
+        fi
         if [ "${_runtime}" -eq 1 ]; then
             _hr
             _menu_print_action r "重启隧道服务"
             _menu_print_action h "探测 Argo 域名"
-            _menu_print_action v "查看节点链接"
             _menu_print_action u "卸载 Argo" "${C_RED}"
         fi
         _menu_print_back
         _hr
-        prompt "请选择操作 $( [ "${_runtime}" -eq 1 ] && printf '(0-9/x/r/h/v/u)' || printf '(0-9/x)' ): " _c || return 0
+        prompt '选择工作台操作: ' _c || return 0
         case "${_c:-}" in
             1) _unified_toggle_or_plan "${_runtime}" argo "${_en}" install_plan_argo_toggle || true ;;
             2) _unified_dispatch_or_plan "${_runtime}" argo update_protocol install_plan_argo_update_protocol || true ;;
@@ -7417,29 +7629,27 @@ unified_menu_argo() {
             5) _unified_dispatch_or_plan "${_runtime}" argo update_auth install_plan_argo_update_auth || true ;;
             6) _unified_dispatch_or_plan "${_runtime}" argo update_auth_protocol install_plan_argo_update_auth_protocol || true ;;
             7) _unified_dispatch_or_plan "${_runtime}" argo update_trojan_password install_plan_argo_update_trojan_password || true ;;
-            8)
-                if st_get '.argo.xhttp.server | type' | grep -qx object; then
-                    log_info "当前由 XHTTP 配置管理 Padding，请在 x 菜单编辑 Extra 或恢复旧版设置"
-                else
-                    _unified_runtime_fn_or_plan "${_runtime}" install_plan_argo_toggle_xpad _menu_toggle_xpad argo Argo || true
-                fi ;;
-            9) log_info "Argo: ${_summary}" ;;
-            x) _argo_xhttp_menu "${_runtime}" && continue ;;
-            r) _unified_runtime_only_fn "${_runtime}" module_dispatch argo restart || true ;;
-            h) _unified_runtime_only_fn "${_runtime}" argo_check_health || true ;;
-            v) _unified_runtime_only_fn "${_runtime}" module_dispatch argo show || true ;;
+            9) _argo_split_menu "${_runtime}" || true ;;
+            x) _argo_xhttp_menu "${_runtime}" || true ;;
+            r) if [ "${_runtime}" -eq 1 ] && _menu_confirm_interrupt '重启 Argo Tunnel'; then
+                   module_dispatch argo restart || true
+               fi ;;
+
+            h) if [ "${_runtime}" -eq 1 ]; then
+                   argo_check_health || true
+                   _pause
+               fi ;;
             u)
                 if [ "${_runtime}" -eq 1 ]; then
-                    _menu_confirm_uninstall "Argo" || { _pause; continue; }
-                    module_dispatch argo uninstall || { _pause; continue; }
-                    _pause; return 0
+                    _menu_confirm_uninstall "Argo" || continue
+                    module_dispatch argo uninstall || continue
+                    return 0
                 else
                     log_error "无效选项，请按提示输入"
                 fi ;;
             0) return 0 ;;
             *) log_error "无效选项，请按提示输入" ;;
         esac
-        _pause
     done
 }
 
@@ -7447,7 +7657,7 @@ unified_menu_freeflow() {
     local _mode="${1:-install}" _runtime=0
     _unified_mode_is_runtime "${_mode}" && { _runtime=1; _manage_module_entry_check || return; }
     while true; do
-        local _en _proto _path _host _port _xpad _active _svc _summary
+        local _en _proto _path _host _port _xpad _active _svc
         _en=$(st_get '.ff.enabled')
         _proto=$(st_get '.ff.protocol')
         _path=$(st_get '.ff.path')
@@ -7456,8 +7666,7 @@ unified_menu_freeflow() {
         _xpad=$(xpad_of ff)
         [ "${_en}" = "true" ] && [ "${_proto}" != "none" ] && _active=true || _active=false
         _svc=$(_unified_runtime_status_for ff)
-        _summary=$(_unified_summary_for "${_runtime}" ff)
-        clear; echo ""; log_title "══ FreeFlow 闭环工作台 ══"
+        log_title "══ FreeFlow 闭环工作台 ══"
         _unified_render_mode_header "${_mode}" "常用字段只改当前项，不再重走整段问答"
         _unified_render_status "${_runtime}" "${_active}" "${_svc}"
         if [ "${_proto}" = "tcphttp" ]; then
@@ -7467,44 +7676,35 @@ unified_menu_freeflow() {
         fi
         printf "  xPadding: ${C_YLW}%s${C_RST}\n" "${_xpad}"
         _hr
-        _menu_print_action 1 "切换启用状态"
+        _menu_print_action 1 "$([ "${_en}" = true ] && printf 停用 || printf 启用)入站"
         _menu_print_action 2 "修改传输协议"
         _menu_print_action 3 "修改监听端口"
         _menu_print_action 4 "修改 Host / 路径 path"
-        _menu_print_action 5 "切换旧版 xPadding（XHTTP 未配置服务端 Extra 时生效）"
-        _menu_print_action 6 "查看当前节点摘要"
-        _menu_print_action x "XHTTP 参数与节点导出"
+        _menu_print_action x '高级设置（XHTTP）'
         if [ "${_runtime}" -eq 1 ]; then
             _hr
-            _menu_print_action r "重启 xray2go 服务"
-            _menu_print_action v "查看节点链接"
             _menu_print_action u "卸载 FreeFlow" "${C_RED}"
         fi
         _menu_print_back
         _hr
-        prompt "请选择操作 $( [ "${_runtime}" -eq 1 ] && printf '(0-6/x/r/v/u)' || printf '(0-6/x)' ): " _c || return 0
+        prompt '选择工作台操作: ' _c || return 0
         case "${_c:-}" in
             1) _unified_toggle_or_plan "${_runtime}" ff "${_active}" install_plan_ff_toggle || true ;;
             2) _unified_dispatch_or_plan "${_runtime}" ff update_mode install_plan_ff_update_mode || true ;;
             3) _unified_dispatch_or_plan "${_runtime}" ff update_port install_plan_ff_update_port || true ;;
             4) _unified_dispatch_or_plan "${_runtime}" ff update_host_or_path install_plan_ff_update_host_or_path || true ;;
-            5) _unified_runtime_fn_or_plan "${_runtime}" install_plan_ff_toggle_xpad _menu_toggle_xpad ff FreeFlow || true ;;
-            6) log_info "FreeFlow: ${_summary}" ;;
             x) _direct_xhttp_menu ff "${_runtime}" "${_proto}" && continue ;;
-            r) _unified_runtime_only_fn "${_runtime}" module_dispatch ff restart || true ;;
-            v) _unified_runtime_only_fn "${_runtime}" module_dispatch ff show || true ;;
             u)
                 if [ "${_runtime}" -eq 1 ]; then
-                    _menu_confirm_uninstall "FreeFlow" || { _pause; continue; }
-                    module_dispatch ff uninstall || { _pause; continue; }
-                    _pause; return 0
+                    _menu_confirm_uninstall "FreeFlow" || continue
+                    module_dispatch ff uninstall || continue
+                    return 0
                 else
                     log_error "无效选项，请按提示输入"
                 fi ;;
             0) return 0 ;;
             *) log_error "无效选项，请按提示输入" ;;
         esac
-        _pause
     done
 }
 
@@ -7512,60 +7712,50 @@ unified_menu_reality() {
     local _mode="${1:-install}" _runtime=0
     _unified_mode_is_runtime "${_mode}" && { _runtime=1; _manage_module_entry_check || return; }
     while true; do
-        local _en _port _sni _net _xpad _svc _summary
+        local _en _port _sni _net _xpad _svc
         _en=$(st_get '.reality.enabled')
         _port=$(port_of reality)
         _sni=$(st_get '.reality.sni')
         _net=$(st_get '.reality.network'); _net="${_net:-tcp}"
         _xpad=$(xpad_of reality)
         _svc=$(_unified_runtime_status_for reality)
-        _summary=$(_unified_summary_for "${_runtime}" reality)
-        clear; echo ""; log_title "══ Reality 闭环工作台 ══"
+        log_title "══ Reality 闭环工作台 ══"
         _unified_render_mode_header "${_mode}" "默认推荐 TCP + Reality；需要时再切 XHTTP"
         _unified_render_status "${_runtime}" "${_en}" "${_svc}"
         printf "  端口: ${C_YLW}%s${C_RST}  SNI: ${C_CYN}%s${C_RST}  传输: ${C_GRN}%s${C_RST}\n" "${_port}" "${_sni}" "${_net}"
         printf "  xPadding: ${C_YLW}%s${C_RST}\n" "${_xpad}"
         _hr
-        _menu_print_action 1 "切换启用状态"
+        _menu_print_action 1 "$([ "${_en}" = true ] && printf 停用 || printf 启用)入站"
         _menu_print_action 2 "修改监听端口"
         _menu_print_action 3 "修改 SNI"
         _menu_print_action 4 "切换传输协议（TCP / XHTTP）"
-        _menu_print_action 5 "切换旧版 xPadding（XHTTP 未配置服务端 Extra 时生效）"
-        _menu_print_action 6 "查看当前节点摘要"
-        _menu_print_action x "XHTTP 模式与 Extra"
+        _menu_print_action x '高级设置（XHTTP）'
         if [ "${_runtime}" -eq 1 ]; then
             _hr
             _menu_print_action k "重新生成密钥对"
-            _menu_print_action r "重启 xray2go 服务"
-            _menu_print_action v "查看节点链接"
             _menu_print_action u "卸载 Reality" "${C_RED}"
         fi
         _menu_print_back
         _hr
-        prompt "请选择操作 $( [ "${_runtime}" -eq 1 ] && printf '(0-6/x/k/r/v/u)' || printf '(0-6/x)' ): " _c || return 0
+        prompt '选择工作台操作: ' _c || return 0
         case "${_c:-}" in
             1) _unified_toggle_or_plan "${_runtime}" reality "${_en}" install_plan_reality_toggle || true ;;
             2) _unified_dispatch_or_plan "${_runtime}" reality update_port install_plan_reality_update_port || true ;;
             3) _unified_dispatch_or_plan "${_runtime}" reality update_sni install_plan_reality_update_sni || true ;;
             4) _unified_dispatch_or_plan "${_runtime}" reality update_transport install_plan_reality_update_transport || true ;;
-            5) _unified_runtime_fn_or_plan "${_runtime}" install_plan_reality_toggle_xpad _menu_toggle_xpad reality Reality || true ;;
-            6) log_info "Reality: ${_summary}" ;;
             x) _direct_xhttp_menu reality "${_runtime}" "${_net}" && continue ;;
             k) _unified_runtime_only_fn "${_runtime}" module_dispatch reality regenerate_keys || true ;;
-            r) _unified_runtime_only_fn "${_runtime}" module_dispatch reality restart || true ;;
-            v) _unified_runtime_only_fn "${_runtime}" module_dispatch reality show || true ;;
             u)
                 if [ "${_runtime}" -eq 1 ]; then
-                    _menu_confirm_uninstall "Reality" || { _pause; continue; }
-                    module_dispatch reality uninstall || { _pause; continue; }
-                    _pause; return 0
+                    _menu_confirm_uninstall "Reality" || continue
+                    module_dispatch reality uninstall || continue
+                    return 0
                 else
                     log_error "无效选项，请按提示输入"
                 fi ;;
             0) return 0 ;;
             *) log_error "无效选项，请按提示输入" ;;
         esac
-        _pause
     done
 }
 
@@ -7573,49 +7763,43 @@ unified_menu_vltcp() {
     local _mode="${1:-install}" _runtime=0
     _unified_mode_is_runtime "${_mode}" && { _runtime=1; _manage_module_entry_check || return; }
     while true; do
-        local _en _port _listen _svc _summary
+        local _en _port _listen _svc
         _en=$(st_get '.vltcp.enabled')
         _port=$(port_of vltcp)
         _listen=$(st_get '.vltcp.listen')
         _svc=$(_unified_runtime_status_for vltcp)
-        _summary=$(_unified_summary_for "${_runtime}" vltcp)
-        clear; echo ""; log_title "══ VLESS-TCP 闭环工作台 ══"
+        log_title "══ VLESS-TCP 闭环工作台 ══"
         _unified_render_mode_header "${_mode}" "明文直连模块，建议结合受控网络环境使用"
         _unified_render_status "${_runtime}" "${_en}" "${_svc}"
         printf "  端口: ${C_YLW}%s${C_RST}  监听: ${C_CYN}%s${C_RST}\n" "${_port}" "${_listen}"
         _hr
-        _menu_print_action 1 "切换启用状态"
+        _menu_print_action 1 "$([ "${_en}" = true ] && printf 停用 || printf 启用)入站"
         _menu_print_action 2 "修改监听端口"
         _menu_print_action 3 "修改监听地址"
         _menu_print_action 4 "查看当前节点摘要"
         if [ "${_runtime}" -eq 1 ]; then
             _hr
-            _menu_print_action r "重启 xray2go 服务"
-            _menu_print_action v "查看节点链接"
             _menu_print_action u "卸载 VLESS-TCP" "${C_RED}"
         fi
         _menu_print_back
         _hr
-        prompt "请选择操作 $( [ "${_runtime}" -eq 1 ] && printf '(0-4/r/v/u)' || printf '(0-4)' ): " _c || return 0
+        prompt '选择工作台操作: ' _c || return 0
         case "${_c:-}" in
             1) _unified_toggle_or_plan "${_runtime}" vltcp "${_en}" install_plan_vltcp_toggle || true ;;
             2) _unified_dispatch_or_plan "${_runtime}" vltcp update_port install_plan_vltcp_update_port || true ;;
             3) _unified_dispatch_or_plan "${_runtime}" vltcp update_listen install_plan_vltcp_update_listen || true ;;
             4) log_info "VLESS-TCP: ${_summary}" ;;
-            r) _unified_runtime_only_fn "${_runtime}" module_dispatch vltcp restart || true ;;
-            v) _unified_runtime_only_fn "${_runtime}" module_dispatch vltcp show || true ;;
             u)
                 if [ "${_runtime}" -eq 1 ]; then
-                    _menu_confirm_uninstall "VLESS-TCP" || { _pause; continue; }
-                    module_dispatch vltcp uninstall || { _pause; continue; }
-                    _pause; return 0
+                    _menu_confirm_uninstall "VLESS-TCP" || continue
+                    module_dispatch vltcp uninstall || continue
+                    return 0
                 else
                     log_error "无效选项，请按提示输入"
                 fi ;;
             0) return 0 ;;
             *) log_error "无效选项，请按提示输入" ;;
         esac
-        _pause
     done
 }
 
@@ -7623,55 +7807,47 @@ unified_menu_vlquic() {
     local _mode="${1:-install}" _runtime=0
     _unified_mode_is_runtime "${_mode}" && { _runtime=1; _manage_module_entry_check || return; }
     while true; do
-        local _en _port _listen _domain _svc _summary
+        local _en _port _listen _domain _svc
         _en=$(st_get '.vlquic.enabled')
         _port=$(port_of vlquic)
         _listen=$(st_get '.vlquic.listen')
         _domain=$(st_get '.vlquic.domain')
         _svc=$(_unified_runtime_status_for vlquic)
-        _summary=$(_unified_summary_for "${_runtime}" vlquic)
-        clear; echo ""; log_title "══ VLESS-XHTTP-H3 闭环工作台 ══"
+        log_title "══ VLESS-XHTTP-H3 闭环工作台 ══"
         _unified_render_mode_header "${_mode}" "需要域名、证书与 UDP/QUIC 可用"
         _unified_render_status "${_runtime}" "${_en}" "${_svc}"
         printf "  UDP端口: ${C_YLW}%s${C_RST}  监听: ${C_CYN}%s${C_RST}\n" "${_port}" "${_listen}"
         printf "  域名: ${C_CYN}%s${C_RST}\n" "${_domain:-未配置}"
         _hr
-        _menu_print_action 1 "切换启用状态"
+        _menu_print_action 1 "$([ "${_en}" = true ] && printf 停用 || printf 启用)入站"
         _menu_print_action 2 "修改 UDP 监听端口"
         _menu_print_action 3 "修改监听地址"
-        _menu_print_action 4 "配置域名/证书"
-        _menu_print_action 5 "查看当前节点摘要"
-        _menu_print_action x "XHTTP 参数与节点导出"
+        _menu_print_action 4 '证书'
+        _menu_print_action x '高级设置（XHTTP）'
         if [ "${_runtime}" -eq 1 ]; then
             _hr
-            _menu_print_action r "重启 xray2go 服务"
-            _menu_print_action v "查看节点链接"
             _menu_print_action u "卸载 VLESS-XHTTP-H3" "${C_RED}"
         fi
         _menu_print_back
         _hr
-        prompt "请选择操作 $( [ "${_runtime}" -eq 1 ] && printf '(0-5/x/r/v/u)' || printf '(0-5/x)' ): " _c || return 0
+        prompt '选择工作台操作: ' _c || return 0
         case "${_c:-}" in
             1) _unified_toggle_or_plan "${_runtime}" vlquic "${_en}" install_plan_vlquic_toggle || true ;;
             2) _unified_dispatch_or_plan "${_runtime}" vlquic update_port install_plan_vlquic_update_port || true ;;
             3) _unified_dispatch_or_plan "${_runtime}" vlquic update_listen install_plan_vlquic_update_listen || true ;;
-            4) _unified_dispatch_or_plan "${_runtime}" vlquic update_cert install_plan_vlquic_update_cert || true ;;
-            5) log_info "VLESS-XHTTP-H3: ${_summary}" ;;
+            4) _workbench_certificates vlquic "${_runtime}" ;;
             x) _direct_xhttp_menu vlquic "${_runtime}" xhttp && continue ;;
-            r) _unified_runtime_only_fn "${_runtime}" module_dispatch vlquic restart || true ;;
-            v) _unified_runtime_only_fn "${_runtime}" module_dispatch vlquic show || true ;;
             u)
                 if [ "${_runtime}" -eq 1 ]; then
-                    _menu_confirm_uninstall "VLESS-XHTTP-H3" || { _pause; continue; }
-                    module_dispatch vlquic uninstall || { _pause; continue; }
-                    _pause; return 0
+                    _menu_confirm_uninstall "VLESS-XHTTP-H3" || continue
+                    module_dispatch vlquic uninstall || continue
+                    return 0
                 else
                     log_error "无效选项，请按提示输入"
                 fi ;;
             0) return 0 ;;
             *) log_error "无效选项，请按提示输入" ;;
         esac
-        _pause
     done
 }
 
@@ -7745,24 +7921,7 @@ _cforigin_xhttp_render_status() {
     ' <<< "$(st_get '.cforigin.xhttp // {}')"
 }
 
-_direct_xhttp_export_menu() {
-    local _module="$1" _choice
-    while true; do
-        log_title "══ 导出 $(module_label "${_module}") XHTTP 节点 ══"
-        _menu_print_action 1 "分享链接"
-        _menu_print_action 2 "客户端出站 JSON"
-        _menu_print_back
-        prompt '选择格式 (0-2): ' _choice || return 0
-        case "${_choice}" in
-            0) return 0 ;;
-            1) "_${_module}_xhttp_link" || true ;;
-            2) "_${_module}_xhttp_export_json" || true ;;
-            *) log_error "无效选项，请按提示输入"; continue ;;
-        esac
-        _pause
-        return 0
-    done
-}
+
 
 _direct_xhttp_menu() {
     local _module="$1" _runtime="$2" _transport="$3" _choice _mode _profile _input _label
@@ -7773,35 +7932,43 @@ _direct_xhttp_menu() {
         "_${_module}_xhttp_render_status"
         _menu_print_action 1 "选择传输模式"
         _menu_print_action 2 "编辑服务端和客户端 Extra JSON"
-        _menu_print_action 3 "导出分享链接或客户端出站 JSON"
+        case "${_module}" in
+            ff|reality) _menu_print_action 3 '切换旧版 xPadding' ;;
+            cforigin) _menu_print_action 3 '切换 Cloudflare Edge HTTP/3' ;;
+        esac
         _menu_print_action 4 "恢复 stream-one 和默认 Extra"
         _menu_print_action 5 "逐项编辑常用参数"
         _menu_print_back
-        prompt "请选择操作 (0-5): " _choice || return 0
+        prompt "选择高级设置: " _choice || return 0
         case "${_choice}" in
             0) return 0 ;;
             1)
-                prompt "传输模式（1 stream-one，2 auto，3 packet-up，4 stream-up，回车返回）: " _input || return 0
-                case "${_input}" in
-                    1) _mode=stream-one ;;
-                    2) _mode=auto ;;
-                    3) _mode=packet-up ;;
-                    4) _mode=stream-up ;;
-                    '') continue ;;
-                    *) log_error "请输入 1–4 选择传输模式"; _pause; continue ;;
-                esac
+                while prompt '传输模式（1 stream-one，2 auto，3 packet-up，4 stream-up，0 返回）: ' _input; do
+                    case "${_input}" in
+                        1) _mode=stream-one; break ;;
+                        2) _mode=auto; break ;;
+                        3) _mode=packet-up; break ;;
+                        4) _mode=stream-up; break ;;
+                        0|'') continue 2 ;;
+                        *) log_error '请输入 1–4 选择传输模式' ;;
+                    esac
+                done
+                [ -n "${_input}" ] || return 0
                 _profile=$(_xhttp_saved_profile "${_module}" | jq -c --arg mode "${_mode}" '.mode = $mode')
                 "_${_module}_xhttp_set_profile" "${_runtime}" "${_profile}" || true ;;
             2)
                 log_info 'JSON 字段: mode, server（入站 Extra）, client（客户端 Extra）'
                 _xhttp_edit_advanced "${_module}" "${_runtime}"
                 continue ;;
-            3) _direct_xhttp_export_menu "${_module}"; continue ;;
+            3) case "${_module}" in
+                   ff|reality) _xhttp_legacy_padding "${_module}" "${_runtime}" ;;
+                   cforigin) _unified_dispatch_or_plan "${_runtime}" cforigin toggle_edge_h3 install_plan_cforigin_toggle_edge_h3 || true ;;
+                   *) log_error '无效高级设置' ;;
+               esac ;;
             4) "_${_module}_xhttp_set_profile" "${_runtime}" null || true ;;
             5) _xhttp_edit_common "${_module}" "${_runtime}"; continue ;;
             *) log_error "请输入 0–5 选择操作" ;;
         esac
-        _pause
     done
 }
 
@@ -7813,7 +7980,7 @@ unified_menu_cforigin() {
     local _mode="${1:-install}" _runtime=0
     _unified_mode_is_runtime "${_mode}" && { _runtime=1; _manage_module_entry_check || return; }
     while true; do
-        local _en _proto _path _domain _edge _edge_h3 _origin _listen _tls _svc _summary
+        local _en _proto _path _domain _edge _edge_h3 _origin _listen _tls _svc
         _en=$(st_get '.cforigin.enabled')
         _proto=$(st_get '.cforigin.protocol')
         _path=$(st_get '.cforigin.path')
@@ -7824,34 +7991,29 @@ unified_menu_cforigin() {
         _listen=$(st_get '.cforigin.listen')
         _tls=$(st_get '.cforigin.origin_tls')
         _svc=$(_unified_runtime_status_for cforigin)
-        _summary=$(_unified_summary_for "${_runtime}" cforigin)
-        clear; echo ""; log_title "══ CF Origin 闭环工作台 ══"
+        log_title "══ CF Origin 闭环工作台 ══"
         _unified_render_mode_header "${_mode}" "需要 Cloudflare 域名、回源规则与源站证书"
         _unified_render_status "${_runtime}" "${_en}" "${_svc}"
         printf "  协议: ${C_GRN}%s${C_RST}  路径: ${C_CYN}%s${C_RST}\n" "${_proto}" "${_path}"
         printf "  域名: ${C_CYN}%s${C_RST}  Edge: ${C_YLW}%s${C_RST}  Origin: ${C_YLW}%s${C_RST}\n" "${_domain:-未配置}" "${_edge}" "${_origin}"
         printf "  监听: ${C_CYN}%s${C_RST}  Edge-H3: ${C_YLW}%s${C_RST}  TLS: ${C_YLW}%s${C_RST}\n" "${_listen}" "${_edge_h3}" "${_tls}"
         _hr
-        _menu_print_action 1 "切换启用状态"
+        _menu_print_action 1 "$([ "${_en}" = true ] && printf 停用 || printf 启用)入站"
         _menu_print_action 2 "修改协议（WS / HTTPUpgrade / XHTTP）"
         _menu_print_action 3 "修改域名"
         _menu_print_action 4 "修改路径 path"
         _menu_print_action 5 "修改 Edge 入口端口"
         _menu_print_action 6 "修改 Origin 回源端口"
         _menu_print_action 7 "修改监听地址"
-        _menu_print_action 8 "切换客户端到 Cloudflare Edge HTTP/3（仅 XHTTP）"
-        _menu_print_action 9 "配置域名/证书"
-        _menu_print_action a "查看当前节点摘要"
-        _menu_print_action x "XHTTP 参数与节点导出"
+        _menu_print_action 9 '证书'
+        _menu_print_action x '高级设置（XHTTP）'
         if [ "${_runtime}" -eq 1 ]; then
             _hr
-            _menu_print_action r "重启 xray2go 服务"
-            _menu_print_action v "查看节点/Cloudflare 提示"
             _menu_print_action u "卸载 CF Origin" "${C_RED}"
         fi
         _menu_print_back
         _hr
-        prompt "请选择操作 $( [ "${_runtime}" -eq 1 ] && printf '(0-9/a/x/r/v/u)' || printf '(0-9/a/x)' ): " _c || return 0
+        prompt '选择工作台操作: ' _c || return 0
         case "${_c:-}" in
             1) _unified_toggle_or_plan "${_runtime}" cforigin "${_en}" install_plan_cforigin_toggle || true ;;
             2) _unified_dispatch_or_plan "${_runtime}" cforigin update_protocol install_plan_cforigin_update_protocol || true ;;
@@ -7860,24 +8022,19 @@ unified_menu_cforigin() {
             5) _unified_dispatch_or_plan "${_runtime}" cforigin update_edge_port install_plan_cforigin_update_edge_port || true ;;
             6) _unified_dispatch_or_plan "${_runtime}" cforigin update_port install_plan_cforigin_update_origin_port || true ;;
             7) _unified_dispatch_or_plan "${_runtime}" cforigin update_listen install_plan_cforigin_update_listen || true ;;
-            8) _unified_dispatch_or_plan "${_runtime}" cforigin toggle_edge_h3 install_plan_cforigin_toggle_edge_h3 || true ;;
-            9) _unified_dispatch_or_plan "${_runtime}" cforigin update_cert install_plan_cforigin_update_cert || true ;;
-            a) log_info "CF Origin: ${_summary}" ;;
+            9) _workbench_certificates cforigin "${_runtime}" ;;
             x) _cforigin_xhttp_menu "${_runtime}" && continue ;;
-            r) _unified_runtime_only_fn "${_runtime}" module_dispatch cforigin restart || true ;;
-            v) _unified_runtime_only_fn "${_runtime}" module_dispatch cforigin show || true ;;
             u)
                 if [ "${_runtime}" -eq 1 ]; then
-                    _menu_confirm_uninstall "CF Origin" || { _pause; continue; }
-                    module_dispatch cforigin uninstall || { _pause; continue; }
-                    _pause; return 0
+                    _menu_confirm_uninstall "CF Origin" || continue
+                    module_dispatch cforigin uninstall || continue
+                    return 0
                 else
                     log_error "无效选项，请按提示输入"
                 fi ;;
             0) return 0 ;;
             *) log_error "无效选项，请按提示输入" ;;
         esac
-        _pause
     done
 }
 
@@ -7885,54 +8042,46 @@ unified_menu_socks() {
     local _mode="${1:-install}" _runtime=0
     _unified_mode_is_runtime "${_mode}" && { _runtime=1; _manage_module_entry_check || return; }
     while true; do
-        local _en _port _listen _user _svc _summary
+        local _en _port _listen _user _svc
         _en=$(st_get '.socks.enabled')
         _port=$(port_of socks)
         _listen=$(st_get '.socks.listen')
         _user=$(st_get '.socks.user')
         _svc=$(_unified_runtime_status_for socks)
-        _summary=$(_unified_summary_for "${_runtime}" socks)
-        clear; echo ""; log_title "══ SOCKS5 闭环工作台 ══"
+        log_title "══ SOCKS5 闭环工作台 ══"
         _unified_render_mode_header "${_mode}" "账号密码变更支持单字段修改"
         _unified_render_status "${_runtime}" "${_en}" "${_svc}"
         printf "  端口: ${C_YLW}%s${C_RST}  监听: ${C_CYN}%s${C_RST}  用户: ${C_GRN}%s${C_RST}\n" "${_port}" "${_listen}" "${_user}"
         _hr
-        _menu_print_action 1 "切换启用状态"
+        _menu_print_action 1 "$([ "${_en}" = true ] && printf 停用 || printf 启用)入站"
         _menu_print_action 2 "修改监听端口"
         _menu_print_action 3 "修改监听地址"
         _menu_print_action 4 "修改用户名"
         _menu_print_action 5 "修改密码"
-        _menu_print_action 6 "查看当前节点摘要"
         if [ "${_runtime}" -eq 1 ]; then
             _hr
-            _menu_print_action r "重启 xray2go 服务"
-            _menu_print_action v "查看节点链接"
             _menu_print_action u "卸载 SOCKS5" "${C_RED}"
         fi
         _menu_print_back
         _hr
-        prompt "请选择操作 $( [ "${_runtime}" -eq 1 ] && printf '(0-6/r/v/u)' || printf '(0-6)' ): " _c || return 0
+        prompt '选择工作台操作: ' _c || return 0
         case "${_c:-}" in
             1) _unified_toggle_or_plan "${_runtime}" socks "${_en}" install_plan_socks_toggle || true ;;
             2) _unified_dispatch_or_plan "${_runtime}" socks update_port install_plan_socks_update_port || true ;;
             3) _unified_dispatch_or_plan "${_runtime}" socks update_listen install_plan_socks_update_listen || true ;;
             4) _unified_dispatch_or_plan "${_runtime}" socks update_user install_plan_socks_update_user || true ;;
             5) _unified_dispatch_or_plan "${_runtime}" socks update_pass install_plan_socks_update_pass || true ;;
-            6) log_info "SOCKS5: ${_summary}" ;;
-            r) _unified_runtime_only_fn "${_runtime}" module_dispatch socks restart || true ;;
-            v) _unified_runtime_only_fn "${_runtime}" module_dispatch socks show || true ;;
             u)
                 if [ "${_runtime}" -eq 1 ]; then
-                    _menu_confirm_uninstall "SOCKS5" || { _pause; continue; }
-                    module_dispatch socks uninstall || { _pause; continue; }
-                    _pause; return 0
+                    _menu_confirm_uninstall "SOCKS5" || continue
+                    module_dispatch socks uninstall || continue
+                    return 0
                 else
                     log_error "无效选项，请按提示输入"
                 fi ;;
             0) return 0 ;;
             *) log_error "无效选项，请按提示输入" ;;
         esac
-        _pause
     done
 }
 
@@ -7941,7 +8090,7 @@ unified_menu_ss2022() {
     [ -n "$_mode" ] || _mode=install
     _unified_mode_is_runtime "$_mode" && { _runtime=1; _manage_module_entry_check || return; }
     while true; do
-        local _en _port _listen _method _key_mode _svc _summary
+        local _en _port _listen _method _key_mode _svc
         _en=$(st_get '.ss2022.enabled')
         _port=$(port_of ss2022)
         _listen=$(st_get '.ss2022.listen')
@@ -7949,48 +8098,40 @@ unified_menu_ss2022() {
         _key_mode=单密钥
         if [ "$(st_get '.ss2022.key_mode')" = dual ]; then _key_mode=双密钥; fi
         _svc=$(_unified_runtime_status_for ss2022)
-        _summary=$(_unified_summary_for "$_runtime" ss2022)
-        clear; echo ""; log_title "══ Shadowsocks 2022 闭环工作台 ══"
+        log_title "══ Shadowsocks 2022 闭环工作台 ══"
         _unified_render_mode_header "$_mode" "使用 Xray-core 内置 SS2022"
         _unified_render_status "$_runtime" "$_en" "$_svc"
         printf "  端口: $C_YLW%s$C_RST  监听: $C_CYN%s$C_RST  方法: $C_GRN%s（%s）$C_RST\\n" "$_port" "$_listen" "$_method" "$_key_mode"
         _hr
-        _menu_print_action 1 "切换启用状态"
+        _menu_print_action 1 "$([ "${_en}" = true ] && printf 停用 || printf 启用)入站"
         _menu_print_action 2 "修改 TCP/UDP 监听端口"
         _menu_print_action 3 "修改监听地址"
         _menu_print_action 4 "修改加密方法与密钥模式（会重新生成密钥）"
         _menu_print_action 5 "重新生成密钥"
-        _menu_print_action 6 "查看当前节点摘要"
         if [ "$_runtime" -eq 1 ]; then
             _hr
-            _menu_print_action r "重启 xray2go 服务"
-            _menu_print_action v "查看节点链接"
             _menu_print_action u "卸载 Shadowsocks 2022" "$C_RED"
         fi
         _menu_print_back
         _hr
-        prompt "请选择操作 $( [ "$_runtime" -eq 1 ] && printf '(0-6/r/v/u)' || printf '(0-6)' ): " _c || return 0
+        prompt '选择工作台操作: ' _c || return 0
         case "$_c" in
             1) _unified_toggle_or_plan "$_runtime" ss2022 "$_en" install_plan_ss2022_toggle || true ;;
             2) _unified_dispatch_or_plan "$_runtime" ss2022 update_port install_plan_ss2022_update_port || true ;;
             3) _unified_dispatch_or_plan "$_runtime" ss2022 update_listen install_plan_ss2022_update_listen || true ;;
             4) _unified_dispatch_or_plan "$_runtime" ss2022 update_method install_plan_ss2022_update_method || true ;;
             5) _unified_dispatch_or_plan "$_runtime" ss2022 regenerate_keys install_plan_ss2022_regenerate_keys || true ;;
-            6) log_info "SS2022: $_summary" ;;
-            r) _unified_runtime_only_fn "$_runtime" module_dispatch ss2022 restart || true ;;
-            v) _unified_runtime_only_fn "$_runtime" module_dispatch ss2022 show || true ;;
             u)
                 if [ "$_runtime" -eq 1 ]; then
-                    _menu_confirm_uninstall "Shadowsocks 2022" || { _pause; continue; }
-                    module_dispatch ss2022 uninstall || { _pause; continue; }
-                    _pause; return 0
+                    _menu_confirm_uninstall "Shadowsocks 2022" || continue
+                    module_dispatch ss2022 uninstall || continue
+                    return 0
                 else
                     log_error "无效选项，请按提示输入"
                 fi ;;
             0) return 0 ;;
             *) log_error "无效选项，请按提示输入" ;;
         esac
-        _pause
     done
 }
 
@@ -7998,73 +8139,60 @@ unified_menu_http() {
     local _mode="${1:-install}" _runtime=0
     _unified_mode_is_runtime "${_mode}" && { _runtime=1; _manage_module_entry_check || return; }
     while true; do
-        local _en _port _listen _user _svc _summary
+        local _en _port _listen _user _svc
         _en=$(st_get '.http.enabled')
         _port=$(port_of http)
         _listen=$(st_get '.http.listen')
         _user=$(st_get '.http.user')
         _svc=$(_unified_runtime_status_for http)
-        _summary=$(_unified_summary_for "${_runtime}" http)
-        clear; echo ""; log_title "══ HTTP 代理闭环工作台 ══"
+        log_title "══ HTTP 代理闭环工作台 ══"
         _unified_render_mode_header "${_mode}" "HTTP 代理为明文 TCP 协议，公开监听前请确认网络边界"
         _unified_render_status "${_runtime}" "${_en}" "${_svc}"
         printf "  端口: ${C_YLW}%s${C_RST}  监听: ${C_CYN}%s${C_RST}  用户: ${C_GRN}%s${C_RST}\n" "${_port}" "${_listen}" "${_user}"
         _hr
-        _menu_print_action 1 "切换启用状态"
+        _menu_print_action 1 "$([ "${_en}" = true ] && printf 停用 || printf 启用)入站"
         _menu_print_action 2 "修改监听端口"
         _menu_print_action 3 "修改监听地址"
         _menu_print_action 4 "修改用户名"
         _menu_print_action 5 "修改密码"
-        _menu_print_action 6 "查看当前节点摘要"
         if [ "${_runtime}" -eq 1 ]; then
             _hr
-            _menu_print_action r "重启 xray2go 服务"
-            _menu_print_action v "查看节点链接"
             _menu_print_action u "卸载 HTTP 代理" "${C_RED}"
         fi
         _menu_print_back
         _hr
-        prompt "请选择操作 $( [ "${_runtime}" -eq 1 ] && printf '(0-6/r/v/u)' || printf '(0-6)' ): " _c || return 0
+        prompt '选择工作台操作: ' _c || return 0
         case "${_c:-}" in
             1) _unified_toggle_or_plan "${_runtime}" http "${_en}" install_plan_http_toggle || true ;;
             2) _unified_dispatch_or_plan "${_runtime}" http update_port install_plan_http_update_port || true ;;
             3) _unified_dispatch_or_plan "${_runtime}" http update_listen install_plan_http_update_listen || true ;;
             4) _unified_dispatch_or_plan "${_runtime}" http update_user install_plan_http_update_user || true ;;
             5) _unified_dispatch_or_plan "${_runtime}" http update_pass install_plan_http_update_pass || true ;;
-            6) log_info "HTTP 代理: ${_summary}" ;;
-            r) _unified_runtime_only_fn "${_runtime}" module_dispatch http restart || true ;;
-            v) _unified_runtime_only_fn "${_runtime}" module_dispatch http show || true ;;
             u)
                 if [ "${_runtime}" -eq 1 ]; then
-                    _menu_confirm_uninstall "HTTP 代理" || { _pause; continue; }
-                    module_dispatch http uninstall || { _pause; continue; }
-                    _pause; return 0
+                    _menu_confirm_uninstall "HTTP 代理" || continue
+                    module_dispatch http uninstall || continue
+                    return 0
                 else
                     log_error "无效选项，请按提示输入"
                 fi ;;
             0) return 0 ;;
             *) log_error "无效选项，请按提示输入" ;;
         esac
-        _pause
     done
 }
 
 install_wizard_render() {
-    clear; echo ""
-    log_title "══ 快速部署向导 ══"
-    printf "  先选择部署目标；需要多入口或逐项调整时，再进入高级自定义部署。\n\n"
-    printf "  ${C_GRN}1.${C_RST} VLESS + Reality TCP ${C_YLW}[推荐，依赖最少]${C_RST}\n"
-    printf "  ${C_GRN}2.${C_RST} Argo Tunnel ${C_YLW}[需要域名与 Cloudflare 凭证]${C_RST}\n"
-    printf "  ${C_GRN}3.${C_RST} 高级自定义部署 ${C_YLW}[多入口/完整参数]${C_RST}\n"
-    _hr
-    _menu_print_action 0 "返回主菜单" "${C_PUR}"
+    log_title 'Xray-2go · 首次部署'
+    _menu_print_action 1 '快速部署 Reality（VLESS + Reality TCP）'
+    _menu_print_action 2 '快速部署 Argo（需要域名与 Cloudflare 凭证）'
+    _menu_print_action 3 '自定义部署'
+    _menu_print_action 0 '退出'
 }
-
 install_wizard_confirm() {
     local _c
     clear; echo ""
     log_title "══ 确认部署 ══"
-    printf "  UUID      : %s\n" "$(st_get '.uuid')"
     printf "  Argo      : %s\n" "$(install_plan_module_summary argo)"
     printf "  FreeFlow  : %s\n" "$(install_plan_module_summary ff)"
     printf "  Reality   : %s\n" "$(install_plan_module_summary reality)"
@@ -8086,7 +8214,7 @@ install_wizard_confirm() {
     prompt "确认开始部署？(y/N): " _c || return 1
     case "${_c:-}" in
         y|Y|yes|YES) install_execute_current_plan interactive ;;
-        *) log_info "已取消本次部署，可在高级自定义部署中调整计划"; return 1 ;;
+        *) log_info "已取消本次部署"; return 2 ;;
     esac
 }
 
@@ -8135,27 +8263,33 @@ install_wizard_argo() {
 }
 
 install_wizard_menu() {
+    local _c _menu_redraw _result _MENU_ACTION_PAUSES=1
+    install_plan_reset_defaults || return 1
     while true; do
         install_wizard_render
-        local _c
+        _menu_redraw=0
+        _result=0
         prompt "请选择部署方案 (0-3，回车选 1): " _c || { _menu_return_to_parent; return 0; }
         case "${_c:-1}" in
-            1) install_wizard_reality && return 0 ;;
-            2) install_wizard_argo && return 0 ;;
-            3) install_plan_menu && return 0 ;;
-            0) _menu_return_to_parent; return 0 ;;
-            *) log_error "无效选项，请输入 0-3" ;;
+            1) install_wizard_reality || _result=$? ;;
+            2) install_wizard_argo || _result=$? ;;
+            3) install_plan_menu || _result=$?
+               [ "${_menu_redraw}" -eq 0 ] || continue ;;
+            0) return 0 ;;
+            *) log_error "无效选项，请输入 0-3"; continue ;;
         esac
-        _pause
+        if [ "${_result}" -ne 2 ]; then _pause; fi
+        [ "${_result}" -ne 0 ] || return 0
     done
 }
 
 install_plan_menu() {
+    local _result
     while true; do
         install_plan_render_summary
         local _c
         prompt "请选择操作 (0-13): " _c || { _menu_return_to_parent; return 0; }
-        echo ""
+        _result=0
         case "${_c:-}" in
             1) unified_menu_argo install && continue ;;
             2) unified_menu_freeflow install && continue ;;
@@ -8167,36 +8301,61 @@ install_plan_menu() {
             8) install_plan_configure_uuid || true ;;
             9) install_plan_reset_defaults || true; log_info "安装计划已重置为初始状态" ;;
             10) install_plan_validate || true ;;
-            11)
-                install_wizard_confirm && return 0
-                ;;
+            11) install_wizard_confirm && return 0
+                _result=$? ;;
             12) unified_menu_http install && continue ;;
             13) unified_menu_ss2022 install && continue ;;
             0) _menu_return_to_parent; return 0 ;;
             *) log_error "无效选项，请输入 0-13" ;;
         esac
-        _pause
+        if [ "${_result}" -ne 2 ]; then _pause; fi
     done
 }
 
 module_xray_install() {
-    if [ "${_MENU_XI}" -eq 1 ]; then
-        if [ "${_MENU_CX}" -eq 0 ]; then
-            log_warn "Xray-2go 已安装并运行，如需重装请先卸载 (按 u)"; return
-        fi
-        log_warn "Xray-2go 已安装但未运行；如需重装请先卸载 (按 u)，如需启动请进入对应管理菜单。"; return
+    local _MENU_STATE
+    _menu_collect_status
+    if [ "${_MENU_STATE}" != uninstalled ]; then
+        log_warn '仅在确认 Xray-2go 未安装时可以开始部署'
+        return 1
     fi
-    install_plan_reset_defaults || { log_error "安装计划初始化失败"; return 1; }
     install_wizard_menu
 }
+
+_menu_pending_uninstall() {
+    local _choice
+    log_title '检测到未完成卸载'
+    _menu_print_action 1 '继续卸载'
+    _menu_print_action 0 '退出'
+    while prompt '选择操作 (0-1): ' _choice; do
+        case "${_choice}" in
+            1) platform_detect_init; module_xray_uninstall; return $? ;;
+            0) return 0 ;;
+            *) log_error '无效选项，请输入 0 或 1' ;;
+        esac
+    done
+}
+
 menu() {
-    local _MENU_CX=1 _MENU_XI=0 _choice
+    local _MENU_STATE _choice _MENU_HIDE_LINKS=1
     while true; do
+        if [ -e "${_UNINSTALL_PENDING}" ]; then _menu_pending_uninstall; return; fi
         _menu_collect_status
+        if [ "${_MENU_STATE}" = uninstalled ]; then
+            install_wizard_menu || return
+            _menu_collect_status
+            [ "${_MENU_STATE}" != uninstalled ] || return 0
+            continue
+        fi
         _menu_render
-        prompt "输入编号或按键: " _choice || return 0
-        printf '\n'
-        _menu_select_action "${_choice}"
+        prompt '输入编号 (0-3): ' _choice || return 0
+        case "${_choice}" in
+            1) _menu_nodes "" ;;
+            2) _menu_inbounds ;;
+            3) _menu_maintenance ;;
+            0) return 0 ;;
+            *) log_error '无效选项，请输入 0-3' ;;
+        esac
     done
 }
 
@@ -8211,7 +8370,7 @@ usage() {
   xray_2go.sh reality -p <port>
 
 说明:
-  - 无参数: 打开控制台。首次部署时按 d 进入快速向导
+  - 无参数: 打开控制台。首次使用时直接选择部署方案
   - reality: 非交互一键安装 VLESS + Reality (TCP)
   - reality -p <port>: 使用指定监听端口进行一键安装
 EOF
@@ -8275,22 +8434,17 @@ main() {
     fi
     check_root
     if [ -e "${_UNINSTALL_PENDING}" ]; then
-        [ "${_CLI_ACTION}" = menu ] || { log_error "卸载未完成，请从主菜单按 u 继续"; return 1; }
-        local _pending_choice
-        printf '检测到未完成卸载。按 u 继续卸载，按 0 退出: '
-        IFS= read -r _pending_choice || return 1
-        case "${_pending_choice}" in
-            u|U) platform_detect_init; module_xray_uninstall; return $? ;;
-            0) return 0 ;;
-            *) log_error "无效选项"; return 1 ;;
-        esac
+        [ "${_CLI_ACTION}" = menu ] || { log_error "卸载未完成，请从主菜单选择继续卸载"; return 1; }
+        _menu_pending_uninstall
+        return $?
     fi
     platform_detect_init
     _transaction_lock_acquire || { log_error "启动初始化需要可用的部署写锁"; return 1; }
     local _startup_rc=0
     if [ -e "${_UNINSTALL_PENDING}" ]; then
         _transaction_lock_release
-        log_error "卸载未完成，请重新运行脚本并按 u 继续"
+        if [ "${_CLI_ACTION}" = menu ]; then _menu_pending_uninstall; return $?; fi
+        log_error "卸载未完成，请重新运行脚本并选择继续卸载"
         return 1
     fi
     if platform_preflight && st_init && plugin_refresh_runtime; then
