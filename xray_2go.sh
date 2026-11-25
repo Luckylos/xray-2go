@@ -59,6 +59,7 @@ readonly _SYSCTL_FILE="${_X2G_ROOT}/etc/sysctl.d/99-xray2go.conf"
 readonly _SVC_SYSTEMD_DIR="${_X2G_ROOT}/etc/systemd/system"
 readonly _SVC_OPENRC_DIR="${_X2G_ROOT}/etc/init.d"
 readonly _HOSTS_BAK="${WORK_DIR}/.hosts.bak"
+readonly _HOSTS_FILE="${_X2G_ROOT}/etc/hosts"
 readonly _ARGO_ENV_FILE="${WORK_DIR}/.argo_env"
 readonly _ACME_ENV_FILE="${WORK_DIR}/.acme_env"
 readonly _CERT_DIR="${WORK_DIR}/certs"
@@ -74,11 +75,11 @@ readonly _XPAD_JSON='{"xPaddingObfsMode":true,"xPaddingMethod":"tokenish","xPadd
 
 # 动态插件注册表（由 plugin_load_all 填充，非 readonly）
 _PLUGIN_REGISTRY=()
+declare -A _PLUGIN_FUNCTIONS=()
 readonly -a _BUILTIN_PLUGINS=(argo ff reality vltcp socks ss2022 http vlquic cforigin)
 # 插件快照缓存（按当前 state stamp 复用，避免重复遍历 registry）
 _PLUGIN_SNAPSHOT_STAMP=""
 _PLUGIN_SNAPSHOT_PORTS=""
-_PLUGIN_SNAPSHOT_LINKS=""
 _PLUGIN_SNAPSHOT_INBOUNDS=""
 
 # ==============================================================================
@@ -97,7 +98,8 @@ _TXN_PRE_TUNNEL_ACTIVE=0
 _TXN_TUNNEL_RESTART_ATTEMPTED=0
 _TXN_PRE_XRAY_ENABLED=0
 _TXN_PRE_TUNNEL_ENABLED=0
-_TXN_PRE_FW_FILE=""
+_TXN_FW_SEQUENCE=0
+_TXN_FW_RECORD_FAILED=0
 _TXN_ARTIFACT_PATHS=()
 _UPDATE_PID=""
 
@@ -115,8 +117,9 @@ _trap_int() {
         kill -TERM "${_UPDATE_PID}" 2>/dev/null || true
         wait "${_UPDATE_PID}" 2>/dev/null || true
     fi
-    if [ "${_TXN_ACTIVE:-0}" -eq 1 ]; then
+    if [ "${_TXN_ACTIVE:-0}" -eq 1 ] || [ "${_TXN_FW_ONLY:-0}" -eq 1 ]; then
         local _keep_snapshot=0
+        trap '' INT TERM
         _transaction_rollback || _keep_snapshot=1
         _transaction_end "${_keep_snapshot}"
     fi
@@ -508,6 +511,7 @@ atomic_write_with_backup() {
 atomic_write_secret() {
     local _dest="$1" _content="$2"
     local _old_umask _rc
+    _ensure_tmp_dir || return 1
     _old_umask=$(umask)
     umask 077
     atomic_write "${_dest}" "${_content}"
@@ -532,19 +536,18 @@ atomic_write_secret_with_backup() {
 # ── 文件锁（串行化所有 read-modify-write）────────────────────────────────────
 with_lock() {
     local _fn="$1"; shift
-    if [ "${_TXN_ACTIVE:-0}" -eq 1 ]; then
+    if [ "${_TXN_ACTIVE:-0}" -eq 1 ] || [ -n "${_TXN_LOCK_FD}" ]; then
         "${_fn}" "$@"
         return $?
     fi
-    mkdir -p "${WORK_DIR}" 2>/dev/null || true
-    _ensure_tmp_dir || return 1
-    if command -v flock >/dev/null 2>&1; then
-        ( flock -x 9 || { log_error "获取文件锁失败"; exit 1; }; "${_fn}" "$@" ) \
-            9>"${_LOCK_FILE}"
-    else
-        log_warn "flock 不可用，并发写入无保护"
+    command -v flock >/dev/null 2>&1 || { log_error "flock 不可用，拒绝无锁写入"; return 1; }
+    mkdir -p "$(dirname "${_LOCK_FILE}")" || return 1
+    (
+        flock -x 9 || { log_error "获取文件锁失败"; exit 1; }
+        _G_TMP_DIR=""
+        trap '_trap_exit' EXIT
         "${_fn}" "$@"
-    fi
+    ) 9>"${_LOCK_FILE}"
 }
 
 
@@ -770,6 +773,7 @@ cforigin_print_cloudflare_hint() {
 
 _st_persist_inner() {
     local _json
+    [ ! -e "${_UNINSTALL_PENDING}" ] || { log_error "卸载待继续，拒绝写入状态"; return 1; }
     _st_check_disk_state || return 1
     _json=$(printf '%s\n' "${_G_STATE}" | jq . 2>/dev/null) \
         || { log_error "state 序列化失败"; return 1; }
@@ -993,6 +997,7 @@ _st_read_object() {
 
 _st_restore_backup() {
     local _backup="$1" _restored _damaged
+    [ ! -e "${_UNINSTALL_PENDING}" ] || return 1
     if _st_read_object "${STATE_FILE}" >/dev/null; then
         log_error "状态文件已被其他进程恢复，请重新运行"
         return 1
@@ -1116,45 +1121,88 @@ EOF
     [ $(( 8#${_mode} & 8#022 )) -eq 0 ] || { log_warn "插件路径权限不安全，已拒绝加载: ${_path}"; return 1; }
 }
 
-_plugin_contract_ok() {
-    local _f="$1" _name="$2"
-    _plugin_path_safe "${_f}" || return 1
-    bash -n "${_f}" >/dev/null 2>&1 || { log_warn "插件语法错误，已跳过且未加载: ${_name}"; return 1; }
-    (
-        # 先在子 shell 中 source 并检查接口，避免损坏插件污染当前 shell 命名空间。
-        # shellcheck source=/dev/null
-        source "${_f}" >/dev/null 2>&1 || exit 1
-        declare -f "_plg_${_name}_inbound" >/dev/null 2>&1 || exit 1
-        declare -f "_plg_${_name}_link"    >/dev/null 2>&1 || exit 1
-        declare -f "_plg_${_name}_ports"   >/dev/null 2>&1 || exit 1
-        declare -f "_plg_${_name}_enabled" >/dev/null 2>&1 || exit 1
-    ) || { log_warn "插件 ${_name} 接口不完整，已跳过且未加载"; return 1; }
+_plugin_stage_functions() (
+    local _stage="$1" _name="$2" _prefix="_plg_${2}_" _fn _method
+    local -a _new_functions=()
+    local -A _other_functions=()
+    for _fn in ${_PLUGIN_FUNCTIONS[${_name}]:-}; do unset -f -- "${_fn}" || exit 1; done
+    while IFS= read -r _fn; do
+        _other_functions["${_fn}"]=1
+    done < <(compgen -A function)
+    for _method in inbound link ports enabled; do
+        unset -f -- "${_prefix}${_method}" || exit 1
+    done
+    # 校验与发布使用同一次隔离加载产生的函数。
+    # shellcheck source=/dev/null
+    source "${_stage}" >/dev/null 2>&1 || exit 1
+    for _method in inbound link ports enabled; do
+        declare -F "${_prefix}${_method}" >/dev/null || exit 1
+        [ -z "${_other_functions[${_prefix}${_method}]:-}" ] || exit 1
+    done
+    while IFS= read -r _fn; do
+        [ -z "${_other_functions[${_fn}]:-}" ] || continue
+        [[ "${_fn}" =~ ^[A-Za-z0-9_-]+$ ]] || exit 1
+        _new_functions+=("${_fn}")
+    done < <(compgen -A function)
+    printf '%s\n' "${_new_functions[*]}"
+    declare -f -- "${_new_functions[@]}"
+)
+
+_plugin_drop_functions() {
+    local _name="$1" _fn
+    for _fn in ${_PLUGIN_FUNCTIONS[${_name}]:-}; do unset -f -- "${_fn}" || return 1; done
+    unset '_PLUGIN_FUNCTIONS[${_name}]'
 }
 
-# 加载所有插件并注册到 _PLUGIN_REGISTRY
+_plugin_stage_file() {
+    local _file="$1" _name="$2" _stage="$3"
+    if [[ " ${_BUILTIN_PLUGINS[*]} " == *" ${_name} "* ]]; then
+        # 保留名始终使用脚本自带模板。
+        "_plugin_write_${_name}" > "${_stage}"
+    else
+        [ -f "${_file}" ] && _plugin_path_safe "${_file}" && cat -- "${_file}" > "${_stage}"
+    fi
+}
+
+# 已存在的插件逐个发布或保留上一套完整实现。
 plugin_load_all() {
-    _PLUGIN_REGISTRY=()
-    mkdir -p "${PLUGIN_DIR}"
+    mkdir -p "${PLUGIN_DIR}" || return 1
     chmod 755 "${WORK_DIR}" "${PLUGIN_DIR}" 2>/dev/null || true
     _plugin_path_safe "${WORK_DIR}" || return 1
     _plugin_path_safe "${PLUGIN_DIR}" || return 1
-    local _f _name
+    local _f _name _stage _loaded
+    local -a _next_registry=()
+    local -A _present=()
+    _stage=$(mktemp "${PLUGIN_DIR}/.load_XXXXXX") || return 1
     for _f in "${PLUGIN_DIR}"/*.sh; do
+        [ -e "${_f}" ] || [ -L "${_f}" ] || continue
         _name=$(basename "${_f}" .sh)
-        if [[ " ${_BUILTIN_PLUGINS[*]} " == *" ${_name} "* ]]; then
-            # 保留名的运行时实现始终来自脚本自带模板。
-            # shellcheck source=/dev/null
-            source <("_plugin_write_${_name}") || return 1
+        val_plugin_name "${_name}" >/dev/null || { log_warn "插件文件名不合法，已跳过且未加载: ${_f}"; continue; }
+        _present["${_name}"]=1
+        if _plugin_stage_file "${_f}" "${_name}" "${_stage}" &&
+           bash -n "${_stage}" >/dev/null 2>&1 &&
+           _loaded=$(_plugin_stage_functions "${_stage}" "${_name}") && [[ "${_loaded}" == *$'\n'* ]]; then
+            _plugin_drop_functions "${_name}" || { rm -f -- "${_stage}"; return 1; }
+            # 只发布 Bash 从已校验函数生成的定义，不重复执行插件顶层代码。
+            eval "${_loaded#*$'\n'}" || { rm -f -- "${_stage}"; return 1; }
+            _PLUGIN_FUNCTIONS["${_name}"]="${_loaded%%$'\n'*}"
+            _next_registry+=("${_name}")
+            log_info "插件已加载: ${_name}"
+        elif [ -n "${_PLUGIN_FUNCTIONS[${_name}]:-}" ]; then
+            _next_registry+=("${_name}")
+            log_warn "插件 ${_name} 刷新失败，继续使用上一版"
         else
-            [ -f "${_f}" ] || continue
-            val_plugin_name "${_name}" >/dev/null || { log_warn "插件文件名不合法，已跳过且未加载: ${_f}"; continue; }
-            _plugin_contract_ok "${_f}" "${_name}" || continue
-            # shellcheck source=/dev/null
-            source "${_f}" || { log_warn "插件加载失败: ${_f}"; continue; }
+            log_warn "插件 ${_name} 无法加载或接口不完整，已跳过且未加载"
         fi
-        _PLUGIN_REGISTRY+=( "${_name}" )
-        log_info "插件已加载: ${_name}"
     done
+    rm -f -- "${_stage}" || return 1
+    for _name in "${_PLUGIN_REGISTRY[@]}"; do
+        if [ -z "${_present[${_name}]:-}" ]; then
+            _plugin_drop_functions "${_name}" || return 1
+        fi
+    done
+    _PLUGIN_REGISTRY=("${_next_registry[@]}")
+    _PLUGIN_SNAPSHOT_STAMP=""
 }
 
 # 调用插件方法
@@ -1186,7 +1234,6 @@ plugin_refresh_runtime() {
     plugin_load_all || return 1
     _PLUGIN_SNAPSHOT_STAMP=""
     _PLUGIN_SNAPSHOT_PORTS=""
-    _PLUGIN_SNAPSHOT_LINKS=""
     _PLUGIN_SNAPSHOT_INBOUNDS=""
 }
 
@@ -1211,7 +1258,7 @@ _plugin_port_rules() {
 }
 
 _plugin_snapshot_rebuild() {
-    local _uuid_check _name _p _l _links _ibs='[]' _ib _rows _port _listen _proto _transports _key _socket
+    local _uuid_check _name _p _ibs='[]' _ib _rows _port _listen _proto _transports _key _socket
     local -A _used_ports=() _used_wild_ports=() _used_exact_keys=()
     _PLUGIN_SNAPSHOT_STAMP=""
     _uuid_check=$(st_get '.uuid')
@@ -1220,15 +1267,11 @@ _plugin_snapshot_rebuild() {
         return 1
     fi
     _PLUGIN_SNAPSHOT_PORTS=""
-    _PLUGIN_SNAPSHOT_LINKS=""
 
     for _name in "${_PLUGIN_REGISTRY[@]}"; do
         _p=$(_plugin_port_rules "${_name}") || return 1
         [ -z "${_p}" ] || _PLUGIN_SNAPSHOT_PORTS+="${_p}"$'\n'
 
-        _l=$(plugin_call "${_name}" link 2>/dev/null) || _l=""
-        _links=$(plugin_filter_links "${_name}" <<< "${_l}")
-        [ -z "${_links}" ] || _PLUGIN_SNAPSHOT_LINKS+="${_links}"$'\n'
         _ib=$(plugin_call "${_name}" inbound 2>/dev/null) || {
             log_error "插件 inbound 失败: ${_name}"; return 1; }
         [ -n "${_ib}" ] || continue
@@ -1298,15 +1341,17 @@ plugin_is_loaded() {
 }
 
 plugin_collect_links() {
-    local _mod="${1:-}" _links
+    local _mod="${1:-}" _links _name
     if [ -n "${_mod}" ]; then
         plugin_is_loaded "${_mod}" || return 0
         _links=$(plugin_call "${_mod}" link) || return 1
         plugin_filter_links "${_mod}" <<< "${_links}"
         return
     fi
-    _plugin_snapshot_ensure || return 1
-    printf '%s' "${_PLUGIN_SNAPSHOT_LINKS}"
+    for _name in "${_PLUGIN_REGISTRY[@]}"; do
+        _links=$(plugin_call "${_name}" link 2>/dev/null) || continue
+        plugin_filter_links "${_name}" <<< "${_links}"
+    done
 }
 
 plugin_collect_inbounds() {
@@ -1378,9 +1423,13 @@ _argo_xhttp_download_settings() {
     local _profile="$1" _host="$2" _server
     _server=$(_xhttp_server_extra argo) || return 1
     _server=$(_xhttp_client_visible_server_extra <<< "${_server}") || return 1
+    if jq -e '.split.download.port == false' <<< "${_profile}" >/dev/null; then
+        log_warn "历史 Argo 下行端口为 false，已使用 CDN 端口；请在高级配置中修正"
+    fi
     jq -ce --arg address "$(st_get '.cfip')" --argjson port "$(st_get '.cfport')" \
         --arg host "${_host}" --argjson server "${_server}" '
-        (.split.download // {} | del(.security) | with_entries(select(.value != null))) as $override |
+        (.split.download // {} | del(.security) |
+         if .port == false then del(.port) else . end | with_entries(select(.value != null))) as $override |
         ({address:$address,port:$port,network:"xhttp",security:"tls",
           tlsSettings:{serverName:$host,fingerprint:"chrome"},
           xhttpSettings:{path:"/argo",host:$host,extra:$server}} * $override) |
@@ -2164,72 +2213,263 @@ _fw_unmark_rule() {
 _fw_has_nftables() {
     command -v nft >/dev/null 2>&1 && nft list ruleset >/dev/null 2>&1
 }
-_fw_nft_table_exists() { nft list table inet xray2go >/dev/null 2>&1; }
-_fw_nft_ensure_table() {
-    _fw_nft_table_exists && return 0
-    nft add table inet xray2go 2>/dev/null || return 1
-    nft add chain inet xray2go input '{ type filter hook input priority 0; policy accept; }' \
-        2>/dev/null || return 1
-}
 
 _fw_select_backend() {
-    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then printf 'ufw'; return 0; fi
+    if command -v ufw >/dev/null 2>&1 && LC_ALL=C ufw status 2>/dev/null | grep -q '^Status: active'; then printf 'ufw'; return 0; fi
     if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then printf 'firewalld'; return 0; fi
     if _fw_has_nftables; then printf 'nft'; return 0; fi
     if command -v iptables >/dev/null 2>&1; then printf 'iptables'; return 0; fi
     printf 'none'
 }
 
-_fw_rule_exists() {
-    local _backend="$1" _port="$2" _proto="${3:-tcp}"
+_fw_nft_handles() {
+    awk -v protocol="$1" -v port="$2" '
+        $1 == "chain" { input = ($2 == "input") }
+        input && $1 == protocol && $2 == "dport" && $3 == port && $4 == "accept" &&
+        NF == 7 && $5 == "#" && $6 == "handle" { print $7 }
+    '
+}
+
+_fw_rule_state() {
+    local _backend="$1" _layer="$2" _port="$3" _proto="$4" _listing _matches
+    local -a _flags=()
     case "${_backend}" in
         nft)
-            _fw_nft_table_exists && nft list chain inet xray2go input 2>/dev/null \
-                | grep -q "${_proto} dport ${_port} accept" ;;
+            _listing=$(nft list tables 2>/dev/null) || return 1
+            if ! grep -Fxq 'table inet xray2go' <<< "${_listing}"; then printf 0; return; fi
+            if [ "${_layer}" = table ]; then printf 1; return; fi
+            _listing=$(nft -a -nn list table inet xray2go 2>/dev/null) || return 1
+            if [ "${_layer}" = chain ]; then
+                if grep -Eq '^[[:space:]]*chain input[[:space:]]*\{' <<< "${_listing}"; then printf 1; else printf 0; fi
+                return
+            fi
+            _matches=$(_fw_nft_handles "${_proto}" "${_port}" <<< "${_listing}") || return 1
+            if [ -z "${_matches}" ]; then printf 0
+            elif [[ "${_matches}" =~ ^[0-9]+$ ]]; then printf 'handle:%s' "${_matches}"
+            else printf ambiguous; fi ;;
         ufw)
-            ufw status numbered 2>/dev/null | grep -qE "^[[:space:]]*\[[[:space:]]*[0-9]+\].*${_port}/${_proto}" ;;
+            _listing=$(LC_ALL=C ufw status 2>/dev/null) || return 1
+            if grep -q '^Status: active$' <<< "${_listing}"; then
+                awk -v rule="${_port}/${_proto}" '
+                    { sub(/^[[:space:]]*\[[[:space:]]*[0-9]+\][[:space:]]*/, "") }
+                    $1 == rule {
+                        action = ($2 == "(v6)" ? 3 : 2)
+                        source = action + ($(action + 1) == "IN" ? 2 : 1)
+                        last = source + (action == 3 ? 1 : 0)
+                        if ($source == "Anywhere" && (action == 2 || $(last) == "(v6)")) {
+                            if ($action == "ALLOW" && NF == last) {
+                                if (action == 2) v4++; else v6++
+                            } else if ($action == "ALLOW" && $(last + 1) == "#") external=1
+                            else if ($action ~ /^(DENY|REJECT|LIMIT)$/) blocked=1
+                        }
+                    }
+                    END {
+                        if (v4 > 1 || v6 > 1 || (external && (v4 || v6))) print "ambiguous"
+                        else if (v4 && v6) print "dual"
+                        else if (v4) print "v4"
+                        else if (v6) print "v6"
+                        else if (blocked) print "blocked"
+                        else if (external) print "external"
+                        else print 0
+                    }
+                ' <<< "${_listing}"
+            else
+                grep -q '^Status: inactive$' <<< "${_listing}" || return 1
+                _listing=$(LC_ALL=C ufw show added 2>/dev/null) || return 1
+                if grep -Fxq "ufw allow ${_port}/${_proto}" <<< "${_listing}"; then printf configured
+                elif grep -Eq "^ufw (deny|reject|limit) ${_port}/${_proto}( |$)" <<< "${_listing}"; then printf blocked
+                elif grep -Fq "ufw allow ${_port}/${_proto} " <<< "${_listing}"; then printf external
+                else printf 0; fi
+            fi ;;
         firewalld)
-            firewall-cmd --query-port="${_port}/${_proto}" --permanent >/dev/null 2>&1 &&
-                firewall-cmd --query-port="${_port}/${_proto}" >/dev/null 2>&1 ;;
-        iptables)
-            iptables -C INPUT -p "${_proto}" --dport "${_port}" -j ACCEPT 2>/dev/null ;;
-        ip6tables6)
-            ip6tables -C INPUT -p "${_proto}" --dport "${_port}" -j ACCEPT 2>/dev/null ;;
+            [ "${_layer}" != permanent ] || _flags+=(--permanent)
+            _listing=$(firewall-cmd "${_flags[@]}" --list-ports 2>/dev/null) || return 1
+            awk -v rule="${_port}/${_proto}" '{ for (i=1; i<=NF; i++) if ($i == rule) found=1 } END { print found+0 }' \
+                <<< "${_listing}" ;;
+        iptables|ip6tables6)
+            _listing=$("${_backend%6}" -S INPUT 2>/dev/null) || return 1
+            _matches=$(grep -Ec -- "^-A INPUT -p ${_proto}( -m ${_proto})? --dport ${_port} -j ACCEPT$" <<< "${_listing}") || [ "$?" -eq 1 ] || return 1
+            if [ "${_matches}" -le 1 ]; then printf '%s' "${_matches}"; else printf ambiguous; fi ;;
         *) return 1 ;;
     esac
 }
 
-_fw_open_port_backend() {
-    local _backend="$1" _port="$2" _proto="${3:-tcp}"
-    local _rule="${_port}/${_proto}" _permanent _runtime
-    if [ "${_backend}" = firewalld ] && ! _fw_read_managed_rules | grep -Fxq "firewalld:${_rule}"; then
-        _permanent=$(firewall-cmd --permanent --list-ports 2>/dev/null) || return 1
-        _runtime=$(firewall-cmd --list-ports 2>/dev/null) || return 1
-        if [[ " ${_permanent} ${_runtime} " == *" ${_rule} "* ]]; then
-            log_info "防火墙端口已存在（未纳入托管）: ${_rule} (firewalld)"
-            return 0
-        fi
+_fw_nft_remove_empty() {
+    local _object="$1" _listing
+    if [ "${_object}" = chain ]; then
+        _listing=$(nft -nn list chain inet xray2go input 2>/dev/null) || return 1
+        awk 'NF { n++ }
+            /^[[:space:]]*chain input[[:space:]]*\{[[:space:]]*$/ { chain=1 }
+            $0 ~ /^[[:space:]]*type filter hook input priority (filter|0); policy accept;[[:space:]]*$/ { hook=1 }
+            END { exit !(n==5 && chain && hook) }
+        ' <<< "${_listing}" || return 1
+        nft delete chain inet xray2go input 2>/dev/null
+    else
+        _listing=$(nft -nn list table inet xray2go 2>/dev/null) || return 1
+        awk 'NF { n++ } END { exit !(n==2) }' <<< "${_listing}" || return 1
+        nft delete table inet xray2go 2>/dev/null
     fi
-    if _fw_rule_exists "${_backend}" "${_port}" "${_proto}"; then
-        # pre-existing rule is not script-owned; do not mark it as managed
-        log_info "防火墙端口已存在（未纳入托管）: ${_port}/${_proto} (${_backend})"
-        return 0
-    fi
-    case "${_backend}" in
-        nft)
-            _fw_nft_ensure_table 2>/dev/null || return 1
-            nft add rule inet xray2go input "${_proto}" dport "${_port}" accept 2>/dev/null || return 1 ;;
-        ufw)
-            ufw allow "${_port}/${_proto}" >/dev/null 2>&1 || return 1 ;;
-        firewalld)
-            firewall-cmd --permanent --add-port="${_port}/${_proto}" >/dev/null 2>&1 || return 1
-            _fw_mark_rule "${_backend}" "${_port}" "${_proto}" || return 1
-            firewall-cmd --add-port="${_rule}" >/dev/null 2>&1 || return 1 ;;
-        iptables)
-            iptables -I INPUT -p "${_proto}" --dport "${_port}" -j ACCEPT 2>/dev/null || return 1 ;;
+}
+
+_fw_change_backend() {
+    local _backend="$1" _layer="$2" _port="$3" _proto="$4" _before="$5" _target="$6"
+    local _rule="${_port}/${_proto}" _operation _handle _range
+    local -a _flags=()
+    case "${_backend}:${_layer}:${_target}" in
+        nft:table:present) nft add table inet xray2go 2>/dev/null ;;
+        nft:chain:present)
+            nft add chain inet xray2go input '{ type filter hook input priority 0; policy accept; }' 2>/dev/null ;;
+        nft:table:0|nft:chain:0) _fw_nft_remove_empty "${_layer}" ;;
+        nft:rule:0)
+            _handle=${_before#handle:}
+            [[ "${_handle}" =~ ^[0-9]+$ ]] || return 1
+            nft delete rule inet xray2go input handle "${_handle}" 2>/dev/null ;;
+        nft:rule:*) nft add rule inet xray2go input "${_proto}" dport "${_port}" accept 2>/dev/null ;;
+        ufw:*:0) LC_ALL=C ufw --force delete allow "${_rule}" >/dev/null 2>&1 ;;
+        ufw:*:v4|ufw:*:v6)
+            if [ "${_target}" = v4 ]; then _range=0.0.0.0/0; else _range=::/0; fi
+            LC_ALL=C ufw allow proto "${_proto}" from "${_range}" to "${_range}" port "${_port}" >/dev/null 2>&1 ;;
+        ufw:*) LC_ALL=C ufw allow "${_rule}" >/dev/null 2>&1 ;;
+        firewalld:*)
+            [ "${_layer}" != permanent ] || _flags+=(--permanent)
+            if [ "${_target}" = 0 ]; then _operation=remove; else _operation=add; fi
+            firewall-cmd "${_flags[@]}" "--${_operation}-port=${_rule}" >/dev/null 2>&1 ;;
+        iptables:*|ip6tables6:*)
+            if [ "${_target}" = 0 ]; then _operation=-D; else _operation=-I; fi
+            "${_backend%6}" "${_operation}" INPUT -p "${_proto}" --dport "${_port}" -j ACCEPT 2>/dev/null ;;
         *) return 1 ;;
     esac
-    _fw_mark_rule "${_backend}" "${_port}" "${_proto}" || return 1
+}
+
+_fw_state_matches() {
+    case "$2" in
+        present) [[ $1 != 0 && $1 != ambiguous && $1 != blocked && $1 != external ]] ;;
+        *) [ "$1" = "$2" ] ;;
+    esac
+}
+
+_fw_apply_step() {
+    local _backend="$1" _layer="$2" _port="$3" _proto="$4" _before="$5" _target="$6"
+    local _entry _state _step
+    _fw_state_matches "${_before}" "${_target}" && return 0
+    [ "${_before}" != ambiguous ] || return 1
+    _state=$(_fw_rule_state "${_backend}" "${_layer}" "${_port}" "${_proto}") || return 1
+    [ "${_state}" = "${_before}" ] || return 1
+    _step=$((_TXN_FW_SEQUENCE + 1))
+    _entry="${_TXN_DIR}/firewall.${_step}"
+    if ! printf '%s %s %s %s %s %s\n' "$@" > "${_entry}.before"; then
+        _TXN_FW_RECORD_FAILED=1
+        return 1
+    fi
+    _TXN_FW_SEQUENCE=${_step}
+    _fw_change_backend "$@" || return 1
+    if ! _state=$(_fw_rule_state "${_backend}" "${_layer}" "${_port}" "${_proto}") ||
+       ! _fw_state_matches "${_state}" "${_target}" ||
+       ! printf '%s\n' "${_state}" > "${_entry}.after"; then
+        _TXN_FW_RECORD_FAILED=1
+        return 1
+    fi
+}
+
+_fw_restore_removed_rule_record() {
+    local _rule="$1:$2/$3" _slot
+    _slot=$(awk -F '\t' -v p="${_FW_RULES_FILE}" '$2 == 1 && $3 == p { print $1 }' "${_TXN_DIR}/manifest") || return 1
+    [ -n "${_slot}" ] || return 0
+    if grep -Fxq -- "${_rule}" "${_TXN_DIR}/files/${_slot}"; then
+        _fw_mark_rule "$@"
+    else
+        [ "$?" -eq 1 ]
+    fi
+}
+
+_fw_undo_step() {
+    local _entry="$1" _backend _layer _port _proto _before _target _state _after
+    read -r _backend _layer _port _proto _before _target < "${_entry}.before" || return 1
+    # Restore ownership before recreating a formerly managed rule.
+    if [ "${_target}" = 0 ]; then
+        _fw_restore_removed_rule_record "${_backend}" "${_port}" "${_proto}" || return 1
+    fi
+    _state=$(_fw_rule_state "${_backend}" "${_layer}" "${_port}" "${_proto}") || return 1
+    _fw_state_matches "${_state}" "${_before}" && return 0
+    if [ -f "${_entry}.after" ] && [ -s "${_entry}.after" ]; then
+        _after=$(<"${_entry}.after")
+        _fw_state_matches "${_state}" "${_after}" || return 1
+    elif [[ ${_backend}:${_before} == nft:0 ]]; then
+        # A matching nft object may have been created by a concurrent writer.
+        return 1
+    elif ! _fw_state_matches "${_state}" "${_target}"; then
+        # UFW may have removed just one address family before returning failure.
+        [[ ${_backend}:${_before}:${_state}:${_target} == ufw:dual:v[46]:0 ]] || return 1
+    fi
+    _fw_change_backend "${_backend}" "${_layer}" "${_port}" "${_proto}" "${_state}" "${_before}" || return 1
+    _state=$(_fw_rule_state "${_backend}" "${_layer}" "${_port}" "${_proto}") || return 1
+    if [[ ${_before} == handle:* ]]; then
+        [[ ${_state} == handle:* ]]
+    else
+        _fw_state_matches "${_state}" "${_before}"
+    fi
+}
+
+# Uninstall holds its own lock. Give each removal a rollback scope so a retry
+# continues from the rules whose removal and ownership updates both succeeded.
+_fw_run() {
+    if [ -n "${_TXN_DIR}" ]; then "$@"; return $?; fi
+    local _TXN_DIR="" _TXN_FW_ONLY=0 _TXN_FW_SEQUENCE=0 _TXN_FW_RECORD_FAILED=0
+    local _rc=0 _keep_snapshot=0 _traps
+    mkdir -p "${WORK_DIR}" || return 1
+    _TXN_DIR=$(mktemp -d "${WORK_DIR}/.txn_XXXXXX") || return 1
+    _TXN_FW_ONLY=1
+    if ! mkdir "${_TXN_DIR}/files" || ! _transaction_snapshot_file "${_FW_RULES_FILE}" 0; then
+        _transaction_end 1
+        return 1
+    fi
+    _traps=$(trap -p INT TERM)
+    trap '_trap_int' INT TERM
+    "$@" || _rc=$?
+    if [ "${_rc}" -ne 0 ]; then _transaction_rollback || _keep_snapshot=1; fi
+    _transaction_end "${_keep_snapshot}"
+    trap - INT TERM
+    eval "${_traps}"
+    return "${_rc}"
+}
+
+_fw_open_port_backend() { _fw_run _fw_open_port_inner "$@"; }
+
+_fw_open_port_inner() {
+    local _backend="$1" _port="$2" _proto="${3:-tcp}" _state _permanent
+    if [ "${_backend}" = firewalld ]; then
+        _permanent=$(_fw_rule_state firewalld permanent "${_port}" "${_proto}") || return 1
+        _state=$(_fw_rule_state firewalld runtime "${_port}" "${_proto}") || return 1
+        if ! _fw_read_managed_rules | grep -Fxq "firewalld:${_port}/${_proto}" &&
+           { [ "${_permanent}" = 1 ] || [ "${_state}" = 1 ]; }; then
+            log_info "防火墙端口已存在（未纳入托管）: ${_port}/${_proto} (${_backend})"
+            return 0
+        fi
+        _fw_apply_step firewalld permanent "${_port}" "${_proto}" "${_permanent}" present || return 1
+        _fw_apply_step firewalld runtime "${_port}" "${_proto}" "${_state}" present || return 1
+    else
+        _state=$(_fw_rule_state "${_backend}" rule "${_port}" "${_proto}") || return 1
+        if [ "${_state}" = blocked ]; then
+            log_warn "UFW 已有拒绝或限流规则：${_port}/${_proto}"
+            return 1
+        fi
+        if [ "${_state}" != 0 ]; then
+            log_info "防火墙端口已存在（未纳入托管）: ${_port}/${_proto} (${_backend})"
+            return 0
+        fi
+        if [ "${_backend}" = nft ]; then
+            local _layer _exists
+            for _layer in table chain; do
+                _exists=$(_fw_rule_state nft "${_layer}" 0 tcp) || return 1
+                _fw_apply_step nft "${_layer}" 0 tcp "${_exists}" present || return 1
+            done
+        fi
+        _fw_apply_step "${_backend}" rule "${_port}" "${_proto}" "${_state}" present || return 1
+    fi
+    if ! _fw_mark_rule "${_backend}" "${_port}" "${_proto}"; then
+        _TXN_FW_RECORD_FAILED=1
+        return 1
+    fi
     log_ok "防火墙已开放: ${_port}/${_proto} (${_backend})"
 }
 
@@ -2245,52 +2485,30 @@ _fw_open_port() {
 
 _fw_close_port() {
     local _port="$1" _proto="$2" _backend="$3"
-    if ! _fw_remove_rule "${_port}" "${_proto}" "${_backend}" ||
-       ! _fw_unmark_rule "${_backend}" "${_port}" "${_proto}"; then
+    if ! _fw_run _fw_close_port_inner "${_port}" "${_proto}" "${_backend}"; then
         log_warn "防火墙规则待清理: ${_port}/${_proto} (${_backend})"
         return 1
     fi
     log_info "防火墙托管规则已清理: ${_port}/${_proto} (${_backend})"
 }
 
-_fw_remove_rule() {
-    local _port="$1" _proto="$2" _backend="$3" _listing _handle _cmd
-    case "${_backend}" in
-        nft)
-            _listing=$(nft list tables 2>/dev/null) || return 1
-            grep -Fxq 'table inet xray2go' <<< "${_listing}" || return 0
-            _listing=$(nft -a list table inet xray2go 2>/dev/null) || return 1
-            _handle=$(awk -v protocol="${_proto}" -v port="${_port}" '
-                $1 == "chain" { input = ($2 == "input") }
-                input && $1 == protocol && $2 == "dport" && $3 == port &&
-                $4 == "accept" && $(NF-1) == "handle" { print $NF }
-            ' <<< "${_listing}")
-            [ -n "${_handle}" ] || return 0
-            [[ "${_handle}" =~ ^[0-9]+$ ]] || return 1
-            nft delete rule inet xray2go input handle "${_handle}" 2>/dev/null ;;
-        ufw)
-            _listing=$(LC_ALL=C ufw status 2>/dev/null) || return 1
-            if grep -q '^Status: active' <<< "${_listing}" &&
-               ! awk -v rule="${_port}/${_proto}" '$1 == rule && $2 == "ALLOW" && $NF ~ /^(Anywhere|\(v6\))$/ { found=1 } END { exit !found }' <<< "${_listing}"; then
-                return 0
-            fi
-            LC_ALL=C ufw --force delete allow "${_port}/${_proto}" >/dev/null 2>&1 ;;
-        firewalld)
-            _listing=$(firewall-cmd --permanent --list-ports 2>/dev/null) || return 1
-            if [[ " ${_listing} " == *" ${_port}/${_proto} "* ]]; then
-                firewall-cmd --permanent --remove-port="${_port}/${_proto}" >/dev/null 2>&1 || return 1
-            fi
-            _listing=$(firewall-cmd --list-ports 2>/dev/null) || return 1
-            if [[ " ${_listing} " == *" ${_port}/${_proto} "* ]]; then
-                firewall-cmd --remove-port="${_port}/${_proto}" >/dev/null 2>&1 || return 1
-            fi ;;
-        iptables|ip6tables6)
-            _cmd="${_backend%6}"
-            _listing=$("${_cmd}" -S INPUT 2>/dev/null) || return 1
-            grep -Eq -- "^-A INPUT -p ${_proto}( -m ${_proto})? --dport ${_port} -j ACCEPT$" <<< "${_listing}" || return 0
-            "${_cmd}" -D INPUT -p "${_proto}" --dport "${_port}" -j ACCEPT 2>/dev/null ;;
-        *) return 1 ;;
-    esac
+_fw_close_port_inner() {
+    local _port="$1" _proto="$2" _backend="$3" _permanent _state
+    if [ "${_backend}" = firewalld ]; then
+        _permanent=$(_fw_rule_state firewalld permanent "${_port}" "${_proto}") || return 1
+        _state=$(_fw_rule_state firewalld runtime "${_port}" "${_proto}") || return 1
+        _fw_apply_step firewalld permanent "${_port}" "${_proto}" "${_permanent}" 0 || return 1
+        _fw_apply_step firewalld runtime "${_port}" "${_proto}" "${_state}" 0 || return 1
+    else
+        _state=$(_fw_rule_state "${_backend}" rule "${_port}" "${_proto}") || return 1
+        if [[ ${_state} != blocked && ${_state} != external ]]; then
+            _fw_apply_step "${_backend}" rule "${_port}" "${_proto}" "${_state}" 0 || return 1
+        fi
+    fi
+    if ! _fw_unmark_rule "${_backend}" "${_port}" "${_proto}"; then
+        _TXN_FW_RECORD_FAILED=1
+        return 1
+    fi
 }
 
 fw_reconcile() {
@@ -2316,36 +2534,26 @@ fw_reconcile() {
 ${_expected_rules}
 EOF
 
-    if [ -n "${_expected_ports:-}" ]; then
-        printf '%s\n' "${_expected_ports}" > "${_FW_PORTS_FILE}" 2>/dev/null || true
-    else
-        rm -f "${_FW_PORTS_FILE}" 2>/dev/null || _failed=1
+    if [ "${_failed}" -eq 0 ]; then
+        if [ -n "${_expected_ports:-}" ]; then
+            printf '%s\n' "${_expected_ports}" > "${_FW_PORTS_FILE}" 2>/dev/null || _failed=1
+        else
+            rm -f "${_FW_PORTS_FILE}" 2>/dev/null || _failed=1
+        fi
+        [ "${_failed}" -eq 0 ] || _TXN_FW_RECORD_FAILED=1
     fi
     [ "${_failed}" -eq 0 ] || { log_error "部分防火墙规则同步失败"; return 1; }
 }
 
 _fw_restore_managed_snapshot() {
-    local _snapshot="$1" _rule _backend _rp _proto _failed=0
-    [ -f "${_snapshot}" ] || return 1
-    while IFS= read -r _rule; do
-        [ -n "${_rule:-}" ] || continue
-        if ! grep -Fqx "${_rule}" "${_snapshot}" 2>/dev/null; then
-            _backend=${_rule%%:*}
-            _rp=${_rule#*:}; _proto=${_rp#*/}; _rp=${_rp%/*}
-            _fw_close_port "${_rp}" "${_proto}" "${_backend}" || _failed=1
+    local _step _entry _failed=0
+    for ((_step=_TXN_FW_SEQUENCE; _step>0; _step--)); do
+        _entry="${_TXN_DIR}/firewall.${_step}"
+        if ! _fw_undo_step "${_entry}"; then
+            log_warn "无法恢复防火墙变更：${_entry}.before"
+            _failed=1
         fi
-    done <<EOF
-$(_fw_read_managed_rules)
-EOF
-    while IFS= read -r _rule; do
-        [ -n "${_rule:-}" ] || continue
-        _backend=${_rule%%:*}
-        _rp=${_rule#*:}; _proto=${_rp#*/}; _rp=${_rp%/*}
-        if ! _fw_read_managed_rules | grep -Fqx "${_rule}" ||
-           { [ "${_backend}" = firewalld ] && ! _fw_rule_exists "${_backend}" "${_rp}" "${_proto}"; }; then
-            _fw_open_port_backend "${_backend}" "${_rp}" "${_proto}" || _failed=1
-        fi
-    done < "${_snapshot}"
+    done
     [ "${_failed}" -eq 0 ]
 }
 
@@ -2386,21 +2594,45 @@ lifecycle_rollback_sysctl() {
 }
 lifecycle_apply_hosts_patch() {
     is_openrc || return 0
-    [ -f "${_HOSTS_BAK}" ] || cp -f /etc/hosts "${_HOSTS_BAK}" 2>/dev/null || {
-        log_warn "/etc/hosts 备份失败，跳过"; return 0; }
-    log_step "修补 /etc/hosts..."
-    sed -i '1s/.*/127.0.0.1   localhost/' /etc/hosts 2>/dev/null || true
-    sed -i '2s/.*/::1         localhost/'  /etc/hosts 2>/dev/null || true
-    log_ok "/etc/hosts 已修补"
+    [ -f "${_HOSTS_FILE}" ] && [ ! -L "${_HOSTS_FILE}" ] || return 1
+    local _tmp _mapping _rc _added=0
+    _tmp=$(mktemp "${_HOSTS_FILE}.xray2go.XXXXXX") || return 1
+    cp -p "${_HOSTS_FILE}" "${_tmp}" || { rm -f "${_tmp}"; return 1; }
+    for _mapping in '127.0.0.1 localhost' '::1 localhost'; do
+        _rc=0
+        awk -v ip="${_mapping% *}" '
+            { sub(/#.*/, "") }
+            $1 == ip { for (i=2; i<=NF; i++) if (tolower($i) == "localhost") found=1 }
+            END { exit !found }
+        ' "${_tmp}" && continue || _rc=$?
+        [ "${_rc}" -eq 1 ] || { rm -f "${_tmp}"; return 1; }
+        if [ "${_added}" -eq 0 ] && [ -s "${_tmp}" ] && [ -n "$(tail -c 1 "${_tmp}")" ]; then
+            printf '\n' >> "${_tmp}" || { rm -f "${_tmp}"; return 1; }
+        fi
+        printf '%s\n' "${_mapping} # xray2go-managed" >> "${_tmp}" || { rm -f "${_tmp}"; return 1; }
+        _added=1
+    done
+    if [ "${_added}" -eq 0 ]; then rm -f "${_tmp}"; return $?; fi
+    mv -f -- "${_tmp}" "${_HOSTS_FILE}" || { rm -f "${_tmp}"; return 1; }
+    log_ok "hosts 已补齐必要映射"
 }
 lifecycle_rollback_hosts() {
-    [ -f "${_HOSTS_BAK}" ] || return 0
-    cp -f "${_HOSTS_BAK}" /etc/hosts 2>/dev/null || {
-        log_warn "/etc/hosts 恢复失败，请手动恢复: ${_HOSTS_BAK}"
+    if [ -f "${_HOSTS_BAK}" ]; then
+        log_warn "检测到旧版 hosts 备份 ${_HOSTS_BAK}；未覆盖当前 hosts，备份已保留，请人工核对"
+    fi
+    [ -f "${_HOSTS_FILE}" ] && [ ! -L "${_HOSTS_FILE}" ] || return 0
+    local _tmp _rc=0
+    grep -Eq '^(127\.0\.0\.1|::1) localhost # xray2go-managed$' "${_HOSTS_FILE}" || _rc=$?
+    [ "${_rc}" -eq 0 ] || return "$(( _rc != 1 ))"
+    _tmp=$(mktemp "${_HOSTS_FILE}.xray2go.XXXXXX") || return 1
+    cp -p "${_HOSTS_FILE}" "${_tmp}" && awk '
+        $0 == "127.0.0.1 localhost # xray2go-managed" { next }
+        $0 == "::1 localhost # xray2go-managed" { next }
+        { print }
+    ' "${_HOSTS_FILE}" > "${_tmp}" && mv -f -- "${_tmp}" "${_HOSTS_FILE}" || {
+        rm -f "${_tmp}"
         return 1
     }
-    rm -f "${_HOSTS_BAK}" || return 1
-    log_ok "/etc/hosts 已从备份恢复"
 }
 
 # ==============================================================================
@@ -2428,14 +2660,46 @@ svc_exec() {
     return "${_rc}"
 }
 
+svc_status() {
+    local _name="$1" _rc
+    _rc=0
+    svc_exec status "${_name}" >/dev/null 2>&1 || _rc=$?
+    [ "${_rc}" -eq 0 ] && return 0
+    if is_systemd; then
+        { [ "${_rc}" -eq 3 ] || [ "${_rc}" -eq 4 ]; } && return 1
+        return 2
+    fi
+    if is_openrc; then
+        [ "${_rc}" -eq 3 ] && return 1
+        if [ "${_rc}" -eq 1 ] &&
+            [ ! -e "${_SVC_OPENRC_DIR}/${_name}" ] && [ ! -L "${_SVC_OPENRC_DIR}/${_name}" ]; then
+            return 1
+        fi
+    fi
+    if ! is_openrc && [ "${_rc}" -eq 1 ]; then return 1; fi
+    return 2
+}
+
+svc_enabled_status() {
+    local _name="$1" _rc
+    _rc=0
+    svc_is_enabled "${_name}" >/dev/null 2>&1 || _rc=$?
+    [ "${_rc}" -eq 0 ] && return 0
+    if is_systemd && [ "${_rc}" -eq 4 ]; then return 1; fi
+    [ "${_rc}" -eq 1 ] && return 1
+    return 2
+}
+
 svc_is_enabled() {
     local _name="$1"
     if is_systemd; then
         systemctl is-enabled --quiet "${_name}" >/dev/null 2>&1
     elif is_openrc; then
-        rc-update show default 2>/dev/null | awk -v n="${_name}" '$1 == n { found=1 } END { exit(found ? 0 : 1) }'
+        local _runlevel
+        _runlevel=$(rc-update show default 2>/dev/null) || return 2
+        awk -v n="${_name}" '$1 == n { found=1 } END { exit(found ? 0 : 1) }' <<< "${_runlevel}"
     else
-        return 1
+        return 2
     fi
 }
 
@@ -2487,7 +2751,7 @@ svc_reload_xray() {
     local _old_hash=""
     [ -f "${_CONFIG_HASH_FILE}" ] && _old_hash=$(cat "${_CONFIG_HASH_FILE}" 2>/dev/null || true)
 
-    if [ "${_new_hash}" = "${_old_hash}" ] && [ "${_new_hash}" != "unknown" ]; then
+    if [ "${1:-}" != force ] && [ "${_new_hash}" = "${_old_hash}" ] && [ "${_new_hash}" != "unknown" ]; then
         log_info "config.json 未变化，跳过 restart"
         return 0
     fi
@@ -2502,7 +2766,8 @@ svc_reload_xray() {
         _TXN_XRAY_RESTART_ATTEMPTED=1
     fi
     svc_exec_mut restart "${_SVC_XRAY}" || { log_error "xray restart 失败"; return 1; }
-    printf '%s' "${_new_hash}" > "${_CONFIG_HASH_FILE}" 2>/dev/null || true
+    svc_verify_health "${_SVC_XRAY}" 6 || { log_error "xray 重载后未确认运行，未更新配置哈希"; return 1; }
+    printf '%s' "${_new_hash}" > "${_CONFIG_HASH_FILE}" 2>/dev/null || return 1
     log_ok "xray 已重启并加载新配置"
 }
 
@@ -2595,7 +2860,14 @@ svc_restart_xray() {
 
 svc_enable_start_verify() {
     local _svc="$1" _max="${2:-0}" _mode="${3:-required}"
-    svc_exec_mut enable "${_svc}" || true
+    local _enable_rc=0
+    svc_exec_mut enable "${_svc}" || _enable_rc=$?
+    if [ "${_enable_rc}" -ne 0 ] && [ "${_mode}" = "required" ]; then
+        log_error "${_svc} 开机启用失败"
+        return 1
+    elif [ "${_enable_rc}" -ne 0 ]; then
+        log_warn "${_svc} 开机启用失败（可稍后检查）"
+    fi
     if ! svc_exec_mut start  "${_svc}"; then
         if [ "${_mode}" = "optional" ]; then
             log_warn "${_svc} 启动失败（可稍后在对应管理菜单重新检查配置）"
@@ -2724,36 +2996,49 @@ config_synthesize() {
 }
 
 _config_apply_inner() {
-    local _t; _t=$(tmp_file "xray_next_XXXXXX.json") || return 1
+    local _mode="${1:-}" _reload="${2:-}" _t _json _failed_config="${WORK_DIR}/config_failed.json"
+    _ensure_tmp_dir
+    _t=$(tmp_file "xray_next_XXXXXX.json") || return 1
     log_step "合成配置..."
-    config_synthesize > "${_t}" || return 1
+    if [ "${_TXN_ACTIVE:-0}" -eq 1 ]; then
+        _st_track_managed_certificates && _plugin_snapshot_ensure || { rm -f -- "${_t}"; return 1; }
+    fi
+    config_synthesize > "${_t}" || { rm -f -- "${_t}"; return 1; }
 
     if [ -x "${XRAY_BIN}" ]; then
         log_step "验证配置 (xray -test)..."
         if ! "${XRAY_BIN}" -test -c "${_t}" >/dev/null 2>&1; then
-            log_error "config 验证失败！已保留: ${WORK_DIR}/config_failed.json"
-            mv "${_t}" "${WORK_DIR}/config_failed.json" 2>/dev/null || true
+            if chmod 600 "${_t}" && mv -fT -- "${_t}" "${_failed_config}"; then
+                log_error "config 验证失败！已保留: ${_failed_config}"
+            else
+                log_error "config 验证失败，config_failed.json 保存失败: ${_failed_config}"
+                rm -f -- "${_t}"
+            fi
             return 1
         fi
         log_ok "config 验证通过"
-        rm -f "${WORK_DIR}/config_failed.json" 2>/dev/null || true
+    elif [ "${_mode}" = tls ]; then
+        log_error "xray 未就绪，无法验证换证后的配置"
+        rm -f -- "${_t}"
+        return 1
     else
         log_warn "xray 未就绪，跳过预检（安装阶段正常）"
     fi
 
-    local _json; _json=$(cat "${_t}")
+    _json=$(cat "${_t}") || { rm -f -- "${_t}"; return 1; }
     atomic_write_with_backup "${CONFIG_FILE}" "${_json}" 2 || {
+        rm -f -- "${_t}"
         log_error "config 写入失败"; return 1; }
     rm -f "${_t}" 2>/dev/null || true
     log_ok "config.json 已原子更新"
 
-    # 服务运行中才执行重启加载
-    if svc_exec status "${_SVC_XRAY}" >/dev/null 2>&1; then
-        svc_reload_xray || return 1
+    # 管理菜单换证可强制加载新 TLS 材料，其他配置更新仍仅重启运行中的服务。
+    if [ "${_reload}" = force ] || svc_exec status "${_SVC_XRAY}" >/dev/null 2>&1; then
+        svc_reload_xray "${_reload}" || return 1
     fi
 }
 
-config_apply() { with_lock _config_apply_inner; }
+config_apply() { with_lock _config_apply_inner "$@"; }
 
 config_print_nodes() {
     local _links
@@ -2776,7 +3061,6 @@ _transaction_collect_artifacts() {
     _TXN_ARTIFACT_PATHS=(
         "${CONFIG_FILE}"
         "${STATE_FILE}"
-        "${WORK_DIR}/config_failed.json"
         "${_CONFIG_HASH_FILE}"
         "${_FW_PORTS_FILE}"
         "${_FW_RULES_FILE}"
@@ -2800,15 +3084,14 @@ _transaction_collect_artifacts() {
 }
 
 _transaction_lock_acquire() {
-    mkdir -p "${WORK_DIR}" 2>/dev/null || return 1
-    if command -v flock >/dev/null 2>&1; then
-        exec {_TXN_LOCK_FD}>"${_LOCK_FILE}" || return 1
-        flock -x "${_TXN_LOCK_FD}" || {
-            eval "exec ${_TXN_LOCK_FD}>&-" 2>/dev/null || true
-            _TXN_LOCK_FD=""
-            return 1
-        }
-    fi
+    command -v flock >/dev/null 2>&1 || return 1
+    mkdir -p "$(dirname "${_LOCK_FILE}")" || return 1
+    exec {_TXN_LOCK_FD}>"${_LOCK_FILE}" || return 1
+    flock -x "${_TXN_LOCK_FD}" || {
+        eval "exec ${_TXN_LOCK_FD}>&-" 2>/dev/null || true
+        _TXN_LOCK_FD=""
+        return 1
+    }
 }
 
 _transaction_lock_release() {
@@ -2858,6 +3141,7 @@ _transaction_begin() {
     else
         _st_refresh_transaction_state || { _transaction_lock_release; return 1; }
     fi
+    mkdir -p "${WORK_DIR}" || { _transaction_lock_release; return 1; }
     _TXN_DIR=$(mktemp -d "${WORK_DIR}/.txn_XXXXXX") || {
         _transaction_lock_release
         log_error "创建事务快照目录失败"
@@ -2873,24 +3157,28 @@ _transaction_begin() {
         log_error "创建事务文件快照失败"
         return 1
     }
-    _TXN_PRE_FW_FILE="${_TXN_DIR}/firewall.rules"
-    _fw_read_managed_rules > "${_TXN_PRE_FW_FILE}" 2>/dev/null || :
+    _TXN_FW_SEQUENCE=0
+    _TXN_FW_RECORD_FAILED=0
     _TXN_PRE_XRAY_ACTIVE=0
     _TXN_XRAY_RESTART_ATTEMPTED=0
     _TXN_PRE_TUNNEL_ACTIVE=0
     _TXN_TUNNEL_RESTART_ATTEMPTED=0
     _TXN_PRE_XRAY_ENABLED=0
     _TXN_PRE_TUNNEL_ENABLED=0
-    svc_exec status "${_SVC_XRAY}" >/dev/null 2>&1 && _TXN_PRE_XRAY_ACTIVE=1 || true
-    svc_exec status "${_SVC_TUNNEL}" >/dev/null 2>&1 && _TXN_PRE_TUNNEL_ACTIVE=1 || true
-    svc_is_enabled "${_SVC_XRAY}" >/dev/null 2>&1 && _TXN_PRE_XRAY_ENABLED=1 || true
-    svc_is_enabled "${_SVC_TUNNEL}" >/dev/null 2>&1 && _TXN_PRE_TUNNEL_ENABLED=1 || true
+    _TXN_PRE_XRAY_ACTIVE=$(_transaction_service_snapshot svc_status "${_SVC_XRAY}")
+    _TXN_PRE_TUNNEL_ACTIVE=$(_transaction_service_snapshot svc_status "${_SVC_TUNNEL}")
+    _TXN_PRE_XRAY_ENABLED=$(_transaction_service_snapshot svc_enabled_status "${_SVC_XRAY}")
+    _TXN_PRE_TUNNEL_ENABLED=$(_transaction_service_snapshot svc_enabled_status "${_SVC_TUNNEL}")
     _TXN_ACTIVE=1
 }
 
 _transaction_restore_files() {
     local _restore_fw="$1" _p _i _exists
-    _transaction_collect_artifacts
+    if [ "${_TXN_FW_ONLY:-0}" -eq 1 ]; then
+        local -a _TXN_ARTIFACT_PATHS=("${_FW_RULES_FILE}")
+    else
+        _transaction_collect_artifacts
+    fi
     for _p in "${_TXN_ARTIFACT_PATHS[@]}"; do
         [ "${_p}" != "${_FW_RULES_FILE}" ] || [ "${_restore_fw}" -eq 1 ] || continue
         if ! awk -F '\t' -v p="${_p}" '$2 == 1 && $3 == p { found=1 } END { exit(found ? 0 : 1) }' \
@@ -2908,10 +3196,20 @@ _transaction_restore_files() {
     done < "${_TXN_DIR}/manifest"
 }
 
+_transaction_service_snapshot() {
+    local _query="$1" _name="$2" _rc=0
+    "${_query}" "${_name}" || _rc=$?
+    case "${_rc}" in 0) printf 1 ;; 1) printf 0 ;; *) printf 2 ;; esac
+}
+
 _transaction_restore_service() {
-    local _name="$1" _was_active="$2" _was_enabled="$3" _reload="${4:-0}" _is_active=0 _is_enabled=0
-    svc_exec status "${_name}" >/dev/null 2>&1 && _is_active=1 || true
-    svc_is_enabled "${_name}" >/dev/null 2>&1 && _is_enabled=1 || true
+    local _name="$1" _was_active="$2" _was_enabled="$3" _reload="${4:-0}" _is_active _is_enabled
+    _is_active=$(_transaction_service_snapshot svc_status "${_name}")
+    _is_enabled=$(_transaction_service_snapshot svc_enabled_status "${_name}")
+    if [[ ${_was_active}${_was_enabled}${_is_active}${_is_enabled} == *2* ]]; then
+        log_warn "${_name} 服务状态未知，无法确认已恢复"
+        return 1
+    fi
     if [ "${_was_enabled}" = 1 ] && [ "${_is_enabled}" = 0 ]; then
         svc_exec_mut enable "${_name}" >/dev/null 2>&1 || return 1
     elif [ "${_was_enabled}" = 0 ] && [ "${_is_enabled}" = 1 ]; then
@@ -2930,10 +3228,14 @@ _transaction_restore_service() {
 
 _transaction_rollback() {
     local _failed=0 _restored_state _reload=0 _restore_fw=0
-    if _fw_restore_managed_snapshot "${_TXN_PRE_FW_FILE}"; then
+    if _fw_restore_managed_snapshot; then
         _restore_fw=1
     else
         _failed=1
+    fi
+    if [ "${_TXN_FW_ONLY:-0}" -eq 1 ]; then
+        [ "${_restore_fw}" -eq 1 ] && _transaction_restore_files 1
+        return $?
     fi
     if [ "${_install_hosts_pending:-0}" -eq 1 ]; then lifecycle_rollback_hosts || _failed=1; fi
     if _transaction_restore_files "${_restore_fw}"; then
@@ -2969,13 +3271,17 @@ _transaction_end() {
     _TXN_ACTIVE=0
     if [ "${_keep_snapshot}" -eq 1 ]; then
         log_error "事务回滚未完全成功，快照保留于：${_TXN_DIR}"
+    elif [ "${_TXN_FW_RECORD_FAILED}" -eq 1 ]; then
+        log_error "防火墙变更记录失败，事务快照保留于：${_TXN_DIR}"
     elif ! rm -rf -- "${_TXN_DIR}"; then
         log_warn "事务快照清理失败：${_TXN_DIR}"
     fi
+    if [ "${_TXN_FW_ONLY:-0}" -eq 1 ]; then _TXN_DIR=""; return 0; fi
     _transaction_lock_release
     _TXN_DIR=""
     _TXN_PRE_STATE=""
-    _TXN_PRE_FW_FILE=""
+    _TXN_FW_SEQUENCE=0
+    _TXN_FW_RECORD_FAILED=0
     _TXN_ARTIFACT_PATHS=()
 }
 
@@ -2986,6 +3292,7 @@ _transaction_run() {
         "$@"
         return $?
     fi
+    local _PLUGIN_SNAPSHOT_STAMP="" _PLUGIN_SNAPSHOT_PORTS="" _PLUGIN_SNAPSHOT_INBOUNDS=""
     _transaction_begin || return 1
     "$@" || _rc=$?
     if [ "${_rc}" -ne 0 ]; then
@@ -3666,15 +3973,22 @@ module_argo_enable() {
 }
 
 _svc_stop_and_disable() {
-    local _service="$1"
-    svc_exec_mut stop "${_service}" 2>/dev/null || true
-    svc_exec_mut disable "${_service}" 2>/dev/null || true
-    if svc_exec status "${_service}" >/dev/null 2>&1 || svc_is_enabled "${_service}" >/dev/null 2>&1; then
-        log_error "${_service} 仍在运行或设为开机启动"
+    local _service="$1" _status
+    _status=0
+    svc_status "${_service}" || _status=$?
+    if [ "${_status}" -eq 2 ]; then
+        log_error "${_service} 状态查询失败，拒绝卸载"
         return 1
     fi
+    svc_exec_mut stop "${_service}" 2>/dev/null || true
+    svc_exec_mut disable "${_service}" 2>/dev/null || true
+    _status=0
+    svc_status "${_service}" || _status=$?
+    [ "${_status}" -eq 1 ] || { log_error "${_service} 停止状态无法确认"; return 1; }
+    _status=0
+    svc_enabled_status "${_service}" || _status=$?
+    [ "${_status}" -eq 1 ] || { log_error "${_service} 开机状态无法确认已禁用"; return 1; }
 }
-
 module_argo_disable_inner() {
     _svc_stop_and_disable "${_SVC_TUNNEL}" || return 1
     st_set '.argo.enabled = false' || return 1
@@ -3866,10 +4180,37 @@ module_vlquic_update_cert() {
     fi
 }
 
+_module_tls_cert_fingerprint() {
+    local _module="$1" _field _file
+    if [ "${_module}" = cforigin ] && [ "$(st_get '.cforigin.origin_tls')" != true ]; then
+        return 0
+    fi
+    for _field in cert key; do
+        _file=$(st_get '.[$inbound_id][$field]' --arg inbound_id "${_module}" --arg field "${_field}") || return 1
+        if [ -f "${_file}" ]; then
+            sha256sum < "${_file}" || { log_error "${_module} 证书或私钥内容无法读取"; return 1; }
+        else
+            printf 'missing\n'
+        fi
+    done
+}
+
+_module_tls_apply_config() {
+    local _module="$1" _old_fingerprint="$2" _new_fingerprint _reload=""
+    _new_fingerprint=$(_module_tls_cert_fingerprint "${_module}") || return 1
+    [ "${_new_fingerprint}" = "${_old_fingerprint}" ] || _reload=force
+    config_apply tls "${_reload}"
+}
+
 _module_vlquic_save_cert() {
+    local _old_fingerprint="" _enabled
+    _enabled=$(st_get '.vlquic.enabled')
+    if [ "${_enabled}" = true ]; then
+        _old_fingerprint=$(_module_tls_cert_fingerprint vlquic) || return 1
+    fi
     vlquic_config_cert && _vlquic_apply_cert || return 1
-    if [ "$(st_get '.vlquic.enabled')" = true ]; then
-        _commit_inner
+    if [ "${_enabled}" = true ]; then
+        _module_tls_apply_config vlquic "${_old_fingerprint}" && _commit_state_and_firewall
     else
         st_persist
     fi
@@ -3898,13 +4239,19 @@ _cforigin_read_cert_draft() {
 }
 
 _module_cforigin_save_cert() {
+    local _old_fingerprint="" _enabled
+    _enabled=$(st_get '.cforigin.enabled')
+    if [ "${_enabled}" = true ]; then
+        _old_fingerprint=$(_module_tls_cert_fingerprint cforigin) || return 1
+    fi
     st_set '.cforigin += $draft' --argjson draft "$1" || return 1
     if [ "${#_CFORIGIN_ISSUE[@]}" -gt 0 ]; then
         "${_CFORIGIN_ISSUE[@]}" || return 1
     fi
-    _cforigin_check_origin_tls "$(st_get '.cforigin.domain')" || return 1
-    if [ "$(st_get '.cforigin.enabled')" = true ]; then
-        _cforigin_check_ready && config_apply || return 1
+    if [ "${_enabled}" = true ]; then
+        _cforigin_check_ready && _module_tls_apply_config cforigin "${_old_fingerprint}" || return 1
+    else
+        _cforigin_check_origin_tls "$(st_get '.cforigin.domain')" || return 1
     fi
     st_persist || { log_error "state.json 写入失败"; return 1; }
 }
@@ -5005,6 +5352,7 @@ _uninstall_managed_files() {
 
 _module_xray_uninstall_locked() {
     local _s _service_failed=0
+    mkdir -p "${WORK_DIR}" || return 1
     : > "${_UNINSTALL_PENDING}" || return 1
     log_step "卸载中..."
     for _s in "${_SVC_XRAY}" "${_SVC_TUNNEL}"; do
@@ -5024,7 +5372,7 @@ _module_xray_uninstall_locked() {
         "${CONFIG_FILE}" "${CONFIG_FILE}".*.bak "${WORK_DIR}/config_failed.json" \
         "${STATE_FILE}" "${STATE_FILE}".*.bak "${_CONFIG_HASH_FILE}" \
         "${_ARGO_ENV_FILE}" "${_ACME_ENV_FILE}" "${WORK_DIR}/tunnel.yml" "${WORK_DIR}/tunnel.json" \
-        "${XRAY_BIN}" "${ARGO_BIN}" "${_SVC_LOCK_FILE}" "${WORK_DIR}/.lock" || return 1
+        "${XRAY_BIN}" "${ARGO_BIN}" || return 1
     _svc_remove_units "${_SVC_XRAY}" "${_SVC_TUNNEL}" || return 1
     lifecycle_rollback_sysctl || return 1
     lifecycle_rollback_hosts || return 1
@@ -5047,6 +5395,7 @@ _install_main_script() {
     command -v flock >/dev/null 2>&1 || { log_error "更新需要 flock，以保护并发操作"; return 1; }
     exec 9>"${_LOCK_FILE}" || return 1
     flock -x 9 || { log_error "获取文件锁失败"; return 1; }
+    [ ! -e "${_UNINSTALL_PENDING}" ] || { log_error "卸载待继续，拒绝脚本更新"; return 1; }
     _bin_dir=$(dirname "${SELF_DEST}")
     mkdir -p -- "${_bin_dir}" || { log_error "无法创建脚本安装目录"; return 1; }
 
@@ -6627,7 +6976,7 @@ _xhttp_validate_profile() {
         def download:
             require("split.download"; only(["address","port","network","security","tlsSettings","xhttpSettings","sockopt"])) |
             require("split.download.address"; (.address // "") | type == "string" and test("^[a-zA-Z0-9_.:\\[\\]-]*$")) |
-            require("split.download.port"; (.port // 1) | port) |
+            require("split.download.port"; .port == null or (.port | port)) |
             require("split.download.network"; (.network // "xhttp") == "xhttp") |
             require("split.download.security"; (.security // "tls") == "tls") |
             require("split.download.tlsSettings"; (.tlsSettings // {}) | type == "object" and (has("certificates") | not)) |
@@ -6659,9 +7008,16 @@ _xhttp_validate_profile() {
 }
 
 _xhttp_store_profile() {
-    local _module="$1" _profile="$2"
+    local _module="$1" _profile="$2" _old_split
     if [ "${_module}" = argo ]; then
         _argo_xhttp_check_profile_split "${_profile}" || return 1
+        if jq -e '(.split | type) == "object" and .split.mode == null' <<< "${_profile}" >/dev/null; then
+            _old_split=$(st_get '.argo.xhttp.split') || return 1
+            _old_split=${_old_split:-null}
+            _profile=$(jq -c --argjson old "${_old_split}" '
+                .split.mode = (if ($old | type) == "object" then ($old.mode // "packet-up") else "stream-up" end)
+            ' <<< "${_profile}") || return 1
+        fi
     fi
     st_set '.[$inbound_id].xhttp = $profile' --arg inbound_id "${_module}" --argjson profile "${_profile}"
 }
@@ -6748,6 +7104,27 @@ _argo_xhttp_export_json() {
     _address="${_address#[}"
     [ -n "${_address%]}" ] || return 1
     _xhttp_export_vless_outbound "${_address%]}" "${_port}" "${_stream}"
+}
+
+_argo_xhttp_mihomo_warn_differences() {
+    local _outbound _warnings
+    _outbound=$(_argo_xhttp_export_json split) || return 1
+    _warnings=$(jq -r '
+        .streamSettings as $stream |
+        $stream.xhttpSettings.extra.downloadSettings as $down |
+        [if $down.xhttpSettings.extra.xPaddingBytes != null and
+             $down.xhttpSettings.extra.xPaddingBytes != $stream.xhttpSettings.extra.xPaddingBytes
+         then "Mihomo 下行没有独立 Padding，会继承上行值" else empty end,
+         if ([$down | .. | objects | select(has("sockopt"))] | length) > 0 then
+             "Mihomo 下行没有独立 sockopt，拨号设置由上下行共享"
+         else empty end,
+         if ($down.xhttpSettings.extra.xmux | type) == "object" and
+            ($stream.xhttpSettings.extra.xmux | type) != "object"
+         then "Mihomo 1.19.34 下行复用设置需要上行同时提供 reuse-settings 才会启用管理器"
+         else empty end] | .[]
+    ' <<< "${_outbound}") || return 1
+    [ -n "${_warnings}" ] || return 0
+    while IFS= read -r _warning; do [ -z "${_warning}" ] || log_warn "${_warning}"; done <<< "${_warnings}"
 }
 
 _argo_xhttp_export_mihomo() {
@@ -6934,6 +7311,7 @@ _argo_xhttp_export_menu() {
                 2) _argo_xhttp_export_json "${_kind}" || log_warn "无法生成 ${_label} 出站 JSON"; _pause; break ;;
                 3)
                     if [ "$_kind" != split ]; then log_error "无效选项，请按提示输入"; continue; fi
+                    _argo_xhttp_mihomo_warn_differences || log_warn "无法检查 Mihomo 下行覆盖差异"
                     _argo_xhttp_export_mihomo || log_warn "无法生成 ${_label} Mihomo 配置"
                     _pause
                     break
@@ -6956,7 +7334,7 @@ _argo_xhttp_menu() {
         _menu_print_action 1 "使用 Xray 默认参数（auto，清空 Extra 和分离）"
         _menu_print_action 2 "高级 Extra 与下行覆盖（单行 JSON）"
         _menu_print_action 3 "启用分离或修改 REALITY 上行端口"
-        _menu_print_action 4 "导出分享链接或客户端出站 JSON"
+        _menu_print_action 4 "导出客户端配置"
         _menu_print_action 5 "恢复旧版 xPadding 配置"
         _menu_print_action 6 "关闭分离，保留 Extra"
         _menu_print_action 7 "逐项编辑常用参数"
@@ -7896,11 +8274,32 @@ main() {
         return
     fi
     check_root
+    if [ -e "${_UNINSTALL_PENDING}" ]; then
+        [ "${_CLI_ACTION}" = menu ] || { log_error "卸载未完成，请从主菜单按 u 继续"; return 1; }
+        local _pending_choice
+        printf '检测到未完成卸载。按 u 继续卸载，按 0 退出: '
+        IFS= read -r _pending_choice || return 1
+        case "${_pending_choice}" in
+            u|U) platform_detect_init; module_xray_uninstall; return $? ;;
+            0) return 0 ;;
+            *) log_error "无效选项"; return 1 ;;
+        esac
+    fi
     platform_detect_init
-    platform_preflight || return 1
-    st_init || return 1
-    # 刷新内置插件并重建注册表
-    plugin_refresh_runtime || return 1
+    _transaction_lock_acquire || { log_error "启动初始化需要可用的部署写锁"; return 1; }
+    local _startup_rc=0
+    if [ -e "${_UNINSTALL_PENDING}" ]; then
+        _transaction_lock_release
+        log_error "卸载未完成，请重新运行脚本并按 u 继续"
+        return 1
+    fi
+    if platform_preflight && st_init && plugin_refresh_runtime; then
+        :
+    else
+        _startup_rc=$?
+    fi
+    _transaction_lock_release
+    [ "${_startup_rc}" -eq 0 ] || return "${_startup_rc}"
     cli_dispatch
 }
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then

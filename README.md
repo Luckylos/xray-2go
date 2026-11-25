@@ -123,7 +123,7 @@ sudo ./xray_2go.sh
 
 ### Argo XHTTP 配置
 
-在 Argo 菜单选择 VLESS + XHTTP，再按 `x`。配置页会显示当前模式、Padding、XMUX 和分离状态。按 `7` 可逐项设置常用参数，输入 `-` 清除对应覆盖。按 `4` 先选普通或分离节点，再选分享链接或客户端出站 JSON。
+在 Argo 菜单选择 VLESS + XHTTP，再按 `x`。配置页会显示当前模式、Padding、XMUX 和分离状态。按 `7` 可逐项设置常用参数，输入 `-` 清除对应覆盖。按 `4` 先选普通或分离节点，再选分享链接、Xray 出站 JSON 或分离节点的 Mihomo provider。
 
 分离节点的上行使用 **XHTTP + REALITY**，直连服务器的独立公网 TCP 端口。下行使用 **XHTTP + TLS**，通过 Cloudflare CDN 和 Tunnel 回源。两条链路汇入同一个本机 `/argo` 入站。启用分离时，请为 REALITY 上行选一个可从公网访问的 TCP 端口，并在云平台安全组放行。
 
@@ -136,13 +136,13 @@ sudo ./xray_2go.sh
   "client": { "scMinPostsIntervalMs": 30, "xmux": { "maxConcurrency": "16-32" } },
   "split": {
     "port": 28443,
-    "mode": "packet-up",
+    "mode": "stream-up",
     "download": { "xhttpSettings": { "extra": { "xmux": { "maxConnections": 2 } } } }
   }
 }
 ```
 
-上行自动使用本机公网地址、`split.port` 和 Reality 的 SNI、公钥及 Short ID。下行默认使用 Argo 的 CDN 地址、端口和域名，域名同时用作 TLS SNI 和 HTTP Host。`split.download` 可覆盖 CDN 地址、端口、路径、Host 和 TLS 参数。覆盖路径时，转发后的请求仍需进入同一个 `/argo` 入站。分离默认使用 `packet-up`，也可在上行选择 `stream-up`。
+上行自动使用本机公网地址、`split.port` 和 Reality 的 SNI、公钥及 Short ID。下行默认使用 Argo 的 CDN 地址、端口和域名，域名同时用作 TLS SNI 和 HTTP Host。`split.download` 可覆盖 CDN 地址、端口、路径、Host 和 TLS 参数。覆盖路径时，转发后的请求仍需进入同一个 `/argo` 入站。新建分离配置默认保存 `stream-up`，也可显式选择 `packet-up`。历史分离配置省略模式时仍使用 `packet-up`，已有显式模式继续生效。
 
 升级后请重新导出并替换已导入的分离节点。旧版下行安全层会自动切换为 TLS。如果曾在 `split.download` 中手工指定 REALITY 直连地址或端口，请清除这些覆盖，或改为实际的 CDN 参数。
 
@@ -152,7 +152,7 @@ Argo 工作台的 `h` 探测域名根路径，HTTP 请求上限为 15 秒。菜�
 
 重新导出的直连 Reality TCP Vision 和 XHTTP 链接包含 `&support-x25519mlkem768=true`。Mihomo v1.19.34 和支持该参数的 MiSub 内置转换器会将它写为 `reality-opts.support-x25519mlkem768: true`。请重新导出并替换订阅源里的旧链接，再刷新客户端订阅。
 
-Argo XHTTP 分离节点可在 Argo 工作台按 `7` → `4` → `2` → `3` 导出 Mihomo 代理提供者配置。将输出保存为 JSON 文件，作为本地 `proxy-provider` 使用，也可把其中的节点加入现有 Mihomo 配置的 `proxies` 列表。配置在上行 `reality-opts` 下启用 ML-KEM 兼容开关，并在 `xhttp-opts.download-settings` 中显式清除下行继承的 REALITY 公钥。
+从主菜单按 `2` → `x` → `4` → `2` → `3` 可导出 Argo 分离节点的 Mihomo 代理提供者配置。将输出保存为 JSON 文件，作为本地 `proxy-provider` 使用，也可把其中的节点加入现有 Mihomo 配置的 `proxies` 列表。配置在上行 `reality-opts` 下启用 ML-KEM 兼容开关，并在 `xhttp-opts.download-settings` 中显式清除下行继承的 REALITY 公钥。菜单会提示 Mihomo 无法等效表示的下行覆盖。Mihomo 1.19.34 的下行 Padding 继承上行，拨号设置由两路共享。
 
 ### Reality XHTTP 配置
 

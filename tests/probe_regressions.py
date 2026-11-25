@@ -27,10 +27,13 @@ def assert_true(cond, msg):
 
 def run_bash(script: str, timeout: int = 20) -> str:
     with XraySandbox() as sandbox:
+        env = sandbox.environment()
+        env.pop("BASH_ENV", None)
+        assert env["X2G_TEST_ROOT"] == str(sandbox.root)
         cp = subprocess.run(
-            ["bash", "-lc", script],
+            ["bash", "--noprofile", "--norc", "-c", script],
             cwd=ROOT,
-            env=sandbox.environment(),
+            env=env,
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -42,16 +45,144 @@ def run_bash(script: str, timeout: int = 20) -> str:
 
 def run_bash_result(script: str) -> subprocess.CompletedProcess[str]:
     with XraySandbox() as sandbox:
+        env = sandbox.environment()
+        env.pop("BASH_ENV", None)
+        assert env["X2G_TEST_ROOT"] == str(sandbox.root)
         return subprocess.run(
-            ["bash", "-lc", script],
+            ["bash", "--noprofile", "--norc", "-c", script],
             cwd=ROOT,
-            env=sandbox.environment(),
+            env=env,
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             timeout=20,
             check=False,
         )
+
+
+def test_lifecycle_lock_service_and_pending_guards():
+    run_bash(r'''
+        source ./xray_2go.sh
+        set -e
+        mkdir -p "$WORK_DIR"
+        command() {
+            if [[ $1 == -v && $2 == flock ]]; then return 1; fi
+            builtin command "$@"
+        }
+        if _transaction_lock_acquire; then exit 41; fi
+        with_lock touch "$WORK_DIR/must-not-write" && exit 42
+        [[ ! -e $WORK_DIR/must-not-write ]]
+    ''')
+    run_bash(r'''
+        source ./xray_2go.sh
+        set -e
+        is_systemd() { return 0; }
+        systemctl() { return 126; }
+        if _svc_stop_and_disable xray2go; then exit 43; fi
+        svc_exec_mut() { [[ $1 != enable ]]; }
+        svc_verify_health() { return 0; }
+        if svc_enable_start_verify xray2go 2 required; then exit 44; fi
+        svc_exec() { return "$query_rc"; }
+        query_rc=3; if svc_status xray2go; then exit 45; else [[ $? == 1 ]] || exit 46; fi
+        query_rc=4; if svc_status xray2go; then exit 47; else [[ $? == 1 ]] || exit 48; fi
+        query_rc=1; if svc_status xray2go; then exit 49; else [[ $? == 2 ]] || exit 50; fi
+    ''')
+    run_bash(r'''
+        source ./xray_2go.sh
+        set -e
+        mkdir -p "$WORK_DIR"
+        : > "$_UNINSTALL_PENDING"
+        check_root() { :; }
+        platform_detect_init() { touch "$WORK_DIR/bad-platform-init"; }
+        platform_preflight() { touch "$WORK_DIR/bad-preflight"; }
+        plugin_refresh_runtime() { touch "$WORK_DIR/bad-plugin-refresh"; }
+        cli_dispatch() { :; }
+        printf '0\n' | main
+        [[ ! -e $STATE_FILE && ! -e $WORK_DIR/bad-platform-init &&
+            ! -e $WORK_DIR/bad-preflight && ! -e $WORK_DIR/bad-plugin-refresh &&
+            -e $_UNINSTALL_PENDING ]]
+    ''')
+
+
+def test_uninstall_restarts_after_state_removed_and_blocks_update():
+    stubs = r'''
+        source ./xray_2go.sh
+        set -e
+        check_root() { :; }
+        platform_detect_init() { detected=1; }
+        _svc_stop_and_disable() { :; }
+        fw_force_cleanup() { :; }
+        lifecycle_rollback_sysctl() { :; }
+        lifecycle_rollback_hosts() { :; }
+        prompt() { printf -v "$2" y; }
+    '''
+    stages = (
+        r'''mkdir -p "$WORK_DIR" "$(dirname "$SELF_DEST")"
+        printf '{}' > "$STATE_FILE"
+        touch "$SELF_DEST"
+        _svc_remove_units() { return 1; }
+        if module_xray_uninstall; then exit 41; fi
+        [[ -e $_UNINSTALL_PENDING && ! -e $STATE_FILE && -e $SELF_DEST ]]
+        ''',
+        r'''platform_preflight() { touch "$WORK_DIR/unexpected-preflight"; }
+        plugin_refresh_runtime() { touch "$WORK_DIR/unexpected-plugins"; }
+        main <<< 0
+        if (_install_main_script); then exit 42; fi
+        [[ -e $_UNINSTALL_PENDING && ! -e $STATE_FILE && ! -e $PLUGIN_DIR &&
+            ! -e $WORK_DIR/unexpected-preflight && ! -e $WORK_DIR/unexpected-plugins ]]
+        ''',
+        r'''_svc_remove_units() { [[ ${detected:-} == 1 ]]; }
+        main <<< u
+        [[ ! -e $_UNINSTALL_PENDING && ! -e $STATE_FILE && ! -e $SELF_DEST ]]
+        ''',
+    )
+    with XraySandbox() as sandbox:
+        for stage in stages:
+            result = subprocess.run(
+                ['bash', '-lc', stubs + stage], cwd=ROOT, env=sandbox.environment(),
+                capture_output=True, text=True, timeout=15, check=False,
+            )
+            assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_openrc_hosts_patch_only_adds_and_removes_exact_marked_entries():
+    run_bash(r'''
+        source ./xray_2go.sh
+        set -e
+        mkdir -p "$WORK_DIR" "$(dirname "$_HOSTS_FILE")"
+        printf '127.0.0.1 localhost\n192.0.2.8 fixture\n' > "$_HOSTS_FILE"
+        is_openrc() { return 0; }
+        lifecycle_apply_hosts_patch
+        [[ $(grep -c 'xray2go-managed' "$_HOSTS_FILE") == 1 ]]
+        [[ ! -e $_HOSTS_BAK ]]
+        grep -Fqx '::1 localhost # xray2go-managed' "$_HOSTS_FILE"
+        grep -Fqx '192.0.2.8 fixture' "$_HOSTS_FILE"
+        printf '127.0.0.1 localhost # xray2go-managed custom-change\n' >> "$_HOSTS_FILE"
+        lifecycle_rollback_hosts
+        grep -Fqx '127.0.0.1 localhost # xray2go-managed custom-change' "$_HOSTS_FILE"
+        ! grep -Fqx '::1 localhost # xray2go-managed' "$_HOSTS_FILE"
+        printf 'legacy fixture
+' > "$_HOSTS_BAK"
+        lifecycle_rollback_hosts
+        grep -Fqx 'legacy fixture' "$_HOSTS_BAK"
+        grep -Fqx '192.0.2.8 fixture' "$_HOSTS_FILE"
+    ''')
+
+
+def test_config_hash_is_written_only_after_confirmed_service_health():
+    run_bash(r'''
+        source ./xray_2go.sh
+        set -e
+        mkdir -p "$WORK_DIR"
+        printf 'fixture config\n' > "$CONFIG_FILE"
+        is_systemd() { return 0; }
+        svc_apply_xray() { :; }
+        svc_reload_daemon() { :; }
+        svc_exec_mut() { [[ $1 == restart ]]; }
+        svc_verify_health() { return 1; }
+        if svc_reload_xray; then exit 1; fi
+        [[ ! -e $_CONFIG_HASH_FILE ]]
+    ''')
 
 
 def test_runtime_script_update_installs_and_runs_main_branch():
@@ -382,6 +513,8 @@ def test_uninstall_only_removes_managed_shortcut():
         mkdir -p "$(dirname "${SHORTCUT}")"
         prompt() { printf -v "$2" 'y'; }
         svc_exec_mut() { :; }
+        svc_status() { return 1; }
+        svc_enabled_status() { return 1; }
         fw_force_cleanup() { :; }
         rm() {
             local _arg _safe=()
@@ -691,12 +824,6 @@ def test_install_port_conflict_uses_plugin_rules_and_udp():
     assert_true('port_mgr_in_use_udp' in TEXT, "install port check must cover UDP")
 
 
-def test_firewall_does_not_mark_preexisting_rules_as_managed():
-    assert_true('_fw_select_backend()' in TEXT, "firewall backend selector missing")
-    assert_true('if _fw_rule_exists "${_backend}" "${_port}" "${_proto}"; then' in TEXT, "pre-existing firewall rules should be detected")
-    assert_true('pre-existing rule is not script-owned; do not mark it as managed' in TEXT, "pre-existing rules should not be marked as script-managed")
-
-
 def test_firewalld_preserves_preexisting_runtime_and_permanent_rules():
     run_bash(r'''
         source ./xray_2go.sh
@@ -704,9 +831,14 @@ def test_firewalld_preserves_preexisting_runtime_and_permanent_rules():
         mkdir -p "$WORK_DIR"
         firewall-cmd() {
             case "$*" in
-                '--permanent --list-ports') printf '29002/tcp\n' ;;
-                '--list-ports') printf '29001/tcp\n' ;;
-                --query-port=*) return 1 ;;
+                '--permanent --list-ports')
+                    printf '29002/tcp '
+                    grep -Fqx -- '--permanent --add-port=29003/tcp' "$WORK_DIR/changes" 2>/dev/null && printf '29003/tcp '
+                    printf '\n' ;;
+                '--list-ports')
+                    printf '29001/tcp '
+                    grep -Fqx -- '--add-port=29003/tcp' "$WORK_DIR/changes" 2>/dev/null && printf '29003/tcp '
+                    printf '\n' ;;
                 '--permanent --add-port=29003/tcp'|'--add-port=29003/tcp') printf '%s\n' "$*" >> "$WORK_DIR/changes" ;;
                 *) return 1 ;;
             esac
@@ -719,6 +851,373 @@ def test_firewalld_preserves_preexisting_runtime_and_permanent_rules():
         grep -qx -- '--permanent --add-port=29003/tcp' "$WORK_DIR/changes"
         grep -qx -- '--add-port=29003/tcp' "$WORK_DIR/changes"
     ''')
+
+
+def test_ufw_open_matches_exact_inbound_allow():
+    run_bash(r'''
+        source ./xray_2go.sh
+        set -e
+        mkdir -p "$WORK_DIR"
+        ufw() {
+            case "$1" in
+                status)
+                    printf 'Status: active\n18080/tcp ALLOW Anywhere\n8081/tcp DENY IN Anywhere\n8082/tcp ALLOW OUT Anywhere\n'
+                    for port in 8080 8082; do
+                        [[ ! -f $WORK_DIR/opened-$port ]] || printf '%s/tcp ALLOW IN Anywhere\n' "$port"
+                    done ;;
+                allow) touch "$WORK_DIR/opened-${2%/*}" ;;
+                *) return 1 ;;
+            esac
+        }
+        _fw_open_port_backend ufw 18080 tcp
+        [[ ! -e $_FW_RULES_FILE && ! -e $WORK_DIR/opened-18080 ]]
+        if _fw_open_port_backend ufw 8081 tcp; then exit 4; fi
+        [[ ! -e $_FW_RULES_FILE && ! -e $WORK_DIR/opened-8081 ]]
+        _fw_open_port_backend ufw 8080 tcp
+        _fw_open_port_backend ufw 8082 tcp
+        [[ -e $WORK_DIR/opened-8080 && -e $WORK_DIR/opened-8082 ]]
+        [[ $(cat "$_FW_RULES_FILE") == $'ufw:8080/tcp\nufw:8082/tcp' ]]
+    ''')
+
+
+def test_firewall_rollback_restores_live_rules_after_ledger_write_failure():
+    for action in ('add', 'remove'):
+        out = run_bash(r'''
+            source ./xray_2go.sh
+            set -e
+            mkdir -p "$WORK_DIR"
+            svc_exec() { return 1; }
+            svc_is_enabled() { return 1; }
+            svc_reload_daemon() { return 0; }
+            ufw() {
+                case "$1" in
+                    status)
+                        printf 'Status: active\n19080/tcp ALLOW IN Anywhere\n'
+                        [[ ! -e $WORK_DIR/live ]] || printf '8080/tcp ALLOW IN Anywhere\n' ;;
+                    allow)
+                        [[ $* == 'allow 8080/tcp' || $* == 'allow proto tcp from 0.0.0.0/0 to 0.0.0.0/0 port 8080' ]] &&
+                            touch "$WORK_DIR/live" ;;
+                    --force) [[ $* == '--force delete allow 8080/tcp' ]] && rm "$WORK_DIR/live" ;;
+                    *) return 1 ;;
+                esac
+            }
+            apply_change() {
+                if [[ $action == add ]]; then
+                    _fw_mark_rule() { return 1; }
+                    _fw_open_port_backend ufw 8080 tcp
+                else
+                    _fw_unmark_rule() { return 1; }
+                    _fw_close_port 8080 tcp ufw
+                fi
+            }
+            if [[ $action == remove ]]; then
+                touch "$WORK_DIR/live"
+                printf 'ufw:8080/tcp\n' > "$_FW_RULES_FILE"
+            fi
+            if _transaction_run fixture apply_change; then exit 4; fi
+            if [[ $action == add ]]; then
+                [[ ! -e $WORK_DIR/live && ! -e $_FW_RULES_FILE ]] || exit 5
+            else
+                [[ -e $WORK_DIR/live ]] || exit 6
+                grep -Fxq 'ufw:8080/tcp' "$_FW_RULES_FILE"
+            fi
+            compgen -G "$WORK_DIR/.txn_*" >/dev/null
+            printf 'LIVE_RULE_RESTORED\n'
+        '''.replace('set -e', f'set -e\naction={action}', 1))
+        assert 'LIVE_RULE_RESTORED' in out
+
+
+def test_firewall_partial_rollback_keeps_restored_rule_managed_for_uninstall():
+    cp = run_bash_result(r'''
+        source ./xray_2go.sh
+        set -e
+        mkdir -p "$WORK_DIR" "$(dirname "$SELF_DEST")"
+        touch "$SELF_DEST" "$WORK_DIR/live-8080" "$WORK_DIR/live-19080"
+        printf 'ufw:8080/tcp\n' > "$_FW_RULES_FILE"
+        svc_exec() { return 1; }
+        svc_is_enabled() { return 1; }
+        svc_reload_daemon() { return 0; }
+        _svc_stop_and_disable() { :; }
+        _svc_remove_units() { :; }
+        lifecycle_rollback_sysctl() { :; }
+        lifecycle_rollback_hosts() { :; }
+        fw_desired_rules() { printf '8081/tcp\n'; }
+        _fw_select_backend() { printf ufw; }
+        ufw() {
+            local port
+            case "$*" in
+                status)
+                    printf 'Status: active\n'
+                    if [[ -e $WORK_DIR/fail-next-status ]]; then
+                        rm "$WORK_DIR/fail-next-status"
+                        touch "$WORK_DIR/status-failed-after-restore"
+                        return 9
+                    fi
+                    for port in 8080 8081 19080; do
+                        [[ ! -f $WORK_DIR/live-$port ]] || printf '%s/tcp ALLOW IN Anywhere\n' "$port"
+                    done ;;
+                'allow 8081/tcp') touch "$WORK_DIR/live-8081" ;;
+                'allow proto tcp from 0.0.0.0/0 to 0.0.0.0/0 port 8080')
+                    touch "$WORK_DIR/live-8080" "$WORK_DIR/fail-next-status" ;;
+                '--force delete allow 8080/tcp') rm "$WORK_DIR/live-8080" ;;
+                '--force delete allow 8081/tcp')
+                    if [[ ! -e $WORK_DIR/backend-recovered ]]; then
+                        touch "$WORK_DIR/failed-delete-8081"
+                        return 1
+                    fi
+                    rm "$WORK_DIR/live-8081" ;;
+                *) return 1 ;;
+            esac
+        }
+        switch_port_and_fail() {
+            fw_reconcile || return 2
+            [[ ! -e $WORK_DIR/live-8080 && -e $WORK_DIR/live-8081 &&
+                $(<"$_FW_RULES_FILE") == ufw:8081/tcp ]] || return 3
+            touch "$WORK_DIR/switch-complete" || return 4
+            return 1
+        }
+        if _transaction_run fixture switch_port_and_fail; then exit 4; fi
+        [[ -e $WORK_DIR/switch-complete && -e $WORK_DIR/failed-delete-8081 &&
+            -e $WORK_DIR/status-failed-after-restore && -e $WORK_DIR/live-8080 && -e $WORK_DIR/live-8081 ]]
+        compgen -G "$WORK_DIR/.txn_*" >/dev/null
+        ledger=$(_fw_read_managed_rules)
+        touch "$WORK_DIR/backend-recovered"
+        with_lock _module_xray_uninstall_locked
+        if [[ -e $WORK_DIR/live-8080 || -e $WORK_DIR/live-8081 ]]; then
+            printf 'uninstall succeeded with a managed rule still live; rollback ledger: %s\n' "$ledger"
+            exit 5
+        fi
+        [[ $ledger == $'ufw:8080/tcp\nufw:8081/tcp' && -e $WORK_DIR/live-19080 &&
+            ! -e $SELF_DEST && ! -e $_FW_RULES_FILE && ! -e $_UNINSTALL_PENDING ]]
+    ''')
+    assert cp.returncode == 0, cp.stdout
+
+
+def test_firewalld_rollback_restores_each_layer_after_second_command_failure():
+    for action in ('add', 'remove'):
+        run_bash(r'''
+            source ./xray_2go.sh
+            set -e
+            mkdir -p "$WORK_DIR"
+            svc_exec() { return 1; }
+            svc_is_enabled() { return 1; }
+            svc_reload_daemon() { return 0; }
+            firewall-cmd() {
+                local layer=runtime
+                if [[ $1 == --permanent ]]; then layer=permanent; shift; fi
+                case "$1" in
+                    --list-ports)
+                        printf '19080/tcp '
+                        [[ ! -e $WORK_DIR/$layer ]] || printf '8080/tcp '
+                        printf '\n' ;;
+                    --query-port=8080/tcp) [[ -e $WORK_DIR/$layer ]] ;;
+                    --add-port=8080/tcp) [[ $layer == permanent ]] && touch "$WORK_DIR/$layer" ;;
+                    --remove-port=8080/tcp) [[ $layer == permanent ]] && rm "$WORK_DIR/$layer" ;;
+                    *) return 1 ;;
+                esac
+            }
+            apply_change() {
+                if [[ $action == add ]]; then
+                    _fw_open_port_backend firewalld 8080 tcp
+                else
+                    _fw_close_port 8080 tcp firewalld
+                fi
+            }
+            if [[ $action == remove ]]; then
+                touch "$WORK_DIR/permanent" "$WORK_DIR/runtime"
+                printf 'firewalld:8080/tcp\n' > "$_FW_RULES_FILE"
+            fi
+            if _transaction_run fixture apply_change; then exit 4; fi
+            if [[ $action == add ]]; then
+                [[ ! -e $WORK_DIR/permanent && ! -e $WORK_DIR/runtime && ! -e $_FW_RULES_FILE ]]
+            else
+                [[ -e $WORK_DIR/permanent && -e $WORK_DIR/runtime ]]
+                grep -Fxq 'firewalld:8080/tcp' "$_FW_RULES_FILE"
+            fi
+            ! compgen -G "$WORK_DIR/.txn_*" >/dev/null
+        '''.replace('set -e', f'set -e\naction={action}', 1))
+
+
+def test_firewall_interrupt_compensates_before_ledger_write():
+    with XraySandbox() as sandbox:
+        for scope in ('deployment', 'uninstall'):
+            cp = subprocess.run(
+                ['bash', '-lc', r'''
+                    source ./xray_2go.sh
+                    mkdir -p "$WORK_DIR"
+                    svc_exec() { return 1; }
+                    svc_is_enabled() { return 1; }
+                    svc_reload_daemon() { return 0; }
+                    ufw() {
+                        case "$*" in
+                            status)
+                                printf 'Status: active\n'
+                                [[ ! -e $WORK_DIR/live ]] || printf '8080/tcp ALLOW IN Anywhere\n' ;;
+                            'allow 8080/tcp')
+                                touch "$WORK_DIR/live"
+                                if [[ $scope == deployment ]]; then kill -TERM "$BASHPID"; fi ;;
+                            'allow proto tcp from 0.0.0.0/0 to 0.0.0.0/0 port 8080')
+                                touch "$WORK_DIR/live" ;;
+                            '--force delete allow 8080/tcp')
+                                rm "$WORK_DIR/live"
+                                if [[ $scope == uninstall ]]; then kill -TERM "$BASHPID"; fi ;;
+                            *) return 1 ;;
+                        esac
+                    }
+                    if [[ $scope == deployment ]]; then
+                        _transaction_run fixture _fw_open_port_backend ufw 8080 tcp
+                    else
+                        touch "$WORK_DIR/live"
+                        printf 'ufw:8080/tcp\n' > "$_FW_RULES_FILE"
+                        with_lock fw_force_cleanup
+                    fi
+                '''],
+                cwd=ROOT,
+                env={**sandbox.environment(), 'scope': scope},
+                text=True, capture_output=True, timeout=20, check=False,
+            )
+            work = sandbox.root / 'etc/xray2go'
+            assert cp.returncode == 130, cp.stderr
+            assert not list(work.glob('.txn_*')), cp.stderr
+            assert (work / 'live').exists() == (scope == 'uninstall')
+            assert (work / '.fw_rules').exists() == (scope == 'uninstall')
+
+
+def test_firewall_records_unconfirmed_step_and_failed_compensation():
+    for failure in ('before', 'after', 'undo'):
+        run_bash(r'''
+            source ./xray_2go.sh
+            set -e
+            mkdir -p "$WORK_DIR"
+            svc_exec() { return 1; }
+            svc_is_enabled() { return 1; }
+            svc_reload_daemon() { return 0; }
+            ufw() {
+                case "$*" in
+                    status)
+                        printf 'Status: active\n'
+                        [[ ! -e $WORK_DIR/live ]] || printf '8080/tcp ALLOW IN Anywhere\n' ;;
+                    'allow 8080/tcp') touch "$WORK_DIR/live" ;;
+                    '--force delete allow 8080/tcp')
+                        [[ $failure != undo ]] && rm "$WORK_DIR/live" ;;
+                    *) return 1 ;;
+                esac
+            }
+            apply_change() {
+                case "$failure" in
+                    before|after) mkdir "$_TXN_DIR/firewall.1.$failure" || return 9 ;;
+                esac
+                _fw_open_port_backend ufw 8080 tcp || return 1
+                return 1
+            }
+            if _transaction_run fixture apply_change; then exit 4; fi
+            snapshots=("$WORK_DIR"/.txn_*)
+            [[ ${#snapshots[@]} == 1 && -f ${snapshots[0]}/manifest ]]
+            if [[ $failure == before ]]; then
+                [[ ! -e $WORK_DIR/live && ! -e $_FW_RULES_FILE ]]
+            else
+                [[ -f ${snapshots[0]}/firewall.1.before ]]
+                if [[ $failure == after ]]; then
+                    [[ ! -e $WORK_DIR/live && ! -e $_FW_RULES_FILE ]]
+                else
+                    [[ -f ${snapshots[0]}/firewall.1.after && -e $WORK_DIR/live ]]
+                    grep -Fxq 'ufw:8080/tcp' "$_FW_RULES_FILE"
+                fi
+            fi
+        '''.replace('set -e', f'set -e\nfailure={failure}', 1))
+
+
+def test_nft_retries_when_table_exists_without_input_chain():
+    run_bash(r'''
+        source ./xray_2go.sh
+        set -e
+        mkdir -p "$WORK_DIR"
+        nft() {
+            if [[ $1 == -a ]]; then shift; fi
+            if [[ $1 == -nn ]]; then shift; fi
+            case "$*" in
+                'list tables') [[ ! -e $WORK_DIR/table ]] || printf 'table inet xray2go\n' ;;
+                'list table inet xray2go')
+                    [[ -e $WORK_DIR/table ]] || return 1
+                    printf 'table inet xray2go {\n'
+                    if [[ -e $WORK_DIR/chain ]]; then
+                        printf 'chain input {\n type filter hook input priority filter; policy accept;\n'
+                        [[ ! -e $WORK_DIR/rule ]] || printf 'tcp dport 8080 accept # handle 42\n'
+                        [[ ! -e $WORK_DIR/duplicate ]] || printf 'tcp dport 8080 accept # handle 43\n'
+                        printf '}\n'
+                    fi
+                    printf '}\n' ;;
+                'list chain inet xray2go input')
+                    [[ -e $WORK_DIR/chain ]] || return 1
+                    nft list table inet xray2go ;;
+                'add table inet xray2go') touch "$WORK_DIR/table" ;;
+                'add chain inet xray2go input '*)
+                    [[ ! -e $WORK_DIR/fail_chain ]] || return 1
+                    touch "$WORK_DIR/chain" ;;
+                'delete rule inet xray2go input handle 42') rm "$WORK_DIR/rule" ;;
+                'delete chain inet xray2go input')
+                    [[ ! -e $WORK_DIR/rule ]] && rm "$WORK_DIR/chain" ;;
+                'delete table inet xray2go')
+                    [[ ! -e $WORK_DIR/chain ]] && rm "$WORK_DIR/table" ;;
+                'add rule inet xray2go input tcp dport 8080 accept')
+                    [[ -e $WORK_DIR/chain ]] && touch "$WORK_DIR/rule" ;;
+                *) return 1 ;;
+            esac
+        }
+        touch "$WORK_DIR/fail_chain"
+        if _fw_open_port_backend nft 8080 tcp; then exit 4; fi
+        [[ ! -e $WORK_DIR/table && ! -e $WORK_DIR/chain && ! -e $WORK_DIR/rule && ! -e $_FW_RULES_FILE ]]
+        rm "$WORK_DIR/fail_chain"
+        _fw_open_port_backend nft 8080 tcp
+        touch "$WORK_DIR/duplicate"
+        if _fw_close_port 8080 tcp nft; then exit 5; fi
+        [[ -e $WORK_DIR/rule && -e $WORK_DIR/duplicate ]]
+        grep -Fxq 'nft:8080/tcp' "$_FW_RULES_FILE"
+        rm "$WORK_DIR/duplicate"
+        _fw_close_port 8080 tcp nft
+        [[ ! -e $WORK_DIR/rule && ! -s $_FW_RULES_FILE ]]
+        # Simulate a table left behind by an older run as well.
+        rm "$WORK_DIR/chain"
+        _fw_open_port_backend nft 8080 tcp
+        [[ -e $WORK_DIR/rule ]]
+        grep -Fxq 'nft:8080/tcp' "$_FW_RULES_FILE"
+    ''')
+
+
+def test_nft_failed_add_does_not_delete_concurrent_external_rule():
+    cp = run_bash_result(r'''
+        source ./xray_2go.sh
+        set -e
+        mkdir -p "$WORK_DIR"
+        nft() {
+            case "$*" in
+                'list tables') printf 'table inet xray2go\n' ;;
+                '-a -nn list table inet xray2go')
+                    printf 'table inet xray2go {\nchain input {\n'
+                    [[ ! -e $WORK_DIR/external-73 ]] || printf 'tcp dport 8080 accept # handle 73\n'
+                    printf '}\n}\n' ;;
+                'add rule inet xray2go input tcp dport 8080 accept')
+                    # An external writer wins after the pre-query; our add fails.
+                    touch "$WORK_DIR/external-73" "$WORK_DIR/add-failed"
+                    return 1 ;;
+                'delete rule inet xray2go input handle 73')
+                    touch "$WORK_DIR/deleted-external-73"
+                    rm "$WORK_DIR/external-73" ;;
+                *) return 1 ;;
+            esac
+        }
+        if _fw_open_port_backend nft 8080 tcp; then exit 4; fi
+        [[ -e $WORK_DIR/add-failed ]]
+        if [[ -e $WORK_DIR/deleted-external-73 || ! -e $WORK_DIR/external-73 ]]; then
+            printf 'rollback deleted external handle 73 after the nft add failed\n'
+            exit 5
+        fi
+        snapshots=("$WORK_DIR"/.txn_*)
+        [[ ${#snapshots[@]} == 1 && ! -e $_FW_RULES_FILE ]]
+        grep -Fxq 'nft rule 8080 tcp 0 present' "${snapshots[0]}/firewall.1.before"
+        [[ ! -e ${snapshots[0]}/firewall.1.after ]]
+    ''')
+    assert cp.returncode == 0, cp.stdout
 
 
 def test_secret_prompt_exists():
@@ -786,8 +1285,7 @@ def test_firewall_sync_fails_closed_and_prefers_active_managers():
     assert_true('return 1' in open_body, "_fw_open_port must propagate backend failures")
     assert_true('_failed=0' in TEXT and '_fw_open_port "${_rp}" "${_rproto}" || _failed=1' in TEXT, "fw_reconcile must track firewall open failures")
     assert_true('部分防火墙规则同步失败' in TEXT, "fw_reconcile must report partial firewall failures")
-    close_body = TEXT[TEXT.index('_fw_close_port()'):TEXT.index('fw_reconcile()')]
-    assert_true('[[ "${_handle}" =~ ^[0-9]+$ ]] || return 1' in close_body, "nft cleanup must preserve ambiguous duplicate rules and their ledger entry")
+    assert_true('[[ "${_handle}" =~ ^[0-9]+$ ]] || return 1' in TEXT, "nft cleanup must preserve ambiguous duplicate rules and their ledger entry")
 
 
 def test_config_detects_wildcard_listen_conflicts_by_transport():
@@ -868,10 +1366,19 @@ PLUGIN
         svc_reload_daemon() { return 0; }
         platform_get_realip() { printf '203.0.113.10'; }
         _fw_select_backend() { printf ufw; }
-        _fw_remove_rule() { return 0; }
-        _fw_open_port_backend() {
-            [[ $2 != 29003 ]] || return 1
-            _fw_mark_rule "$@"
+        ufw() {
+            case "$*" in
+                status)
+                    printf 'Status: active\n'
+                    for port in 1080 29001 29002; do
+                        [[ ! -f $WORK_DIR/live-$port ]] || printf '%s/tcp ALLOW IN Anywhere\n' "$port"
+                    done
+                    return 0 ;;
+                'allow 1080/tcp'|'allow 29001/tcp'|'allow 29002/tcp') touch "$WORK_DIR/live-${2%/*}" ;;
+                'allow proto tcp from 0.0.0.0/0 to 0.0.0.0/0 port 29002') touch "$WORK_DIR/live-29002" ;;
+                '--force delete allow 29001/tcp'|'--force delete allow 29002/tcp') rm "$WORK_DIR/live-${4%/*}" ;;
+                *) return 1 ;;
+            esac
         }
         _commit
         prompt() { IFS= read -r "$2"; }
@@ -908,13 +1415,63 @@ def test_builtin_plugin_refresh_and_cleanup_share_file_ownership():
     assert result.returncode == 0, result.stdout
 
 
-def test_plugin_loader_validates_before_source_and_loads_in_subshell():
-    body = TEXT[TEXT.index('plugin_load_all()'):TEXT.index('plugin_install_builtins()')]
-    assert_true('val_plugin_name "${_name}"' in body, "plugin loader must validate plugin filename before source")
-    assert_true('_plugin_contract_ok' in body, "plugin loader must inspect plugin contract before source")
-    assert_true('bash -n "${_f}"' in TEXT, "plugin loader must syntax-check plugin before source")
-    assert_true('(\n        # 先在子 shell' in TEXT and 'source "${_f}" >/dev/null 2>&1 || exit 1' in TEXT, "plugin contract check should source in a subshell first")
-    assert_true('插件文件名不合法' in TEXT and '接口不完整，已跳过且未加载' in TEXT, "plugin loader should report rejected plugins clearly")
+def test_plugin_loader_rejects_invalid_first_load():
+    run_bash(r'''
+        source ./xray_2go.sh
+        set -e
+        [[ "$WORK_DIR" == "$X2G_TEST_ROOT/etc/xray2go" ]]
+        mkdir -p "$PLUGIN_DIR"
+        printf '%s\n' 'touch "$WORK_DIR/malformed-sourced"' 'invalid() {' > "$PLUGIN_DIR/malformed.sh"
+        printf '%s\n' '_plg_partial_link() { :; }' > "$PLUGIN_DIR/partial.sh"
+        plugin_load_all
+        [[ ! -e "$WORK_DIR/malformed-sourced" ]]
+        ! plugin_is_loaded malformed
+        ! plugin_is_loaded partial
+        ! declare -F _plg_partial_link >/dev/null
+    ''')
+
+
+def test_plugin_refresh_publishes_only_the_validated_implementation():
+    run_bash(r'''
+        source ./xray_2go.sh
+        set -e
+        [[ "$WORK_DIR" == "$X2G_TEST_ROOT/etc/xray2go" ]]
+        mkdir -p "$PLUGIN_DIR"
+        cat > "$PLUGIN_DIR/swap.sh" <<'PLUGIN'
+cat > "$PLUGIN_DIR/swap.sh" <<'REPLACEMENT'
+_plg_swap_link() { printf 'fixture://not-validated'; }
+REPLACEMENT
+_plg_swap_enabled() { return 0; }
+_plg_swap_inbound() { printf '{"tag":"validated"}'; }
+_plg_swap_ports() { printf '19001/tcp'; }
+_plg_swap_helper() { printf 'fixture://validated'; }
+_plg_swap_link() { _plg_swap_helper; }
+PLUGIN
+        plugin_load_all
+        [[ $(plugin_call swap link) == fixture://validated ]]
+        [[ $(plugin_call swap ports) == 19001/tcp ]]
+        [[ $(plugin_call swap inbound) == '{"tag":"validated"}' ]]
+        plugin_call swap enabled
+
+        cat > "$PLUGIN_DIR/z_other.sh" <<'PLUGIN'
+_plg_z_other_enabled() { return 0; }
+_plg_z_other_link() { printf 'fixture://other'; }
+_plg_z_other_ports() { :; }
+_plg_z_other_inbound() { :; }
+PLUGIN
+        plugin_refresh_runtime
+        [[ $(plugin_call swap link) == fixture://validated ]]
+        [[ $(plugin_call z_other link) == fixture://other ]]
+        printf '%s\n' '_plg_swap_link() { printf "fixture://partial"; }' 'return 42' > "$PLUGIN_DIR/swap.sh"
+        plugin_refresh_runtime
+        [[ $(plugin_call swap link) == fixture://validated ]]
+        mv "$PLUGIN_DIR/swap.sh" "$WORK_DIR/swap.moved"
+        plugin_refresh_runtime
+        ! plugin_is_loaded swap
+        ! declare -F _plg_swap_helper >/dev/null
+        ! declare -F _plg_swap_link >/dev/null
+        [[ $(plugin_call z_other link) == fixture://other ]]
+    ''')
 
 
 def test_plugin_refresh_runtime_is_the_single_bootstrap_entry():
@@ -934,8 +1491,39 @@ def test_plugin_collectors_drive_firewall_config_and_node_output():
     assert_true('plugin_collect_ports_raw' in fw_body, 'firewall desired rules should use shared plugin port collector')
     assert_true('plugin_collect_inbounds' in cfg_body, 'config_build_inbounds should delegate to shared inbound collector')
     assert_true('plugin_collect_links' in nodes_body, 'node output should delegate to shared link collector')
-    for token in ['_PLUGIN_SNAPSHOT_PORTS', '_PLUGIN_SNAPSHOT_LINKS', '_PLUGIN_SNAPSHOT_INBOUNDS', '_plugin_port_rules "${_name}"', 'plugin_call "${_name}" link', 'plugin_call "${_name}" inbound']:
-        assert_true(token in snapshot_body, f'plugin snapshot rebuild should collect all plugin dimensions once: {token}')
+    for token in ['_PLUGIN_SNAPSHOT_PORTS', '_PLUGIN_SNAPSHOT_INBOUNDS', '_plugin_port_rules', 'inbound']:
+        assert_true(token in snapshot_body, f'plugin snapshot should collect runtime configuration once: {token}')
+    assert ' link' not in snapshot_body
+
+
+def test_commit_reuses_inbounds_and_ports_and_builds_links_on_demand():
+    run_bash(r'''
+        source ./xray_2go.sh
+        set -e
+        mkdir -p "$WORK_DIR"
+        st_init
+        _PLUGIN_REGISTRY=(fixture)
+        _plg_fixture_ports() { printf 'ports\n' >> "$WORK_DIR/calls"; st_get '.fixture.port'; }
+        _plg_fixture_inbound() {
+            printf 'inbound\n' >> "$WORK_DIR/calls"
+            jq -cn --argjson port "$(st_get '.fixture.port')" '{port:$port, listen:"127.0.0.1", protocol:"socks"}'
+        }
+        _plg_fixture_link() { printf 'link\n' >> "$WORK_DIR/calls"; printf 'test://fixture\n'; }
+        svc_exec() { return 1; }
+        svc_is_enabled() { return 1; }
+        fw_reconcile() { fw_desired_rules > "$WORK_DIR/desired"; }
+        apply_port() { st_set '.fixture.port = ($port | tonumber)' --arg port "$1" && _commit_inner; }
+        for port in 28081 28082; do
+            : > "$WORK_DIR/calls"
+            _transaction_run fixture apply_port "$port"
+            [[ $(jq -r '.inbounds[0].port' "$CONFIG_FILE") == "$port" ]]
+            grep -qx "$port/tcp" "$WORK_DIR/desired"
+            cmp -s <(printf 'inbound\nports\n') <(sort "$WORK_DIR/calls")
+        done
+        : > "$WORK_DIR/calls"
+        [[ $(plugin_collect_links) == 'test://fixture' ]]
+        [[ $(<"$WORK_DIR/calls") == link ]]
+    ''')
 
 
 def test_argo_env_final_token_validation_and_menu_install_state():
@@ -979,8 +1567,23 @@ def test_argo_install_tunnel_failure_rolls_back_before_state_commit():
         svc_reload_daemon() { :; }
         is_openrc() { return 1; }
         platform_fix_time_sync() { :; }
-        fw_reconcile() { :; }
+        fw_desired_rules() { printf '8080/tcp\\n'; }
+        _fw_select_backend() { printf ufw; }
+        svc_exec() { return 1; }
+        svc_is_enabled() { return 1; }
+        svc_exec_mut() { :; }
+        ufw() {
+            case "$*" in
+                status)
+                    printf 'Status: active\\n'
+                    [[ ! -e $WORK_DIR/live ]] || printf '8080/tcp ALLOW Anywhere\\n' ;;
+                'allow 8080/tcp') touch "$WORK_DIR/live" ;;
+                '--force delete allow 8080/tcp') rm "$WORK_DIR/live" ;;
+                *) return 1 ;;
+            esac
+        }
         svc_enable_start_verify() {
+            [[ -e $WORK_DIR/live && -f $_FW_RULES_FILE ]] || return 1
             printf 'svc-call=%s max=%s mode=%s\\n' "$1" "$2" "$3"
             [ "$1" = "${_SVC_TUNNEL}" ] && return 1
             return 0
@@ -988,7 +1591,7 @@ def test_argo_install_tunnel_failure_rolls_back_before_state_commit():
         st_persist() { printf 'state-persist-called\\n'; return 0; }
         _transaction_run "fixture deployment" module_xray_install_core
         rc=$?
-        [[ ! -e $CONFIG_FILE ]] || exit 1
+        [[ ! -e $CONFIG_FILE && ! -e $WORK_DIR/live && ! -e $_FW_RULES_FILE ]] || exit 1
         printf 'install-rc=%s enabled=%s\\n' "$rc" "$(st_get '.argo.enabled')"
         exit 0
     """)
@@ -1658,19 +2261,23 @@ def test_failed_firewall_cleanup_restores_module_and_keeps_rule_record():
         fw_desired_rules() { return 0; }
         _fw_select_backend() { printf ufw; }
         ufw() {
-            if [[ $1 == status ]]; then
-                printf 'Status: active\n1080/tcp ALLOW IN Anywhere\n39091/tcp ALLOW IN Anywhere\n'
-            else
-                return 1
-            fi
+            case "$*" in
+                status)
+                    printf 'Status: active\n1080/tcp ALLOW IN Anywhere\n'
+                    [[ ! -f $WORK_DIR/live ]] || printf '39091/tcp ALLOW IN Anywhere\n' ;;
+                'allow 39091/tcp') touch "$WORK_DIR/live" ;;
+                *) return 1 ;;
+            esac
         }
         if module_dispatch socks disable; then exit 1; fi
         [[ $(st_get '.socks.enabled') == true && $(<"$CONFIG_FILE") == original ]]
         jq -e '.socks.enabled == true' "$STATE_FILE" >/dev/null
         grep -qx 'ufw:1080/tcp' "$_FW_RULES_FILE"
-        add_rule_and_fail() { _fw_mark_rule ufw 39091 tcp; return 1; }
+        add_rule_and_fail() { _fw_open_port_backend ufw 39091 tcp && return 1; }
         if _transaction_run 'fixture' add_rule_and_fail; then exit 1; fi
+        [[ -f $WORK_DIR/live ]]
         grep -qx 'ufw:39091/tcp' "$_FW_RULES_FILE"
+        compgen -G "$WORK_DIR/.txn_*" >/dev/null
     ''')
 
 
@@ -1772,6 +2379,8 @@ def test_uninstall_retries_failed_firewall_and_preserves_external_files():
         st_persist || exit 1
         prompt() { printf -v "$2" y; }
         svc_exec_mut() { return 0; }
+        svc_status() { return 1; }
+        svc_enabled_status() { return 1; }
         is_systemd() { return 1; }
         ufw() {
             case "$1" in
@@ -2005,7 +2614,7 @@ ordinary = parse_qs(normal.query)
 separated = parse_qs(split.query)
 assert "downloadSettings" not in json.loads(ordinary["extra"][0])
 assert split.hostname == "203.0.113.5" and split.port == 28443
-assert separated["mode"] == ["packet-up"] and separated["security"] == ["reality"]
+assert separated["mode"] == ["stream-up"] and separated["security"] == ["reality"]
 assert separated["sni"] == ["target.example.com"] and separated["pbk"] == ["fixture_public_key"]
 assert ordinary["security"] == ["tls"] and normal.hostname == "edge.example.com"
 assert json.loads(separated["extra"][0])["downloadSettings"]["port"] == 8443
@@ -2060,6 +2669,7 @@ def test_argo_transport_changes_reconcile_split_listener():
         _argo_prepare_fixed_tunnel_from_state() { :; }
         svc_apply_tunnel() { :; }
         svc_exec() { return 1; }
+        svc_is_enabled() { return 1; }
         svc_exec_mut() { :; }
         svc_verify_health() { :; }
         argo_check_health() { :; }
@@ -2138,6 +2748,61 @@ def test_argo_xhttp_legacy_and_profile_exports_share_uri_authority():
         [[ $(_plg_argo_link) == "$legacy" ]] || exit 6
         _argo_xhttp_export_json normal | jq -e '.settings.vnext[0].address == "2001:db8::3"' >/dev/null || exit 7
     """)
+
+
+def test_argo_split_default_preserves_legacy_and_rejects_false_port():
+    run_bash(r'''
+        source ./xray_2go.sh
+        set -e
+        st_init
+        platform_get_realip() { printf 203.0.113.42; }
+        st_set '.argo.enabled=true | .argo.protocol="xhttp" | .argo.auth_protocol="vless" |
+            .argo.domain="fixture.example.com" | .cfport=8443 |
+            .reality.enabled=true | .reality.sni="fixture.example.com" |
+            .reality.pbk="fixture-public" | .reality.sid="0123456789abcdef"'
+        _argo_xhttp_set_profile 0 '{"split":{"port":28443}}'
+        [[ $(st_get '.argo.xhttp.split.mode') == stream-up ]]
+        _argo_xhttp_link split | grep -q '&mode=stream-up&'
+        _argo_xhttp_export_json split | jq -e '.streamSettings.xhttpSettings.mode == "stream-up"'
+        _argo_xhttp_export_mihomo | jq -e '.proxies[0]["xhttp-opts"].mode == "stream-up"'
+        prompt() { IFS= read -r "$2"; }
+        _xhttp_edit_field argo 0 split.port '上行端口' <<< 28444
+        [[ $(st_get '.argo.xhttp.split.port') == 28444 ]]
+        [[ $(st_get '.argo.xhttp.split.mode') == stream-up ]]
+        st_set 'del(.argo.xhttp.split.mode) | .argo.xhttp.split.download.port = false'
+        _argo_xhttp_export_json split | jq -e '.streamSettings.xhttpSettings |
+            .mode == "packet-up" and .extra.downloadSettings.port == 8443'
+        [[ $(st_get '.argo.xhttp.split.download.port') == false ]]
+        if _argo_xhttp_set_profile 0 '{"split":{"port":28443,"download":{"port":false}}}'; then exit 51; fi
+        _argo_xhttp_set_profile 0 '{"split":{"port":28445}}'
+        [[ $(st_get '.argo.xhttp.split.mode') == packet-up ]]
+        _argo_xhttp_set_profile 0 null
+        _xhttp_edit_field argo 0 split.port '上行端口' <<< 28446
+        [[ $(st_get '.argo.xhttp.split.mode') == stream-up ]]
+    ''')
+
+
+def test_mihomo_export_warns_for_unrepresentable_download_overrides():
+    out = run_bash(r'''
+        source ./xray_2go.sh
+        set -e
+        st_init
+        platform_get_realip() { printf 203.0.113.9; }
+        st_set '.argo.enabled=true | .argo.protocol="xhttp" | .argo.auth_protocol="vless" |
+            .argo.domain="edge.example.com" | .cfip="203.0.113.8" | .cfport=8443 |
+            .reality.enabled=true | .reality.sni="edge.example.com" |
+            .reality.pbk="fixture-public" | .reality.sid="0123456789abcdef"'
+        _argo_xhttp_set_profile 0 '{"server":{"xPaddingBytes":"100-200"},"split":{"port":28443,
+            "download":{"sockopt":{},"xhttpSettings":{"extra":{"xPaddingBytes":"300-400","xmux":{"maxConnections":2}}}}}}'
+        _argo_xhttp_mihomo_warn_differences
+        json=$(_argo_xhttp_export_mihomo)
+        jq -e '.proxies[0]["xhttp-opts"].mode == "stream-up"' <<< "$json" >/dev/null
+        printf '%s\n' "$json"
+    ''')
+    assert 'Mihomo 下行没有独立 Padding' in out
+    assert 'Mihomo 下行没有独立 sockopt' in out
+    assert '下行复用设置需要上行同时提供 reuse-settings' in out
+    assert '"proxies"' in out
 
 
 def test_argo_xhttp_editor_and_selected_exports():
@@ -2602,6 +3267,7 @@ svc_exec_mut() {
     return 1
 }
 is_systemd() { return 0; }
+svc_exec() { [[ $1 != status || $_SERVICE_ACTIVE == 1 ]] || return 3; }
 systemctl() { return 0; }
 config_apply() { return 1; }
 fw_reconcile() { return 0; }
@@ -4095,10 +4761,12 @@ user=$(head -c 32 /dev/zero | base64 | tr -d '\\n')
 st_set '.ss2022.enabled = true | .ss2022.method = "2022-blake3-aes-256-gcm" | .ss2022.server_key = $server | .ss2022.user_key = $user | del(.ss2022.key_mode)' --arg server "$server" --arg user "$user" >/dev/null
 _st_normalize_schema >/dev/null
 platform_get_realip() { printf '203.0.113.10'; }
-plugin_refresh_runtime >/dev/null
-printf 'ports=%s\\n' "$(plugin_call ss2022 ports | paste -sd, -)"
-printf 'inbound=%s\\n' "$(plugin_call ss2022 inbound | jq -c .)"
-printf 'link=%s\\n' "$(plugin_call ss2022 link)"
+plugin_refresh_runtime >/dev/null || exit 1
+plugin_is_loaded ss2022 || exit 1
+ports=$(plugin_call ss2022 ports | paste -sd, -) || exit 1
+inbound=$(plugin_call ss2022 inbound | jq -ec .) || exit 1
+link=$(plugin_call ss2022 link) || exit 1
+printf 'ports=%s\\ninbound=%s\\nlink=%s\\n' "$ports" "$inbound" "$link"
 """)
     lines = dict(line.split("=", 1) for line in out.splitlines() if "=" in line and line.split("=", 1)[0] in {"ports", "inbound", "link"})
     assert_true(lines.get("ports") == "8388/tcp,8388/udp", f"SS2022 port collector is wrong: {out}")
@@ -4162,8 +4830,10 @@ _st_normalize_schema >/dev/null
 server=$(head -c 32 /dev/zero | base64 | tr -d '\\n')
 user=$(head -c 32 /dev/zero | base64 | tr -d '\\n')
 st_set '.uuid = "00000000-0000-4000-8000-000000000000" | .argo.enabled = false | .ss2022.enabled = true | .ss2022.server_key = $server | .ss2022.user_key = $user' --arg server "$server" --arg user "$user" >/dev/null
-plugin_refresh_runtime >/dev/null
-config_synthesize | jq -c '{count:(.inbounds|length), ss:(.inbounds[] | select(.protocol == "shadowsocks") | {port,listen,method:.settings.method,network:.settings.network})}'
+plugin_refresh_runtime >/dev/null || exit 1
+plugin_is_loaded ss2022 || exit 1
+platform_get_realip() { printf '203.0.113.10'; }
+config_synthesize | jq -ec '{count:(.inbounds|length), ss:(.inbounds[] | select(.protocol == "shadowsocks") | {port,listen,method:.settings.method,network:.settings.network})}'
 """)
     assert_true('"count":1' in out and '"ss":{"port":8388' in out and '"method":"2022-blake3-aes-256-gcm"' in out, f"SS2022 config synthesis failed: {out}")
 
@@ -4442,6 +5112,135 @@ def test_direct_h3_certificate_validation_and_rollback():
     assert out.count('CONFIG_APPLY_CALLED') == 2, out
 
 
+def test_runtime_tls_rotation_reloads_same_paths_and_rolls_back():
+    for inbound in ('cforigin', 'vlquic'):
+        run_bash(f'inbound={inbound}\n' + r'''
+            source ./xray_2go.sh
+            set -e
+            [[ "$WORK_DIR" == "$X2G_TEST_ROOT/etc/xray2go" ]]
+            domain=rotate.fixture.invalid
+            dir="$_CERT_DIR/$domain"
+            cert="$dir/fullchain.pem"
+            key="$dir/privkey.pem"
+            mkdir -p "$dir"
+            for version in old replacement; do
+                openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 2 \
+                    -subj "/CN=$domain" -keyout "$WORK_DIR/$version.key" \
+                    -out "$WORK_DIR/$version.pem" >/dev/null 2>&1
+            done
+            cp "$WORK_DIR/old.pem" "$cert"
+            cp "$WORK_DIR/old.key" "$key"
+            st_init
+            st_set '.argo.enabled=false |
+                    .[$m] += {enabled:true, domain:$d, cert:$c, key:$k, origin_tls:true}' \
+                --arg m "$inbound" --arg d "$domain" --arg c "$cert" --arg k "$key"
+            st_persist
+            plugin_refresh_runtime
+            config_synthesize > "$WORK_DIR/baseline"
+            printf '%s' "$(<"$WORK_DIR/baseline")" > "$CONFIG_FILE"
+            sha256sum < "$CONFIG_FILE" | awk '{printf "%s", $1}' > "$_CONFIG_HASH_FILE"
+            cat > "$XRAY_BIN" <<'XRAY'
+#!/bin/bash
+[[ $1 == -test && $2 == -c && -f $3 ]] || exit 12
+root="$X2G_TEST_ROOT/etc/xray2go"
+printf 'checked\n' >> "$root/validations"
+[[ ! -f "$root/reject-config" ]]
+XRAY
+            chmod 700 "$XRAY_BIN"
+            is_systemd() { return 1; }
+            is_openrc() { return 1; }
+            svc_exec() { [[ $1 == status && $2 == "$_SVC_XRAY" ]]; }
+            svc_is_enabled() { [[ $1 == "$_SVC_XRAY" ]]; }
+            svc_apply_xray() { return 0; }
+            svc_reload_daemon() { return 0; }
+            svc_verify_health() { return 0; }
+            svc_exec_mut() {
+                [[ $1 == restart && $2 == "$_SVC_XRAY" ]] || return 13
+                [[ -s "$WORK_DIR/validations" ]] || return 14
+                if cmp -s "$cert" "$WORK_DIR/old.pem"; then
+                    printf 'old\n' >> "$WORK_DIR/restarts"
+                else
+                    printf 'replacement\n' >> "$WORK_DIR/restarts"
+                    [[ $outcome != reject-restart ]]
+                fi
+            }
+            fw_reconcile() { return 0; }
+            config_print_nodes() { return 0; }
+            cforigin_print_cloudflare_hint() { return 0; }
+            prompt() { IFS= read -r "$2"; }
+            issue() {
+                cp "$WORK_DIR/$version.pem" "$cert" && cp "$WORK_DIR/$version.key" "$key" &&
+                    st_set '.[$m] += {cert:$c,key:$k}' --arg m "$inbound" --arg c "$cert" --arg k "$key"
+            }
+            acme_issue_http01_to_state() { issue; }
+            acme_issue_http01() { issue; }
+            rotate() { "module_${inbound}_update_cert" <<< "$domain"$'\n3\nadmin@fixture.invalid'; }
+            outcome=ok
+            version=old
+            rotate
+            [[ ! -e "$WORK_DIR/restarts" ]]
+            version=replacement
+            : > "$WORK_DIR/reject-config"
+            if rotate; then exit 41; fi
+            [[ ! -e "$WORK_DIR/restarts" ]]
+            cmp -s "$cert" "$WORK_DIR/old.pem"
+            cmp -s "$key" "$WORK_DIR/old.key"
+            [[ -s "$WORK_DIR/config_failed.json" ]]
+            mv "$WORK_DIR/reject-config" "$WORK_DIR/did-reject-config"
+            outcome=reject-restart
+            if rotate; then exit 42; fi
+            [[ $(<"$WORK_DIR/restarts") == $'replacement\nold' ]]
+            cmp -s "$cert" "$WORK_DIR/old.pem"
+            cmp -s "$key" "$WORK_DIR/old.key"
+            outcome=ok
+            rotate
+            [[ $(<"$WORK_DIR/restarts") == $'replacement\nold\nreplacement' ]]
+            cmp -s "$cert" "$WORK_DIR/replacement.pem"
+            [[ $(<"$CONFIG_FILE") == "$(<"$WORK_DIR/baseline")" ]]
+            [[ -s "$WORK_DIR/config_failed.json" ]]
+            st_set '.[$m].enabled=false' --arg m "$inbound"
+            st_persist
+            before=$(wc -l < "$WORK_DIR/validations")
+            version=old
+            rotate
+            cmp -s "$cert" "$WORK_DIR/old.pem"
+            [[ $(wc -l < "$WORK_DIR/validations") == "$before" ]]
+            [[ $(<"$WORK_DIR/restarts") == $'replacement\nold\nreplacement' ]]
+        ''', timeout=90)
+
+
+def test_config_failed_diagnostic_survives_rollback_and_reports_save_failure():
+    out = run_bash(r'''
+        source ./xray_2go.sh
+        set -e
+        [[ "$WORK_DIR" == "$X2G_TEST_ROOT/etc/xray2go" ]]
+        st_init
+        st_persist
+        is_systemd() { return 1; }
+        is_openrc() { return 1; }
+        svc_exec() { return 1; }
+        svc_is_enabled() { return 1; }
+        svc_reload_daemon() { return 0; }
+        fw_reconcile() { return 0; }
+        config_synthesize() { printf '%s\n' "$candidate"; }
+        printf '#!/bin/bash\nexit 1\n' > "$XRAY_BIN"
+        chmod 700 "$XRAY_BIN"
+        printf 'running-config' > "$CONFIG_FILE"
+        diag="$WORK_DIR/config_failed.json"
+        printf 'older-failure' > "$diag"
+        chmod 644 "$diag"
+        candidate='{"test":"latest failed config"}'
+        if _commit; then exit 43; fi
+        [[ $(<"$CONFIG_FILE") == running-config && $(<"$diag") == "$candidate" ]]
+        [[ $(stat -c '%u:%a' "$diag") == "$(id -u):600" ]]
+        mv "$diag" "$WORK_DIR/saved-failure"
+        mkdir "$diag"
+        if _commit; then exit 44; fi
+        [[ -z $(ls -A "$diag") && $(<"$CONFIG_FILE") == running-config ]]
+    ''')
+    assert out.count('已保留') == 1 and 'config_failed.json 保存失败' in out, out
+
+
 def test_direct_h3_plan_defers_certificate_issuance():
     out = run_bash(r'''
         source ./xray_2go.sh
@@ -4557,8 +5356,11 @@ def test_argo_cleanup_and_host_restoration_report_failure():
         [[ $(st_get '.argo.enabled') == true ]] || exit 3
         mkdir -p "$WORK_DIR" "$(dirname "$_SYSCTL_FILE")"
         printf 'fixture\n' > "$_HOSTS_BAK"
+        mkdir -p "$(dirname "$_HOSTS_FILE")"
+        printf '::1 localhost # xray2go-managed\n' > "$_HOSTS_FILE"
         cp() { return 1; }
         if lifecycle_rollback_hosts; then exit 4; fi
+        grep -Fqx '::1 localhost # xray2go-managed' "$_HOSTS_FILE" || exit 6
         printf '# xray2go managed - do not edit manually\n' > "$_SYSCTL_FILE"
         rm() { return 1; }
         if lifecycle_rollback_sysctl; then exit 5; fi
